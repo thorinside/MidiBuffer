@@ -7,7 +7,7 @@ MidiBuffer is a rolling, clock-relative MIDI recorder and looper for the Expert 
 - **Supported target:** disting NT firmware **1.18 and later**.
 - Firmware earlier than 1.18 is unsupported.
 - The plug-in builds against the pinned API v13 SDK checkout. Native host-double tests and ARM object inspection pass, but those checks do not run firmware.
-- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. The exact modest pre-publication procedure and result record are in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md).
+- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. The original v1 pre-publication procedure remains in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md); the separate post-build UX control/display procedure is in [`docs/UX_REFINEMENT_HARDWARE_TEST.md`](docs/UX_REFINEMENT_HARDWARE_TEST.md).
 
 ## Install
 
@@ -45,10 +45,11 @@ The CV inputs respond to rising edges above 1 V. **Clock** and **Reset** require
 | --- | --- |
 | Left pot | Move the selection start. The first boundary edit creates a full-history selection before applying the edit. |
 | Centre pot | Move the selection end. |
-| Right pot | Zoom between 4 and 256 visible clock pulses. |
-| Left encoder turn | Scroll the view toward older or newer retained history without moving the selection. |
+| Right pot turn | Move the complete selected range older/newer without changing its pulse length. |
+| Right pot hold + turn | Zoom relative to the view at press time; release returns to range movement without a jump or pickup dead zone. |
+| Left encoder turn | Scroll a manual view toward older or newer retained history by one pulse per detent without moving the selection. Show All cannot scroll. |
 | Left encoder press | Start or stop playback. It is a no-op until a valid selection exists. |
-| Right encoder turn | Trim whichever selection boundary was moved most recently, one pulse per detent. |
+| Right encoder turn | Adjust the last effective Start, End, or whole-Range function by one pulse per detent. |
 | Right encoder hold for one second | Panic once: stop playback and send CC120 plus CC123 on all 16 channels to the selected destination. |
 
 ## Capture and loop workflow
@@ -58,7 +59,7 @@ The CV inputs respond to rising edges above 1 V. **Clock** and **Reset** require
 3. Start the external clock. MidiBuffer needs two pulses to measure an interval when it has no current clock measurement.
 4. Set **Capture** to **Start Capture**, then perform. Only eligible channel MIDI received while capture is enabled and the external clock is running is retained.
 5. Set **Capture** to **Stop Capture**. MidiBuffer stores finite endings for active notes and selected expressive state; stopping capture does not transmit those endings to live outputs.
-6. Touch a selection boundary control to create and trim a valid pulse-aligned range. Use **Pulses/Beat**, zoom, and scroll to navigate without changing recorded timing.
+6. Touch a selection boundary control to create and trim a valid pulse-aligned range. Turn the unpressed right pot to move that fixed-length range. Hold the right pot while turning to zoom; release it to resume range movement. Fresh views use **Show All** and continue fitting retained history; zoom in before using the left encoder to inspect a narrower region. **Pulses/Beat**, zoom, and scroll never change recorded timing or the selection.
 7. Press the left encoder to play. If a clock interval is still known, playback begins on the next pulse; otherwise it waits for two fresh pulses. Starting playback also finalizes and pauses active capture.
 8. Press the left encoder again to stop. Playback position is preserved for continuation. Use **Reset** to clean up and return to the range start. Capture never restarts automatically; select **Start Capture** again when you want to record more.
 
@@ -119,7 +120,9 @@ MidiBuffer retains eligible channel MIDI as pulse-relative events in a fixed rol
 - If replacement touches a selected pulse range, the selection is cleared while capture continues. The playback-entry seam refuses a missing or invalidated selection.
 - The 256×64 custom timeline shows retained availability and edited selection length as exact `bars:beats:ticks` durations, plus note marks and pulse-aligned selection brackets. A bar is four beats, a beat has 480 display ticks, beats are zero-based 0–3, and ticks always have three digits. **Avail** is the retained interval envelope (or zero); **Len** is edited end minus start without an inclusive `+1` (or `--` when invalid). These pulse-derived readouts remain available without a live clock. The timeline intentionally omits the prototype's history heading and bottom oldest-history number.
 - **Pulses/Beat** is runtime-adjustable among **1**, **2**, **4**, **8**, **16**, **24**, and **48**, defaulting to **1**. It changes only duration presentation; recorded timestamps and loop boundaries do not change, and tempo changes do not change either duration. For example, 64 intervals at 4 pulses per beat display as `4:0:000`, while 65 display as `4:0:120`. Bars display exactly through `9999999999`; larger amounts use `>9999999999bar` without limiting retained history.
-- The left, centre, and right pots move selection start, move selection end, and zoom the timeline. The left encoder scrolls toward older or newer retained history; the right encoder trims the last-moved boundary by one clock pulse per detent. Scrolling and zooming preserve both selected pulse coordinates. Boundary edits made during playback use the same atomic next-wrap transition as other selection edits.
+- The left and centre pots move selection start and end. The unpressed right pot moves the complete selected range older/newer while preserving its exact pulse length and clamping at retained-history limits. Holding the right pot while turning performs relative zoom from the press-time view; press and release do not move the selection, and the first unpressed delta is measured from the release sample.
+- A fresh timeline is automatic **Show All** over the retained interval envelope and follows history growth/eviction. Zooming in creates a manual view; explicit full zoom-out re-enters Show All. Manual views preserve their configured width and end-relative scroll even when clipping temporarily makes them cover all retained history.
+- The left encoder scrolls a manual view one pulse per delta unit toward older or newer history without acceleration. In Show All it is a no-op. The right encoder adjusts the last effective Start, End, or whole-Range function by one pulse per delta unit. Scrolling and held zoom preserve that target. Navigation preserves selected pulse coordinates, retained events, and playback timing. Boundary/range edits made during playback use the same atomic next-wrap transition as other selection edits.
 - Pressing the left encoder toggles playback when a valid range is selected. Start uses the existing clock-acquisition and saved-position path; stop performs the existing routed note/sustain cleanup. An invalid selection makes the press a no-op, including leaving capture unchanged.
 - Holding the right encoder for one second invokes MIDI panic once per hold. Panic sends All Sound Off (CC120) and All Notes Off (CC123) on all 16 channels to the selected **MIDI Out** destination, stops playback without resetting its saved position, and leaves capture paused.
 - During playback, incoming CC120 or CC123 on any channel invokes that same all-channel panic. Incoming MIDI Stop remains ignored because playback follows the patched clock. Panic stays stopped across later clock pulses until playback is explicitly restarted.

@@ -2,6 +2,7 @@
 
 #include "../src/midibuffer_core.hpp"
 #include "../src/nt_host.hpp"
+#include "../src/range_motion.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +91,18 @@ bool framebufferHasColour(uint8_t colour) {
         }
     }
     return false;
+}
+
+size_t framebufferColourPixelCount(uint8_t colour) {
+    size_t count = 0U;
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 256; ++x) {
+            if (midibuffer_test::framebufferPixel(x, y) == colour) {
+                ++count;
+            }
+        }
+    }
+    return count;
 }
 
 size_t matchingShapeCount(int x0, int y0, int x1, int y1, int colour) {
@@ -689,6 +702,10 @@ void verifyMusicalDurationFormattingAndReadouts() {
     expect(!snapshot(empty).clockRunning &&
                drawReadouts(empty, "Avail 0:0:000  1ppb", "Len --"),
            "during one-pulse clock acquisition, empty readouts stay zero and invalid");
+    changeParameter(empty, kPulsesPerDisplayedBeatParameter, 6);
+    expect(drawReadouts(empty, "Avail 0:0:000  48ppb", "Len --") &&
+               !framebufferHasInk(0, 0, 255, 2),
+           "invalid Len and a normal zero Avail use the original tiny-font regions at 48ppb");
 
     const uint64_t retainedStart = 100U;
     const uint64_t retainedEnd = 164U;
@@ -811,6 +828,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
                midibuffer_test::framebufferPixel(254, 7) != 0U &&
                midibuffer_test::framebufferPixel(255, 7) == 0U &&
                !framebufferHasInk(0, 0, 255, 2) &&
+               !framebufferHasInk(115, 3, 175, 7) &&
                sameSelectionAndTransport(exactBefore,
                                          snapshot(exactLayout)) &&
                sameHistory(exactHistory, exactLayout),
@@ -2109,6 +2127,52 @@ void verifyIntegratedRangeMotionAndFineTargets() {
     moveRightPot(releaseEdge, 0.3f);
     expect(snapshot(releaseEdge).selection.startPulse < 120U,
            "first unpressed range delta is measured from the release sample");
+
+    midibuffer_test::HostDouble repeatedEntry;
+    expect(installRangeFixture(repeatedEntry, 100U, 200U, 120U, 140U),
+           "repeated setupUi takeover fixture installs");
+    _NT_float3 firstSetup = {-1.0f, -1.0f, -1.0f};
+    _NT_float3 secondSetup = {-1.0f, -1.0f, -1.0f};
+    repeatedEntry.factory()->setupUi(repeatedEntry.algorithm(), firstSetup);
+    repeatedEntry.factory()->setupUi(repeatedEntry.algorithm(), secondSetup);
+    const midibuffer::CaptureSnapshot beforePhysicalSeed = snapshot(repeatedEntry);
+    moveRightPot(repeatedEntry, 0.8f);
+    const midibuffer::CaptureSnapshot seededEntry = snapshot(repeatedEntry);
+    moveRightPot(repeatedEntry, 0.81f);
+    const midibuffer::CaptureSnapshot movedAfterEntry = snapshot(repeatedEntry);
+    expectNear(firstSetup[2], 0.25, 1.0e-6,
+               "first setupUi switch reports the logical Range position");
+    expectNear(secondSetup[2], 0.25, 1.0e-6,
+               "repeated setupUi switches reuse the logical Range position");
+    expect(seededEntry.selection.startPulse ==
+                   beforePhysicalSeed.selection.startPulse &&
+               seededEntry.selection.endPulse ==
+                   beforePhysicalSeed.selection.endPulse &&
+               movedAfterEntry.rangeLogicalPosition >
+                   seededEntry.rangeLogicalPosition,
+           "repeated UI entry samples the actual pot without remap and the first following delta has no host pickup dead zone");
+
+    midibuffer_test::PresetImage takeoverImage;
+    expect(repeatedEntry.savePreset(takeoverImage),
+           "takeover state serializes for fresh-load callback verification");
+    midibuffer_test::HostDouble loadedTakeover;
+    expect(loadedTakeover.instantiate(1) &&
+               loadedTakeover.loadPreset(takeoverImage),
+           "takeover state loads into a fresh actual callback host");
+    _NT_float3 loadedSetup = {-1.0f, -1.0f, -1.0f};
+    loadedTakeover.factory()->setupUi(loadedTakeover.algorithm(), loadedSetup);
+    const midibuffer::CaptureSnapshot loadedBeforeSeed = snapshot(loadedTakeover);
+    moveRightPot(loadedTakeover, 0.1f);
+    const midibuffer::CaptureSnapshot loadedSeeded = snapshot(loadedTakeover);
+    moveRightPot(loadedTakeover, 0.09f);
+    const midibuffer::CaptureSnapshot loadedMoved = snapshot(loadedTakeover);
+    expect(loadedSeeded.selection.startPulse ==
+                   loadedBeforeSeed.selection.startPulse &&
+               loadedSeeded.selection.endPulse ==
+                   loadedBeforeSeed.selection.endPulse &&
+               loadedMoved.rangeLogicalPosition <
+                   loadedSeeded.rangeLogicalPosition,
+           "valid-preset load seeds from the actual sampled pot and responds to the first subsequent delta without replay or pickup");
 
     midibuffer_test::HostDouble targets;
     expect(installRangeFixture(targets, 100U, 300U, 120U, 140U),
@@ -3989,6 +4053,20 @@ bool sameMidiTrace(const midibuffer_test::Trace& left,
     return true;
 }
 
+bool sameExactMidiTrace(const midibuffer_test::Trace& left,
+                        const midibuffer_test::Trace& right) {
+    if (!sameMidiTrace(left, right)) {
+        return false;
+    }
+    for (size_t index = 0; index < left.midiCallCount; ++index) {
+        if (left.midiCalls[index].dispatchSample !=
+            right.midiCalls[index].dispatchSample) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool sameNormalizedMidiTrace(const midibuffer_test::Trace& left,
                              uint64_t leftIntervalOrigin,
                              const midibuffer_test::Trace& right,
@@ -4519,6 +4597,147 @@ void verifyPresetSupportedBufferRangeAndCost() {
         saveMilliseconds, loadMilliseconds);
 }
 
+enum DrawCadence {
+    kNoDraws,
+    kSparseDraws,
+    kFrequentDraws,
+};
+
+void drawForCadence(midibuffer_test::HostDouble& host, DrawCadence cadence,
+                    unsigned stage) {
+    unsigned count = 0U;
+    if (cadence == kFrequentDraws) {
+        count = 3U;
+    } else if (cadence == kSparseDraws && (stage % 3U) == 0U) {
+        count = 1U;
+    }
+    while (count-- != 0U) {
+        expect(host.factory()->draw(host.algorithm()),
+               "cadence scenario draw callback completes");
+    }
+}
+
+struct DrawCadenceResult {
+    midibuffer_test::Trace trace;
+    midibuffer::CaptureSnapshot state;
+    midibuffer_test::PresetImage image;
+    bool pendingObserved;
+};
+
+void runDrawCadenceScenario(DrawCadence cadence, DrawCadenceResult& result) {
+    midibuffer_test::HostDouble host;
+    TransportFixture fixture = prepareTransportHistory(host);
+    drawForCadence(host, cadence, 0U);
+    beginTransportOnHeldFirstBeat(host, fixture);
+    drawForCadence(host, cadence, 1U);
+
+    resetPulse(host);
+    drawForCadence(host, cadence, 2U);
+    fixture.lastClockSample = host.elapsedSamples() + 8U;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "cadence scenario resumes from reset on an identical clock");
+    stepThrough(host, fixture.lastClockSample + 8U);
+    drawForCadence(host, cadence, 3U);
+
+    _NT_float3 pots = {-1.0f, -1.0f, -1.0f};
+    host.factory()->setupUi(host.algorithm(), pots);
+    moveUi(host, kNT_potButtonR, pots[0], pots[1], 0.5f);
+    drawForCadence(host, cadence, 4U);
+    moveUi(host, kNT_potButtonR | kNT_potR,
+           pots[0], pots[1], 0.25f, 0, 0, kNT_potButtonR);
+    moveUi(host, 0U, pots[0], pots[1], 0.25f, 0, 0, kNT_potButtonR);
+    drawForCadence(host, cadence, 5U);
+
+    expect(midibuffer::setPulseSelection(
+               host.algorithm(), fixture.firstSelectedPulse + 1U,
+               fixture.firstSelectedPulse + 3U),
+           "cadence scenario queues the same valid pending range");
+    result.pendingObserved = snapshot(host).rangeTransitionPending;
+    sendMidi(host, 0x94U, 72U, 96U);
+    noClockBlock(host);
+    drawForCadence(host, cadence, 6U);
+
+    result.trace = midibuffer_test::trace();
+    result.state = snapshot(host);
+    expect(result.trace.midiCallCount != 0U,
+           "cadence scenario emits a non-empty timestamped MIDI stream");
+    expect(result.pendingObserved && result.state.rangeTransitionPending &&
+               result.state.playbackActive && !result.state.captureEnabled,
+           "cadence scenario retains capture, transport, and pending-transition evidence");
+    expect(host.savePreset(result.image),
+           "cadence scenario captures complete scheduler state");
+}
+
+void verifyDrawNoninterferenceAndIncrementalCost() {
+    midibuffer_test::resetTrace();
+    DrawCadenceResult zero = {};
+    runDrawCadenceScenario(kNoDraws, zero);
+    midibuffer_test::resetTrace();
+    DrawCadenceResult sparse = {};
+    runDrawCadenceScenario(kSparseDraws, sparse);
+    midibuffer_test::resetTrace();
+    DrawCadenceResult frequent = {};
+    runDrawCadenceScenario(kFrequentDraws, frequent);
+
+    expect(sameExactMidiTrace(zero.trace, sparse.trace) &&
+               sameExactMidiTrace(zero.trace, frequent.trace),
+           "zero, sparse, and frequent draws preserve outgoing MIDI bytes, order, destinations, and exact scheduler timestamps");
+    expect(zero.image.equals(sparse.image) &&
+               zero.image.equals(frequent.image) &&
+               sameSelectionAndTransport(zero.state, sparse.state) &&
+               sameSelectionAndTransport(zero.state, frequent.state) &&
+               zero.state.captureEnabled == sparse.state.captureEnabled &&
+               zero.state.captureEnabled == frequent.state.captureEnabled &&
+               zero.state.clockRunning == sparse.state.clockRunning &&
+               zero.state.clockRunning == frequent.state.clockRunning &&
+               zero.state.eventCount == sparse.state.eventCount &&
+               zero.state.eventCount == frequent.state.eventCount,
+           "draw cadence preserves canonical capture, transport, pending range, scheduler, and retained-event state exactly");
+
+    midibuffer_test::HostDouble benchmark;
+    expect(installRangeFixture(benchmark, 100U, 108U, 100U, 108U) &&
+               midibuffer::startPlayback(benchmark.algorithm()),
+           "incremental head-cost fixture constructs and arms");
+    acquireClock(benchmark);
+    clockPulse(benchmark);
+    expect(drawHasHeadAt(benchmark, 34),
+           "incremental head-cost fixture reaches an eligible non-bracket frame");
+    midibuffer_test::resetTrace();
+    expect(benchmark.factory()->draw(benchmark.algorithm()) &&
+               playbackHeadLineCount() == 1U &&
+               framebufferColourPixelCount(12U) == 39U,
+           "head adds exactly one intensity-12 line and 39 inclusive pixels");
+
+    const unsigned iterations = 20000U;
+    const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
+    std::clock_t headStart = std::clock();
+    for (unsigned index = 0; index < iterations; ++index) {
+        benchmark.factory()->draw(benchmark.algorithm());
+    }
+    const std::clock_t headEnd = std::clock();
+    midibuffer::stopPlayback(benchmark.algorithm());
+    const std::clock_t stoppedStart = std::clock();
+    for (unsigned index = 0; index < iterations; ++index) {
+        benchmark.factory()->draw(benchmark.algorithm());
+    }
+    const std::clock_t stoppedEnd = std::clock();
+    const double headNanoseconds =
+        1000000000.0 * static_cast<double>(headEnd - headStart) /
+        (static_cast<double>(CLOCKS_PER_SEC) * iterations);
+    const double stoppedNanoseconds =
+        1000000000.0 * static_cast<double>(stoppedEnd - stoppedStart) /
+        (static_cast<double>(CLOCKS_PER_SEC) * iterations);
+    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
+           "measured draw paths use fixed storage and perform no allocation");
+    std::printf(
+        "MEASURE: native framebuffer draw over %u iterations: eligible head %.1f ns/draw, stopped %.1f ns/draw, delta %.1f ns/draw (process CPU clock; no FPS or hardware claim)\n",
+        iterations, headNanoseconds, stoppedNanoseconds,
+        headNanoseconds - stoppedNanoseconds);
+    std::printf(
+        "MEASURE: fixed native RangeMotionState storage = %llu bytes; head trace = one coordinate call site and one 39-pixel line (source/trace audit)\n",
+        static_cast<unsigned long long>(sizeof(midibuffer::RangeMotionState)));
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -4585,6 +4804,7 @@ int main() {
     verifyCompletePresetRoundTripsAndContinuation();
     verifyInflightPresetSchedulingContinuation();
     verifyPresetSupportedBufferRangeAndCost();
+    verifyDrawNoninterferenceAndIncrementalCost();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {
