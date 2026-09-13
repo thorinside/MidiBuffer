@@ -39,6 +39,11 @@ struct CaptureSnapshot {
     uint32_t clockAverageIntervalCount;
     uint32_t pendingNoteEndingCount;
     uint32_t pendingSustainReleaseCount;
+    uint32_t pulsesPerDisplayedBeat;
+    uint32_t timelineVisiblePulses;
+    uint64_t retainedPulseIntervals;
+    uint64_t timelineViewStartPulse;
+    uint64_t timelineViewEndPulse;
     bool captureEnabled;
     bool clockRunning;
     bool selectionValid;
@@ -47,6 +52,7 @@ struct CaptureSnapshot {
     bool playbackClockLossPaused;
     bool activeSelectionValid;
     bool rangeTransitionPending;
+    bool lastMovedBoundaryIsStart;
     PulseRange selection;
     PulseRange activeSelection;
 };

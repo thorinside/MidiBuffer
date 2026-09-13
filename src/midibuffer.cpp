@@ -16,6 +16,10 @@ const float kGateThresholdVolts = 1.0f;
 const uint32_t kClockAverageWindow = 8U;
 const uint32_t kRecordedEventFlagCaptureEnding = 0x01U;
 const uint32_t kRecordedEventEndingIndexShift = 1U;
+const uint32_t kDefaultTimelineVisiblePulses = 64U;
+const uint32_t kTimelineMinimumVisiblePulses = 4U;
+const uint32_t kTimelineMaximumVisiblePulses = 256U;
+const uint32_t kTimelineCoordinateMaximum = 65535U;
 
 static_assert(sizeof(RecordedEvent) == 24,
               "recording event size is part of capacity accounting");
@@ -35,6 +39,7 @@ enum Parameter {
     kParameterFilterControlChange,
     kParameterFilterPitchBend,
     kParameterFilterAftertouch,
+    kParameterPulsesPerDisplayedBeat,
     kNumParameters,
 };
 
@@ -105,12 +110,14 @@ struct Algorithm : public _NT_algorithm {
           clockIntervalCount(0), clockIntervals(), selection(),
           activeSelection(), state(), recordedState(), playbackOutputState(),
           pendingEndings(), transportState(kTransportStopped),
-          playbackIntervalOrdinal(0), captureEnabled(false),
-          clockRunning(false), haveAcquisitionPulse(false), clockHigh(false),
-          resetHigh(false), selectionValid(false),
-          activeSelectionValid(false), rangeTransitionPending(false),
-          playbackPositionValid(false), playbackIntervalOpen(false),
-          playbackNextEventScheduled(false), pendingNextEndingScheduled(false),
+          playbackIntervalOrdinal(0), timelineScrollPulses(0),
+          timelineVisiblePulses(kDefaultTimelineVisiblePulses),
+          captureEnabled(false), clockRunning(false),
+          haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
+          selectionValid(false), activeSelectionValid(false),
+          rangeTransitionPending(false), playbackPositionValid(false),
+          playbackIntervalOpen(false), playbackNextEventScheduled(false),
+          pendingNextEndingScheduled(false), lastMovedBoundaryIsStart(false),
           pendingNextEndingSample(0) {}
 
     RecordedEvent* recordingEvents;
@@ -140,6 +147,8 @@ struct Algorithm : public _NT_algorithm {
     PendingPlaybackEndings pendingEndings;
     TransportState transportState;
     uint64_t playbackIntervalOrdinal;
+    uint64_t timelineScrollPulses;
+    uint32_t timelineVisiblePulses;
 
     bool captureEnabled;
     bool clockRunning;
@@ -153,6 +162,7 @@ struct Algorithm : public _NT_algorithm {
     bool playbackIntervalOpen;
     bool playbackNextEventScheduled;
     bool pendingNextEndingScheduled;
+    bool lastMovedBoundaryIsStart;
     uint64_t pendingNextEndingSample;
 };
 
@@ -178,6 +188,14 @@ static const char* const kPlaybackChannelStrings[] = {
 static const char* const kFilterStrings[] = {
     "Off",
     "On",
+};
+
+static const char* const kPulsesPerDisplayedBeatStrings[] = {
+    "1", "2", "4", "8", "16", "24", "48",
+};
+
+static const uint8_t kPulsesPerDisplayedBeatValues[] = {
+    1, 2, 4, 8, 16, 24, 48,
 };
 
 // The API macros include their own trailing commas.
@@ -248,6 +266,15 @@ static const _NT_parameter kParameters[] = {
         .scaling = kNT_scalingNone,
         .enumStrings = kFilterStrings,
     },
+    {
+        .name = "Pulses/Beat",
+        .min = 0,
+        .max = 6,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kPulsesPerDisplayedBeatStrings,
+    },
 };
 // clang-format on
 
@@ -267,6 +294,10 @@ static const uint8_t kPlaybackPageParameters[] = {
     kParameterFilterControlChange,
     kParameterFilterPitchBend,
     kParameterFilterAftertouch,
+};
+
+static const uint8_t kTimelinePageParameters[] = {
+    kParameterPulsesPerDisplayedBeat,
 };
 
 static const _NT_parameterPage kParameterPageDefinitions[] = {
@@ -290,6 +321,13 @@ static const _NT_parameterPage kParameterPageDefinitions[] = {
         .group = 0,
         .unused = {0, 0},
         .params = kPlaybackPageParameters,
+    },
+    {
+        .name = "Timeline",
+        .numParams = ARRAY_SIZE(kTimelinePageParameters),
+        .group = 0,
+        .unused = {0, 0},
+        .params = kTimelinePageParameters,
     },
 };
 
@@ -1404,6 +1442,13 @@ void beginOrAdvancePlayback(Algorithm& algorithm, uint64_t sample) {
 void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
     ++algorithm.state.clockEdges;
     ++algorithm.currentPulse;
+    if (algorithm.captureEnabled && algorithm.eventCount != 0 &&
+        algorithm.currentPulse != ~static_cast<uint64_t>(0)) {
+        const uint64_t captureEnd = algorithm.currentPulse + 1U;
+        if (captureEnd > algorithm.historyEndPulseExclusive) {
+            algorithm.historyEndPulseExclusive = captureEnd;
+        }
+    }
 
     if (algorithm.clockRunning) {
         flushPendingPlaybackEvents(algorithm, sample);
@@ -1595,9 +1640,203 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     trackRecordedState(*algorithm, event);
 }
 
+uint32_t pulsesPerDisplayedBeat(const Algorithm& algorithm) {
+    int value = 0;
+    if (algorithm.v != NULL) {
+        value = algorithm.v[kParameterPulsesPerDisplayedBeat];
+    }
+    if (value < 0 || value >= static_cast<int>(
+                                ARRAY_SIZE(kPulsesPerDisplayedBeatValues))) {
+        value = 0;
+    }
+    return kPulsesPerDisplayedBeatValues[value];
+}
+
+bool retainedTimelineBounds(const Algorithm& algorithm, uint64_t& start,
+                            uint64_t& end) {
+    if (algorithm.eventCount == 0) {
+        start = 0;
+        end = 0;
+        return false;
+    }
+    start = algorithm.recordingEvents[algorithm.eventHead].pulse;
+    end = algorithm.historyEndPulseExclusive;
+    return end > start;
+}
+
+uint64_t divideUnsigned64By32(uint64_t value, uint32_t divisor,
+                              uint32_t& remainder) {
+    uint64_t quotient = 0;
+    uint64_t workingRemainder = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        workingRemainder =
+            (workingRemainder << 1U) | ((value >> bit) & 1U);
+        if (workingRemainder >= divisor) {
+            workingRemainder -= divisor;
+            quotient |= static_cast<uint64_t>(1) << bit;
+        }
+    }
+    remainder = static_cast<uint32_t>(workingRemainder);
+    return quotient;
+}
+
+uint64_t scaleTimelineDistance(uint64_t distance, uint32_t numerator,
+                               uint32_t denominator) {
+    uint32_t remainder = 0;
+    const uint64_t quotient =
+        divideUnsigned64By32(distance, denominator, remainder);
+    const uint32_t scaledRemainder =
+        (remainder * numerator + denominator / 2U) / denominator;
+    return quotient * numerator + scaledRemainder;
+}
+
+uint32_t normalizedTimelinePot(float value) {
+    if (!(value >= 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return kTimelineCoordinateMaximum;
+    }
+    return static_cast<uint32_t>(
+        value * static_cast<float>(kTimelineCoordinateMaximum) + 0.5f);
+}
+
+uint64_t pulseFromPot(uint64_t minimum, uint64_t maximum, float pot) {
+    if (maximum <= minimum) {
+        return minimum;
+    }
+    return minimum + scaleTimelineDistance(
+                         maximum - minimum, normalizedTimelinePot(pot),
+                         kTimelineCoordinateMaximum);
+}
+
+uint64_t retainedTimelineIntervals(const Algorithm& algorithm) {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    return retainedTimelineBounds(algorithm, start, end) ? end - start : 0;
+}
+
+void timelineViewBounds(const Algorithm& algorithm, uint64_t& start,
+                        uint64_t& end) {
+    uint64_t retainedStart = 0;
+    uint64_t retainedEnd = 0;
+    if (!retainedTimelineBounds(algorithm, retainedStart, retainedEnd)) {
+        start = 0;
+        end = 0;
+        return;
+    }
+
+    const uint64_t retained = retainedEnd - retainedStart;
+    const uint64_t visible =
+        algorithm.timelineVisiblePulses < retained
+            ? algorithm.timelineVisiblePulses
+            : retained;
+    const uint64_t maximumScroll = retained - visible;
+    const uint64_t scroll = algorithm.timelineScrollPulses < maximumScroll
+                                ? algorithm.timelineScrollPulses
+                                : maximumScroll;
+    end = retainedEnd - scroll;
+    start = end - visible;
+}
+
+bool ensureTimelineSelection(_NT_algorithm* self, Algorithm& algorithm) {
+    if (algorithm.selectionValid) {
+        return true;
+    }
+    uint64_t start = 0;
+    uint64_t end = 0;
+    return retainedTimelineBounds(algorithm, start, end) &&
+           setPulseSelection(self, start, end);
+}
+
+void moveTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
+                          bool startBoundary, uint64_t requested) {
+    if (!ensureTimelineSelection(self, algorithm)) {
+        return;
+    }
+
+    uint64_t retainedStart = 0;
+    uint64_t retainedEnd = 0;
+    if (!retainedTimelineBounds(algorithm, retainedStart, retainedEnd)) {
+        return;
+    }
+
+    uint64_t start = algorithm.selection.startPulse;
+    uint64_t end = algorithm.selection.endPulse;
+    if (startBoundary) {
+        const uint64_t maximum = end - 1U;
+        start = requested < retainedStart
+                    ? retainedStart
+                    : (requested > maximum ? maximum : requested);
+    } else {
+        const uint64_t minimum = start + 1U;
+        end = requested < minimum
+                  ? minimum
+                  : (requested > retainedEnd ? retainedEnd : requested);
+    }
+    if (start == algorithm.selection.startPulse &&
+        end == algorithm.selection.endPulse) {
+        return;
+    }
+    if (setPulseSelection(self, start, end)) {
+        algorithm.lastMovedBoundaryIsStart = startBoundary;
+    }
+}
+
+void adjustLastTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
+                                int delta) {
+    if (delta == 0 || !ensureTimelineSelection(self, algorithm)) {
+        return;
+    }
+
+    uint64_t retainedStart = 0;
+    uint64_t retainedEnd = 0;
+    if (!retainedTimelineBounds(algorithm, retainedStart, retainedEnd)) {
+        return;
+    }
+
+    uint64_t requested = algorithm.lastMovedBoundaryIsStart
+                             ? algorithm.selection.startPulse
+                             : algorithm.selection.endPulse;
+    int steps = delta > 0 ? delta : -delta;
+    while (steps-- > 0) {
+        if (delta > 0 && requested < retainedEnd) {
+            ++requested;
+        } else if (delta < 0 && requested > retainedStart) {
+            --requested;
+        }
+    }
+    moveTimelineBoundary(self, algorithm,
+                         algorithm.lastMovedBoundaryIsStart, requested);
+}
+
+void scrollTimeline(Algorithm& algorithm, int delta) {
+    const uint64_t retained = retainedTimelineIntervals(algorithm);
+    const uint64_t visible =
+        algorithm.timelineVisiblePulses < retained
+            ? algorithm.timelineVisiblePulses
+            : retained;
+    const uint64_t maximumScroll = retained - visible;
+    if (algorithm.timelineScrollPulses > maximumScroll) {
+        algorithm.timelineScrollPulses = maximumScroll;
+    }
+    if (delta > 0) {
+        const uint64_t amount = static_cast<uint32_t>(delta);
+        algorithm.timelineScrollPulses =
+            amount > maximumScroll - algorithm.timelineScrollPulses
+                ? maximumScroll
+                : algorithm.timelineScrollPulses + amount;
+    } else if (delta < 0) {
+        const uint64_t amount = static_cast<uint32_t>(-delta);
+        algorithm.timelineScrollPulses =
+            amount > algorithm.timelineScrollPulses
+                ? 0
+                : algorithm.timelineScrollPulses - amount;
+    }
+}
+
 uint32_t hasCustomUi(_NT_algorithm*) {
-    return kNT_potL | kNT_potC | kNT_potR | kNT_encoderL | kNT_encoderR |
-           kNT_encoderButtonL | kNT_encoderButtonR;
+    return kNT_potL | kNT_potC | kNT_potR | kNT_encoderL | kNT_encoderR;
 }
 
 void customUi(_NT_algorithm* self, const _NT_uiData& data) {
@@ -1608,12 +1847,76 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
     if (data.controls != 0 || data.encoders[0] != 0 || data.encoders[1] != 0) {
         ++algorithm->state.uiChanges;
     }
+
+    if ((data.controls & kNT_potL) != 0U &&
+        ensureTimelineSelection(self, *algorithm)) {
+        moveTimelineBoundary(
+            self, *algorithm, true,
+            pulseFromPot(
+                algorithm->recordingEvents[algorithm->eventHead].pulse,
+                algorithm->selection.endPulse - 1U, data.pots[0]));
+    }
+    if ((data.controls & kNT_potC) != 0U &&
+        ensureTimelineSelection(self, *algorithm)) {
+        moveTimelineBoundary(
+            self, *algorithm, false,
+            pulseFromPot(algorithm->selection.startPulse + 1U,
+                         algorithm->historyEndPulseExclusive, data.pots[1]));
+    }
+    if ((data.controls & kNT_potR) != 0U) {
+        const uint32_t coordinate = normalizedTimelinePot(data.pots[2]);
+        const uint32_t zoomIndex =
+            (coordinate * 6U + kTimelineCoordinateMaximum / 2U) /
+            kTimelineCoordinateMaximum;
+        algorithm->timelineVisiblePulses =
+            kTimelineMinimumVisiblePulses << zoomIndex;
+        if (algorithm->timelineVisiblePulses >
+            kTimelineMaximumVisiblePulses) {
+            algorithm->timelineVisiblePulses =
+                kTimelineMaximumVisiblePulses;
+        }
+        scrollTimeline(*algorithm, 0);
+    }
+    scrollTimeline(*algorithm, data.encoders[0]);
+    adjustLastTimelineBoundary(self, *algorithm, data.encoders[1]);
 }
 
-void setupUi(_NT_algorithm*, _NT_float3& pots) {
+void setupUi(_NT_algorithm* self, _NT_float3& pots) {
+    Algorithm* algorithm = static_cast<Algorithm*>(self);
     pots[0] = 0.0f;
-    pots[1] = 0.0f;
-    pots[2] = 0.0f;
+    pots[1] = 1.0f;
+    pots[2] = 4.0f / 6.0f;
+    if (algorithm == NULL || !algorithm->selectionValid) {
+        return;
+    }
+
+    uint64_t retainedStart = 0;
+    uint64_t retainedEnd = 0;
+    if (!retainedTimelineBounds(*algorithm, retainedStart, retainedEnd)) {
+        return;
+    }
+    const uint64_t startRange = algorithm->selection.endPulse - 1U -
+                                retainedStart;
+    const uint64_t endRange = retainedEnd -
+                              (algorithm->selection.startPulse + 1U);
+    if (startRange != 0U && startRange <= 0xffffffffULL) {
+        pots[0] = static_cast<float>(static_cast<uint32_t>(
+                      algorithm->selection.startPulse - retainedStart)) /
+                  static_cast<float>(static_cast<uint32_t>(startRange));
+    }
+    if (endRange != 0U && endRange <= 0xffffffffULL) {
+        pots[1] = static_cast<float>(static_cast<uint32_t>(
+                      algorithm->selection.endPulse -
+                      (algorithm->selection.startPulse + 1U))) /
+                  static_cast<float>(static_cast<uint32_t>(endRange));
+    }
+    uint32_t span = kTimelineMinimumVisiblePulses;
+    uint32_t zoomIndex = 0;
+    while (span < algorithm->timelineVisiblePulses && zoomIndex < 6U) {
+        span <<= 1U;
+        ++zoomIndex;
+    }
+    pots[2] = static_cast<float>(zoomIndex) / 6.0f;
 }
 
 char* appendUnsigned(char* output, uint32_t value) {
@@ -1631,33 +1934,135 @@ char* appendUnsigned(char* output, uint32_t value) {
     return output;
 }
 
-void drawCounter(int y, const char* label, uint32_t value) {
-    char text[32];
-    char* cursor = text;
-    while (*label != '\0') {
-        *cursor++ = *label++;
+char* appendLiteral(char* output, const char* text) {
+    while (*text != '\0') {
+        *output++ = *text++;
     }
-    appendUnsigned(cursor, value);
-    nt_host::drawText(0, y, text);
+    *output = '\0';
+    return output;
+}
+
+char* appendUnsigned64(char* output, uint64_t value) {
+    char reversed[20];
+    int count = 0;
+    do {
+        uint32_t remainder = 0;
+        value = divideUnsigned64By32(value, 10U, remainder);
+        reversed[count++] = static_cast<char>('0' + remainder);
+    } while (value != 0U);
+
+    while (count > 0) {
+        *output++ = reversed[--count];
+    }
+    *output = '\0';
+    return output;
+}
+
+char* appendBeatAmount(char* output, uint64_t pulses,
+                       uint32_t pulsesPerBeat) {
+    uint32_t remainder = 0;
+    const uint64_t whole =
+        divideUnsigned64By32(pulses, pulsesPerBeat, remainder);
+    output = appendUnsigned64(output, whole);
+    if (remainder != 0U) {
+        const uint32_t hundredths =
+            (remainder * 100U + pulsesPerBeat / 2U) / pulsesPerBeat;
+        *output++ = '.';
+        *output++ = static_cast<char>('0' + hundredths / 10U);
+        *output++ = static_cast<char>('0' + hundredths % 10U);
+        *output = '\0';
+    }
+    return output;
+}
+
+int pulseTimelineX(uint64_t pulse, uint64_t viewStart, uint64_t viewEnd) {
+    if (viewEnd <= viewStart || pulse <= viewStart) {
+        return 4;
+    }
+    if (pulse >= viewEnd) {
+        return 251;
+    }
+    uint32_t remainder = 0;
+    const uint64_t denominator = viewEnd - viewStart;
+    if (denominator > 0xffffffffULL) {
+        return 4;
+    }
+    return 4 + static_cast<int>(
+                   divideUnsigned64By32((pulse - viewStart) * 247U,
+                                       static_cast<uint32_t>(denominator),
+                                       remainder));
+}
+
+void drawSelectionBracket(uint64_t pulse, uint64_t viewStart,
+                          uint64_t viewEnd, bool start) {
+    if (pulse < viewStart || pulse > viewEnd) {
+        return;
+    }
+    const int x = pulseTimelineX(pulse, viewStart, viewEnd);
+    nt_host::drawShape(kNT_line, x, 16, x, 56, 15);
+    nt_host::drawShape(kNT_line, x, 16, x + (start ? 4 : -4), 16, 15);
+    nt_host::drawShape(kNT_line, x, 56, x + (start ? 4 : -4), 56, 15);
 }
 
 bool draw(_NT_algorithm* self) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL) {
-        return false;
+        return true;
     }
 
-    nt_host::drawText(0, 8, "MidiBuffer");
-    nt_host::drawText(0, 18,
-                      algorithm->captureEnabled ? "Capture: Started"
-                                                : "Capture: Stopped");
-    nt_host::drawText(
-        0, 28, algorithm->clockRunning ? "Clock: Running" : "Clock: Acquiring");
-    drawCounter(38, "Events: ", algorithm->eventCount);
-    drawCounter(48, "Capacity: ", algorithm->eventCapacity);
-    nt_host::drawText(
-        0, 58, algorithm->selectionValid ? "Selected: Yes" : "Selected: No");
-    return false;
+    const uint32_t pulsesPerBeat = pulsesPerDisplayedBeat(*algorithm);
+    char availability[40];
+    char* cursor = appendLiteral(availability, "Avail ");
+    cursor = appendBeatAmount(cursor, retainedTimelineIntervals(*algorithm),
+                              pulsesPerBeat);
+    cursor = appendLiteral(cursor, "b  ");
+    cursor = appendUnsigned(cursor, pulsesPerBeat);
+    appendLiteral(cursor, "ppb");
+    nt_host::drawText(0, 7, availability);
+
+    char length[32];
+    cursor = appendLiteral(length, "Len ");
+    if (algorithm->selectionValid) {
+        cursor = appendBeatAmount(
+            cursor,
+            algorithm->selection.endPulse - algorithm->selection.startPulse,
+            pulsesPerBeat);
+        appendLiteral(cursor, "b");
+    } else {
+        appendLiteral(cursor, "--");
+    }
+    nt_host::drawText(176, 7, length);
+
+    uint64_t viewStart = 0;
+    uint64_t viewEnd = 0;
+    timelineViewBounds(*algorithm, viewStart, viewEnd);
+    nt_host::drawShape(kNT_line, 4, 52, 251, 52, 5);
+    if (viewEnd > viewStart) {
+        uint32_t eventIndex = findPlaybackEventIndex(*algorithm, viewStart);
+        uint32_t drawnNotes = 0;
+        while (eventIndex < algorithm->eventCount && drawnNotes < 256U) {
+            const RecordedEvent* event = recordedEventByIndex(
+                *algorithm, eventIndex++);
+            if (event == NULL || event->pulse >= viewEnd) {
+                break;
+            }
+            if ((event->bytes[0] & 0xf0U) != 0x90U ||
+                event->bytes[2] == 0U) {
+                continue;
+            }
+            const int x = pulseTimelineX(event->pulse, viewStart, viewEnd);
+            const int y = 47 - static_cast<int>(event->bytes[1]) * 24 / 127;
+            nt_host::drawShape(kNT_line, x, y, x, 51, 9);
+            ++drawnNotes;
+        }
+        if (algorithm->selectionValid) {
+            drawSelectionBracket(algorithm->selection.startPulse, viewStart,
+                                 viewEnd, true);
+            drawSelectionBracket(algorithm->selection.endPulse, viewStart,
+                                 viewEnd, false);
+        }
+    }
+    return true;
 }
 
 static const _NT_factory kFactory = {
@@ -1716,6 +2121,12 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.pendingNoteEndingCount = algorithm->pendingEndings.noteCount;
     snapshot.pendingSustainReleaseCount =
         algorithm->pendingEndings.sustainCount;
+    snapshot.pulsesPerDisplayedBeat = pulsesPerDisplayedBeat(*algorithm);
+    snapshot.timelineVisiblePulses = algorithm->timelineVisiblePulses;
+    snapshot.retainedPulseIntervals =
+        retainedTimelineIntervals(*algorithm);
+    timelineViewBounds(*algorithm, snapshot.timelineViewStartPulse,
+                       snapshot.timelineViewEndPulse);
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
@@ -1727,6 +2138,8 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
         algorithm->transportState == kTransportClockLossPaused;
     snapshot.activeSelectionValid = algorithm->activeSelectionValid;
     snapshot.rangeTransitionPending = algorithm->rangeTransitionPending;
+    snapshot.lastMovedBoundaryIsStart =
+        algorithm->lastMovedBoundaryIsStart;
     snapshot.selection = algorithm->selection;
     snapshot.activeSelection = algorithm->activeSelection;
     if (algorithm->eventCount != 0) {
@@ -1876,6 +2289,11 @@ void dispatchSafetyMidi3(_NT_algorithm* self, uint8_t status, uint8_t data1,
 namespace nt_host {
 
 void drawText(int x, int y, const char* text) { NT_drawText(x, y, text); }
+
+void drawShape(_NT_shape shape, int x0, int y0, int x1, int y1,
+               int colour) {
+    NT_drawShapeI(shape, x0, y0, x1, y1, colour);
+}
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
 extern "C" void midibufferTestSetDispatchSample(uint64_t sample);

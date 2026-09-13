@@ -23,6 +23,41 @@ void copyText(char* destination, size_t capacity, const char* source) {
     destination[index] = '\0';
 }
 
+void setFramebufferPixel(int x, int y, int colour) {
+    if (x < 0 || x >= 256 || y < 0 || y >= 64) {
+        return;
+    }
+    uint8_t& byte = NT_screen[y * 128 + x / 2];
+    const uint8_t nibble = static_cast<uint8_t>(colour) & 0x0fU;
+    byte = (x & 1) == 0
+               ? static_cast<uint8_t>((byte & 0x0fU) | (nibble << 4U))
+               : static_cast<uint8_t>((byte & 0xf0U) | nibble);
+}
+
+void drawFramebufferLine(int x0, int y0, int x1, int y1, int colour) {
+    const int dx = x1 >= x0 ? x1 - x0 : x0 - x1;
+    const int sx = x0 < x1 ? 1 : -1;
+    const int dyMagnitude = y1 >= y0 ? y1 - y0 : y0 - y1;
+    const int dy = -dyMagnitude;
+    const int sy = y0 < y1 ? 1 : -1;
+    int error = dx + dy;
+    while (true) {
+        setFramebufferPixel(x0, y0, colour);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        const int doubled = error * 2;
+        if (doubled >= dy) {
+            error += dy;
+            x0 += sx;
+        }
+        if (doubled <= dx) {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
 void recordMidi(uint32_t destination, uint8_t size, uint8_t byte0,
                 uint8_t byte1, uint8_t byte2) {
     if (gTrace.midiCallCount >= ARRAY_SIZE(gTrace.midiCalls)) {
@@ -90,6 +125,38 @@ void NT_drawText(int x, int y, const char* text, int, _NT_textAlignment,
     copyText(call.text, sizeof(call.text), text);
 }
 
+void NT_drawShapeI(_NT_shape shape, int x0, int y0, int x1, int y1,
+                   int colour) {
+    if (gTrace.shapeCallCount < ARRAY_SIZE(gTrace.shapeCalls)) {
+        midibuffer_test::ShapeCall& call =
+            gTrace.shapeCalls[gTrace.shapeCallCount++];
+        call.shape = shape;
+        call.x0 = x0;
+        call.y0 = y0;
+        call.x1 = x1;
+        call.y1 = y1;
+        call.colour = colour;
+    }
+    if (shape == kNT_point) {
+        setFramebufferPixel(x0, y0, colour);
+    } else if (shape == kNT_line) {
+        drawFramebufferLine(x0, y0, x1, y1, colour);
+    } else if (shape == kNT_box || shape == kNT_rectangle) {
+        const int left = x0 < x1 ? x0 : x1;
+        const int right = x0 < x1 ? x1 : x0;
+        const int top = y0 < y1 ? y0 : y1;
+        const int bottom = y0 < y1 ? y1 : y0;
+        for (int y = top; y <= bottom; ++y) {
+            for (int x = left; x <= right; ++x) {
+                if (shape == kNT_rectangle || x == left || x == right ||
+                    y == top || y == bottom) {
+                    setFramebufferPixel(x, y, colour);
+                }
+            }
+        }
+    }
+}
+
 void NT_sendMidiByte(uint32_t destination, uint8_t byte0) {
     recordMidi(destination, 1, byte0, 0, 0);
 }
@@ -110,11 +177,33 @@ namespace midibuffer_test {
 
 void resetTrace() {
     std::memset(&gTrace, 0, sizeof(gTrace));
+    std::memset(NT_screen, 0, sizeof(NT_screen));
     gPendingDispatchSample = 0;
 }
 
 const Trace& trace() {
     return gTrace;
+}
+
+uint8_t framebufferPixel(int x, int y) {
+    if (x < 0 || x >= 256 || y < 0 || y >= 64) {
+        return 0;
+    }
+    const uint8_t byte = NT_screen[y * 128 + x / 2];
+    return (x & 1) == 0 ? static_cast<uint8_t>(byte >> 4U)
+                        : static_cast<uint8_t>(byte & 0x0fU);
+}
+
+size_t litFramebufferPixelCount() {
+    size_t count = 0;
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 256; ++x) {
+            if (framebufferPixel(x, y) != 0U) {
+                ++count;
+            }
+        }
+    }
+    return count;
 }
 
 uint64_t heapAllocationCount() {

@@ -4,6 +4,7 @@
 #include "../src/nt_host.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -17,6 +18,9 @@ const size_t kPlaybackChannelParameter = 5;
 const size_t kFilterControlChangeParameter = 6;
 const size_t kFilterPitchBendParameter = 7;
 const size_t kFilterAftertouchParameter = 8;
+const size_t kPulsesPerDisplayedBeatParameter = 9;
+
+const uint32_t kPulsesPerDisplayedBeatValues[] = {1, 2, 4, 8, 16, 24, 48};
 
 int gFailures = 0;
 
@@ -35,6 +39,29 @@ bool drawContains(const char* expected) {
         }
     }
     return false;
+}
+
+bool drawContainsSubstring(const char* expected) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    for (size_t index = 0; index < current.drawCallCount; ++index) {
+        if (std::strstr(current.drawCalls[index].text, expected) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void moveUi(midibuffer_test::HostDouble& host, uint16_t controls,
+            float leftPot, float centrePot, float rightPot,
+            int8_t leftEncoder = 0, int8_t rightEncoder = 0) {
+    _NT_uiData data = {};
+    data.controls = controls;
+    data.pots[0] = leftPot;
+    data.pots[1] = centrePot;
+    data.pots[2] = rightPot;
+    data.encoders[0] = leftEncoder;
+    data.encoders[1] = rightEncoder;
+    host.factory()->customUi(host.algorithm(), data);
 }
 
 void changeParameter(midibuffer_test::HostDouble& host, size_t parameter,
@@ -188,8 +215,8 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
             minimumRequirements.dram == 1000000U &&
             maximumRequirements.dram == 5000000U,
         "allocation requirements default and clamp to the approved byte range");
-    expect(host.requirements().numParameters == 9,
-           "stable routing controls plus three playback filters are requested");
+    expect(host.requirements().numParameters == 10,
+           "stable controls plus the appended beat-display conversion are requested");
     expect(host.requirements().dram == 3000000U,
            "selected recording bytes are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
@@ -295,14 +322,37 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                            "On") == 0,
            "CC, bend, and combined aftertouch filters default off so all "
            "expression plays");
+    expect(std::strcmp(host.algorithm()
+                           ->parameters[kPulsesPerDisplayedBeatParameter]
+                           .name,
+                       "Pulses/Beat") == 0 &&
+               host.algorithm()
+                       ->parameters[kPulsesPerDisplayedBeatParameter]
+                       .def == 0 &&
+               host.algorithm()
+                       ->parameters[kPulsesPerDisplayedBeatParameter]
+                       .max == 6,
+           "pulses per displayed beat defaults to 1 and offers seven choices");
+    for (size_t index = 0;
+         index < ARRAY_SIZE(kPulsesPerDisplayedBeatValues); ++index) {
+        expect(static_cast<uint32_t>(std::atoi(
+                   host.algorithm()
+                       ->parameters[kPulsesPerDisplayedBeatParameter]
+                       .enumStrings[index])) ==
+                   kPulsesPerDisplayedBeatValues[index],
+               "beat-display enum exposes the approved runtime value");
+    }
     const _NT_parameterPages* pages = host.algorithm()->parameterPages;
-    expect(pages->numPages == 3 && pages->pages[1].numParams == 2 &&
+    expect(pages->numPages == 4 && pages->pages[1].numParams == 2 &&
                pages->pages[2].numParams == 5 &&
                pages->pages[2].params[2] ==
                    kFilterControlChangeParameter &&
                pages->pages[2].params[3] == kFilterPitchBendParameter &&
-               pages->pages[2].params[4] == kFilterAftertouchParameter,
-           "expressive controls exist only as three playback-page filters");
+               pages->pages[2].params[4] == kFilterAftertouchParameter &&
+               pages->pages[3].numParams == 1 &&
+               pages->pages[3].params[0] ==
+                   kPulsesPerDisplayedBeatParameter,
+           "timeline conversion is appended without moving playback controls");
 }
 
 void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
@@ -325,21 +375,24 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
 
     _NT_float3 pots = {-1.0f, -1.0f, -1.0f};
     host.factory()->setupUi(host.algorithm(), pots);
-    expect(pots[0] == 0.0f && pots[1] == 0.0f && pots[2] == 0.0f,
-           "setupUi supplies deterministic initial pot positions");
-    expect((host.factory()->hasCustomUi(host.algorithm()) & kNT_encoderL) != 0,
-           "custom control mask includes the timeline encoders");
+    expect(pots[0] == 0.0f && pots[1] == 1.0f &&
+               pots[2] > 0.66f && pots[2] < 0.67f,
+           "setupUi supplies deterministic start, end, and 64-pulse zoom positions");
+    const uint32_t customMask = host.factory()->hasCustomUi(host.algorithm());
+    expect((customMask & kNT_encoderL) != 0 &&
+               (customMask & kNT_encoderR) != 0 &&
+               (customMask & (kNT_encoderButtonL | kNT_encoderButtonR)) == 0,
+           "custom control mask includes rotation but no encoder press actions");
 
     midibuffer_test::resetTrace();
-    expect(!host.factory()->draw(host.algorithm()),
-           "draw preserves the standard parameter line");
-    expect(drawContains("MidiBuffer"), "draw callback identifies the plugin");
-    expect(drawContains("Capture: Stopped"),
-           "draw reports explicit capture state");
-    expect(drawContains("Events: 0"),
-           "MIDI remains unrecorded while capture is stopped");
-    expect(drawContains("Capacity: 125000"),
-           "draw reports actual event capacity for the selected allocation");
+    expect(host.factory()->draw(host.algorithm()),
+           "timeline draw owns the complete 256 by 64 display");
+    expect(drawContains("Avail 0b  1ppb"),
+           "empty timeline reports zero current beat availability");
+    expect(drawContains("Len --"),
+           "empty timeline reports no selected phrase length");
+    expect(midibuffer_test::framebufferPixel(100, 52) != 0U,
+           "timeline draw reaches the real framebuffer seam");
     expect(
         midibuffer_test::heapAllocationCount() == allocationsBefore,
         "real-time, MIDI, UI, and draw callbacks perform no heap allocation");
@@ -687,6 +740,151 @@ uint64_t fillHistoryAndMeasureSpan(midibuffer_test::HostDouble& host,
     return current.newestPulse - current.oldestPulse;
 }
 
+void verifyTimelineSelectionDisplayAndControls() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "timeline host constructs");
+    startCapture(host);
+    acquireClock(host);
+
+    sendMidi(host, 0x90, 48, 100);
+    sendMidi(host, 0x80, 48, 0);
+    expect(snapshot(host).retainedPulseIntervals == 1U,
+           "first captured pulse exposes one retained interval");
+    for (uint32_t interval = 1; interval <= 63U; ++interval) {
+        clockPulse(host);
+        if ((interval % 8U) == 0U) {
+            const uint8_t note = static_cast<uint8_t>(48U + interval / 8U);
+            sendMidi(host, 0x90, note, 100);
+            sendMidi(host, 0x80, note, 0);
+        }
+    }
+
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 2);
+    midibuffer::CaptureSnapshot current = snapshot(host);
+    expect(current.retainedPulseIntervals == 64U &&
+               current.pulsesPerDisplayedBeat == 4U &&
+               current.timelineVisiblePulses == 64U &&
+               current.timelineViewStartPulse == current.oldestPulse &&
+               current.timelineViewEndPulse == current.oldestPulse + 64U,
+           "64 retained pulse intervals display as a full 16-beat view at conversion 4");
+
+    midibuffer_test::resetTrace();
+    expect(host.factory()->draw(host.algorithm()),
+           "capturing timeline draws through the production callback");
+    expect(drawContains("Avail 16b  4ppb") && drawContains("Len --"),
+           "capturing timeline exposes compact availability and no phantom selection");
+    expect(!drawContainsSubstring("History") &&
+               !drawContainsSubstring("Oldest"),
+           "timeline omits the history heading and oldest-history label");
+    expect(midibuffer_test::trace().shapeCallCount >= 9U &&
+               midibuffer_test::litFramebufferPixelCount() >= 248U,
+           "capturing framebuffer contains the axis and recorded note marks");
+
+    moveUi(host, kNT_potL, 0.25f, 0.0f, 0.0f);
+    const midibuffer::CaptureSnapshot startMoved = snapshot(host);
+    expect(startMoved.selectionValid && startMoved.lastMovedBoundaryIsStart &&
+               startMoved.selection.startPulse > current.oldestPulse &&
+               startMoved.selection.endPulse == current.oldestPulse + 64U,
+           "left pot independently moves the pulse-snapped selection start");
+
+    moveUi(host, kNT_potC, 0.0f, 0.75f, 0.0f);
+    const midibuffer::CaptureSnapshot endMoved = snapshot(host);
+    expect(!endMoved.lastMovedBoundaryIsStart &&
+               endMoved.selection.startPulse ==
+                   startMoved.selection.startPulse &&
+               endMoved.selection.endPulse < startMoved.selection.endPulse,
+           "centre pot independently moves the pulse-snapped selection end");
+
+    moveUi(host, 0, 0.0f, 0.0f, 0.0f, 0, 1);
+    const midibuffer::CaptureSnapshot fineEnd = snapshot(host);
+    expect(fineEnd.selection.startPulse == endMoved.selection.startPulse &&
+               fineEnd.selection.endPulse ==
+                   endMoved.selection.endPulse + 1U,
+           "right encoder fine-adjusts the last-moved end by one pulse");
+
+    moveUi(host, kNT_potL, 0.50f, 0.0f, 0.0f);
+    const midibuffer::CaptureSnapshot secondStartMoved = snapshot(host);
+    moveUi(host, 0, 0.0f, 0.0f, 0.0f, 0, -1);
+    const midibuffer::CaptureSnapshot fineStart = snapshot(host);
+    expect(fineStart.lastMovedBoundaryIsStart &&
+               fineStart.selection.startPulse + 1U ==
+                   secondStartMoved.selection.startPulse &&
+               fineStart.selection.endPulse ==
+                   secondStartMoved.selection.endPulse,
+           "right encoder follows the last-moved start boundary by one pulse");
+
+    const midibuffer::PulseRange navigationSelection = fineStart.selection;
+    moveUi(host, kNT_potR, 0.0f, 0.0f, 0.0f);
+    const midibuffer::CaptureSnapshot zoomed = snapshot(host);
+    expect(zoomed.timelineVisiblePulses == 4U &&
+               zoomed.selection.startPulse ==
+                   navigationSelection.startPulse &&
+               zoomed.selection.endPulse == navigationSelection.endPulse,
+           "right pot zooms in without moving either selected boundary");
+    moveUi(host, 0, 0.0f, 0.0f, 0.0f, 3, 0);
+    const midibuffer::CaptureSnapshot scrolled = snapshot(host);
+    expect(scrolled.timelineViewStartPulse + 3U ==
+                   zoomed.timelineViewStartPulse &&
+               scrolled.timelineViewEndPulse + 3U ==
+                   zoomed.timelineViewEndPulse &&
+               scrolled.selection.startPulse ==
+                   navigationSelection.startPulse &&
+               scrolled.selection.endPulse == navigationSelection.endPulse,
+           "left encoder scrolls three history pulses without moving the selection");
+    moveUi(host, kNT_potR, 0.0f, 0.0f, 4.0f / 6.0f);
+    expect(snapshot(host).timelineVisiblePulses == 64U,
+           "right pot returns the timeline to the 64-interval zoom level");
+
+    const uint64_t selectedStart = current.oldestPulse + 8U;
+    const uint64_t selectedEnd = current.oldestPulse + 24U;
+    expect(midibuffer::setPulseSelection(host.algorithm(), selectedStart,
+                                         selectedEnd),
+           "timeline fixture selects a 16-pulse phrase");
+    const HistoryImage immutableHistory = captureHistory(host);
+    for (size_t index = 0;
+         index < ARRAY_SIZE(kPulsesPerDisplayedBeatValues); ++index) {
+        changeParameter(host, kPulsesPerDisplayedBeatParameter,
+                        static_cast<int16_t>(index));
+        const midibuffer::CaptureSnapshot converted = snapshot(host);
+        expect(converted.pulsesPerDisplayedBeat ==
+                       kPulsesPerDisplayedBeatValues[index] &&
+                   converted.selection.startPulse == selectedStart &&
+                   converted.selection.endPulse == selectedEnd &&
+                   sameHistory(immutableHistory, host),
+               "runtime beat conversion preserves event timestamps and pulse boundaries");
+    }
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 2);
+
+    midibuffer_test::resetTrace();
+    host.factory()->draw(host.algorithm());
+    expect(drawContains("Avail 16b  4ppb") && drawContains("Len 4b"),
+           "selected timeline reports retained availability and phrase length in beats");
+    expect(midibuffer_test::framebufferPixel(34, 16) == 15U &&
+               midibuffer_test::framebufferPixel(96, 16) == 15U,
+           "framebuffer contains the selected start and end brackets");
+
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "selected timeline phrase arms playback");
+    clockPulse(host);
+    const midibuffer::CaptureSnapshot playing = snapshot(host);
+    expect(playing.playbackActive && playing.activeSelection.startPulse ==
+                                        selectedStart &&
+               playing.activeSelection.endPulse == selectedEnd,
+           "timeline phrase enters actual clocked playback");
+    moveUi(host, kNT_potC, 0.0f, 0.90f, 0.0f);
+    const midibuffer::CaptureSnapshot pending = snapshot(host);
+    expect(pending.rangeTransitionPending &&
+               pending.activeSelection.startPulse == selectedStart &&
+               pending.activeSelection.endPulse == selectedEnd &&
+               pending.selection.endPulse != selectedEnd,
+           "live timeline edit routes through the next-wrap transition contract");
+    midibuffer_test::resetTrace();
+    host.factory()->draw(host.algorithm());
+    expect(midibuffer_test::trace().shapeCallCount != 0U &&
+               midibuffer_test::litFramebufferPixelCount() != 0U,
+           "playing timeline remains rendered through draw traces and framebuffer");
+}
+
 void verifyRollingHistoryAndSelectionInvalidation() {
     const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
     midibuffer_test::HostDouble sparse;
@@ -720,6 +918,12 @@ void verifyRollingHistoryAndSelectionInvalidation() {
     expect(!midibuffer::acquirePlaybackSelection(sparse.algorithm(),
                                                  playbackRange),
            "playback-entry contract refuses an invalidated selection");
+    midibuffer_test::resetTrace();
+    sparse.factory()->draw(sparse.algorithm());
+    expect(drawContainsSubstring("Avail ") &&
+               midibuffer_test::trace().shapeCallCount != 0U &&
+               midibuffer_test::litFramebufferPixelCount() != 0U,
+           "overwritten rolling history redraws current availability and timeline pixels");
 
     clockPulse(sparse);
     sendMidi(sparse, 0x90, 85, 100);
@@ -1965,6 +2169,7 @@ int main() {
     }
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
+    verifyTimelineSelectionDisplayAndControls();
     verifyCaptureStopEndings();
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();

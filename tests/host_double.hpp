@@ -14,6 +14,15 @@ struct DrawCall {
     char text[48];
 };
 
+struct ShapeCall {
+    _NT_shape shape;
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    int colour;
+};
+
 struct MidiCall {
     uint64_t dispatchSample;
     uint32_t destination;
@@ -24,12 +33,16 @@ struct MidiCall {
 struct Trace {
     DrawCall drawCalls[16];
     size_t drawCallCount;
+    ShapeCall shapeCalls[512];
+    size_t shapeCallCount;
     MidiCall midiCalls[128];
     size_t midiCallCount;
 };
 
 void resetTrace();
 const Trace& trace();
+uint8_t framebufferPixel(int x, int y);
+size_t litFramebufferPixelCount();
 uint64_t heapAllocationCount();
 
 class HostDouble {

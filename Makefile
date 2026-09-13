@@ -30,7 +30,7 @@ inspect: $(ARM_OBJECT)
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Type:[[:space:]]+REL \(Relocatable file\)'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Machine:[[:space:]]+ARM'
 	@$(ARM_NM) --defined-only $(ARM_OBJECT) | grep -Eq '[[:space:]]T[[:space:]]pluginEntry$$'
-	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(NT_drawText|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset)$$' || true )"; \
+	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(NT_drawShapeI|NT_drawText|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset)$$' || true )"; \
 		test -z "$$unexpected" || { echo "Unexpected undefined symbols:"; echo "$$unexpected"; exit 1; }
 	@echo "PASS: valid ARM relocatable object exports pluginEntry; undefined symbols match the host/libc allowlist"
 
