@@ -56,6 +56,12 @@ bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range);
 bool startPlayback(_NT_algorithm* self);
 void stopPlayback(_NT_algorithm* self);
 
+// Safety cleanup is output-state work, not replay of recorded performance.
+// The caller supplies the final status/channel; playback filters and channel
+// override are deliberately bypassed while the selected destination is kept.
+void dispatchSafetyMidi3(_NT_algorithm* self, uint8_t status, uint8_t data1,
+                         uint8_t data2);
+
 } // namespace midibuffer
 
 #endif

@@ -29,6 +29,9 @@ enum Parameter {
     kParameterRecordingChannel,
     kParameterPlaybackDestination,
     kParameterPlaybackChannel,
+    kParameterFilterControlChange,
+    kParameterFilterPitchBend,
+    kParameterFilterAftertouch,
     kNumParameters,
 };
 
@@ -103,6 +106,11 @@ static const char* const kPlaybackChannelStrings[] = {
     "9",        "10", "11", "12", "13", "14", "15", "16",
 };
 
+static const char* const kFilterStrings[] = {
+    "Off",
+    "On",
+};
+
 // The API macros include their own trailing commas.
 // clang-format off
 static const _NT_parameter kParameters[] = {
@@ -144,6 +152,33 @@ static const _NT_parameter kParameters[] = {
         .scaling = kNT_scalingNone,
         .enumStrings = kPlaybackChannelStrings,
     },
+    {
+        .name = "Filter CC",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kFilterStrings,
+    },
+    {
+        .name = "Filter Pitch Bend",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kFilterStrings,
+    },
+    {
+        .name = "Filter Aftertouch",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kFilterStrings,
+    },
 };
 // clang-format on
 
@@ -160,6 +195,9 @@ static const uint8_t kCapturePageParameters[] = {
 static const uint8_t kPlaybackPageParameters[] = {
     kParameterPlaybackDestination,
     kParameterPlaybackChannel,
+    kParameterFilterControlChange,
+    kParameterFilterPitchBend,
+    kParameterFilterAftertouch,
 };
 
 static const _NT_parameterPage kParameterPageDefinitions[] = {
@@ -342,12 +380,59 @@ uint8_t playbackStatus(const Algorithm& algorithm, uint8_t recordedStatus) {
                                 static_cast<uint8_t>(channel - 1));
 }
 
+bool excludedController(uint8_t controller) {
+    return controller == 6U || controller == 38U ||
+           (controller >= 96U && controller <= 101U) || controller >= 120U;
+}
+
+bool eligiblePerformanceEvent(const RecordedEvent& event) {
+    const uint8_t messageType = event.bytes[0] & 0xf0U;
+    if (messageType == 0xd0U) {
+        return event.size == 2U;
+    }
+    if (event.size != 3U) {
+        return false;
+    }
+    if (messageType == 0xb0U) {
+        return !excludedController(event.bytes[1]);
+    }
+    return messageType == 0x80U || messageType == 0x90U ||
+           messageType == 0xa0U || messageType == 0xe0U;
+}
+
+bool filterEnabled(const Algorithm& algorithm, Parameter parameter) {
+    return algorithm.v != NULL && algorithm.v[parameter] != 0;
+}
+
+bool recordedEventPassesPlaybackFilters(const Algorithm& algorithm,
+                                        const RecordedEvent& event) {
+    if (!eligiblePerformanceEvent(event)) {
+        return false;
+    }
+
+    switch (event.bytes[0] & 0xf0U) {
+    case 0xa0U:
+    case 0xd0U:
+        return !filterEnabled(algorithm, kParameterFilterAftertouch);
+    case 0xb0U:
+        return !filterEnabled(algorithm, kParameterFilterControlChange);
+    case 0xe0U:
+        return !filterEnabled(algorithm, kParameterFilterPitchBend);
+    default:
+        return true;
+    }
+}
+
 void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event) {
+    if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
+        return;
+    }
+
     const uint32_t destination = playbackDestinationMask(algorithm);
     const uint8_t status = playbackStatus(algorithm, event.bytes[0]);
     if (event.size == 2U) {
         nt_host::sendMidi2(destination, status, event.bytes[1]);
-    } else if (event.size == 3U) {
+    } else {
         nt_host::sendMidi3(destination, status, event.bytes[1], event.bytes[2]);
     }
 }
@@ -479,18 +564,6 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
 }
 
-bool eligibleStatus(uint8_t status) {
-    const uint8_t messageType = status & 0xf0U;
-    return messageType == 0x80U || messageType == 0x90U ||
-           messageType == 0xa0U || messageType == 0xb0U ||
-           messageType == 0xd0U || messageType == 0xe0U;
-}
-
-bool excludedController(uint8_t controller) {
-    return controller == 6U || controller == 38U ||
-           (controller >= 96U && controller <= 101U) || controller >= 120U;
-}
-
 void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL) {
@@ -511,8 +584,17 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     algorithm->state.lastMidi[1] = byte1;
     algorithm->state.lastMidi[2] = byte2;
 
-    if (!algorithm->captureEnabled || !algorithm->clockRunning ||
-        !eligibleStatus(byte0)) {
+    if (!algorithm->captureEnabled || !algorithm->clockRunning) {
+        return;
+    }
+
+    RecordedEvent event = {
+        algorithm->currentPulse,
+        0,
+        {byte0, byte1, byte2},
+        static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
+    };
+    if (!eligiblePerformanceEvent(event)) {
         return;
     }
 
@@ -527,20 +609,12 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     if (recordingChannel != 0 && channel != recordingChannel) {
         return;
     }
-    if ((byte0 & 0xf0U) == 0xb0U && excludedController(byte1)) {
-        return;
-    }
 
     uint64_t offset = algorithm->sampleCursor - algorithm->lastPulseSample;
     if (offset > 0xffffffffULL) {
         offset = 0xffffffffULL;
     }
-    RecordedEvent event = {
-        algorithm->currentPulse,
-        static_cast<uint32_t>(offset),
-        {byte0, byte1, byte2},
-        static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
-    };
+    event.offsetSamples = static_cast<uint32_t>(offset);
     appendEvent(*algorithm, event);
 }
 
@@ -756,6 +830,20 @@ void stopPlayback(_NT_algorithm* self) {
     if (algorithm != NULL) {
         algorithm->playbackActive = false;
     }
+}
+
+void dispatchSafetyMidi3(_NT_algorithm* self, uint8_t status, uint8_t data1,
+                         uint8_t data2) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return;
+    }
+
+    // Safety callers supply the final output channel. This path deliberately
+    // shares only destination routing with replay: recorded-event eligibility,
+    // expressive filters, and playback channel override never apply to cleanup.
+    nt_host::sendMidi3(playbackDestinationMask(*algorithm), status, data1,
+                       data2);
 }
 
 namespace nt_host {

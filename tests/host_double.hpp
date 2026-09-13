@@ -23,7 +23,7 @@ struct MidiCall {
 struct Trace {
     DrawCall drawCalls[16];
     size_t drawCallCount;
-    MidiCall midiCalls[16];
+    MidiCall midiCalls[32];
     size_t midiCallCount;
 };
 
@@ -55,7 +55,7 @@ class HostDouble {
     _NT_algorithm* algorithm_;
     uint8_t* sram_;
     uint8_t* dram_;
-    int16_t values_[8];
+    int16_t values_[16];
     float frames_[kNT_lastBus * 8];
     uint64_t hostAllocatedBytes_;
 };

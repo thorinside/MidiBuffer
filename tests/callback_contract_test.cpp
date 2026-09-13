@@ -14,6 +14,9 @@ const size_t kCaptureParameter = 2;
 const size_t kRecordingChannelParameter = 3;
 const size_t kPlaybackDestinationParameter = 4;
 const size_t kPlaybackChannelParameter = 5;
+const size_t kFilterControlChangeParameter = 6;
+const size_t kFilterPitchBendParameter = 7;
+const size_t kFilterAftertouchParameter = 8;
 
 int gFailures = 0;
 
@@ -74,6 +77,44 @@ midibuffer::CaptureSnapshot snapshot(midibuffer_test::HostDouble& host) {
     return midibuffer::captureSnapshot(host.algorithm());
 }
 
+struct HistoryImage {
+    midibuffer::RecordedEvent events[16];
+    uint32_t count;
+};
+
+HistoryImage captureHistory(midibuffer_test::HostDouble& host) {
+    HistoryImage image = {};
+    const uint32_t eventCount = snapshot(host).eventCount;
+    image.count = eventCount < ARRAY_SIZE(image.events)
+                      ? eventCount
+                      : ARRAY_SIZE(image.events);
+    for (uint32_t index = 0; index < image.count; ++index) {
+        expect(midibuffer::recordedEventAt(host.algorithm(), index,
+                                           image.events[index]),
+               "retained history can be read for byte comparison");
+    }
+    return image;
+}
+
+bool sameHistory(const HistoryImage& expected,
+                 midibuffer_test::HostDouble& host) {
+    if (snapshot(host).eventCount != expected.count) {
+        return false;
+    }
+    for (uint32_t index = 0; index < expected.count; ++index) {
+        midibuffer::RecordedEvent actual = {};
+        if (!midibuffer::recordedEventAt(host.algorithm(), index, actual) ||
+            actual.pulse != expected.events[index].pulse ||
+            actual.offsetSamples != expected.events[index].offsetSamples ||
+            actual.size != expected.events[index].size ||
+            std::memcmp(actual.bytes, expected.events[index].bytes,
+                        sizeof(actual.bytes)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
     expect(host.instantiate(3),
            "instance constructs through pluginEntry factory");
@@ -101,9 +142,8 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
             minimumRequirements.dram == 1000000U &&
             maximumRequirements.dram == 5000000U,
         "allocation requirements default and clamp to the approved byte range");
-    expect(host.requirements().numParameters == 6,
-           "clock, reset, capture, recording-channel, destination, and "
-           "playback-channel parameters are requested");
+    expect(host.requirements().numParameters == 9,
+           "stable routing controls plus three playback filters are requested");
     expect(host.requirements().dram == 3000000U,
            "selected recording bytes are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
@@ -180,6 +220,43 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                                .enumStrings[0],
                            "Original") == 0,
            "playback channel defaults to Original and offers 1 through 16");
+    expect(std::strcmp(host.algorithm()
+                           ->parameters[kFilterControlChangeParameter]
+                           .name,
+                       "Filter CC") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kFilterPitchBendParameter]
+                               .name,
+                           "Filter Pitch Bend") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kFilterAftertouchParameter]
+                               .name,
+                           "Filter Aftertouch") == 0 &&
+               host.algorithm()
+                       ->parameters[kFilterControlChangeParameter]
+                       .def == 0 &&
+               host.algorithm()->parameters[kFilterPitchBendParameter].def ==
+                   0 &&
+               host.algorithm()->parameters[kFilterAftertouchParameter].def ==
+                   0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kFilterAftertouchParameter]
+                               .enumStrings[0],
+                           "Off") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kFilterAftertouchParameter]
+                               .enumStrings[1],
+                           "On") == 0,
+           "CC, bend, and combined aftertouch filters default off so all "
+           "expression plays");
+    const _NT_parameterPages* pages = host.algorithm()->parameterPages;
+    expect(pages->numPages == 3 && pages->pages[1].numParams == 2 &&
+               pages->pages[2].numParams == 5 &&
+               pages->pages[2].params[2] ==
+                   kFilterControlChangeParameter &&
+               pages->pages[2].params[3] == kFilterPitchBendParameter &&
+               pages->pages[2].params[4] == kFilterAftertouchParameter,
+           "expressive controls exist only as three playback-page filters");
 }
 
 void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
@@ -508,6 +585,155 @@ void verifyRetainedReplayRoutingMatrix() {
            "stopped playback emits no retained events on later clock pulses");
 }
 
+void verifyRecoverableExpressionFiltering() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "expression-filter trace host constructs");
+
+    // Playback filters are deliberately already on while this one history is
+    // captured. Eligible expression must still be retained.
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    changeParameter(host, kFilterPitchBendParameter, 1);
+    changeParameter(host, kFilterAftertouchParameter, 1);
+    startCapture(host);
+    acquireClock(host);
+
+    const uint8_t recordedMessages[][3] = {
+        {0x90, 60, 100}, {0x80, 60, 0}, {0xB1, 1, 23}, {0xB2, 64, 127},
+        {0xE3, 1, 65},   {0xA4, 60, 42}, {0xD5, 77, 0},
+    };
+    const uint8_t messageSizes[] = {3, 3, 3, 3, 3, 3, 2};
+    for (size_t index = 0; index < ARRAY_SIZE(recordedMessages); ++index) {
+        sendMidi(host, recordedMessages[index][0], recordedMessages[index][1],
+                 recordedMessages[index][2]);
+    }
+
+    const uint32_t retainedEligibleCount = snapshot(host).eventCount;
+    sendMidi(host, 0xC0, 9, 0);
+    sendMidi(host, 0xF0, 1, 2);
+    const uint8_t excludedControllers[] = {
+        6, 38, 96, 97, 98, 99, 100, 101, 120, 121, 122, 123, 124, 125, 126, 127,
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(excludedControllers); ++index) {
+        sendMidi(host, 0xB0, excludedControllers[index], 99);
+    }
+    const uint8_t excludedRealtime[] = {0xF8, 0xFA, 0xFB, 0xFC};
+    for (size_t index = 0; index < ARRAY_SIZE(excludedRealtime); ++index) {
+        host.factory()->midiRealtime(host.algorithm(), excludedRealtime[index]);
+    }
+    expect(retainedEligibleCount == ARRAY_SIZE(recordedMessages) &&
+               snapshot(host).eventCount == retainedEligibleCount &&
+               host.factory()->midiSysEx == NULL,
+           "capture retains notes and eligible expression while filters are on "
+           "but excludes program, SysEx, clock/transport, Channel Mode, and "
+           "stateful parameter CCs");
+
+    const uint64_t recordedPulse = snapshot(host).currentPulse;
+    const HistoryImage recordedHistory = captureHistory(host);
+    clockPulse(host);
+    stopCapture(host);
+    expect(midibuffer::setPulseSelection(host.algorithm(), recordedPulse,
+                                         recordedPulse + 1U),
+           "single expression history is selectable for filter replay matrix");
+
+    bool allFilterCombinationsMatch = true;
+    for (uint8_t mask = 0; mask < 8U; ++mask) {
+        changeParameter(host, kFilterControlChangeParameter,
+                        (mask & 1U) != 0U ? 1 : 0);
+        changeParameter(host, kFilterPitchBendParameter,
+                        (mask & 2U) != 0U ? 1 : 0);
+        changeParameter(host, kFilterAftertouchParameter,
+                        (mask & 4U) != 0U ? 1 : 0);
+        midibuffer_test::resetTrace();
+        allFilterCombinationsMatch =
+            midibuffer::startPlayback(host.algorithm()) &&
+            allFilterCombinationsMatch;
+        clockPulse(host);
+        midibuffer::stopPlayback(host.algorithm());
+
+        size_t emittedIndex = 0;
+        const midibuffer_test::Trace& current = midibuffer_test::trace();
+        for (size_t eventIndex = 0;
+             eventIndex < ARRAY_SIZE(recordedMessages); ++eventIndex) {
+            const uint8_t type = recordedMessages[eventIndex][0] & 0xf0U;
+            const bool filtered =
+                (type == 0xb0U && (mask & 1U) != 0U) ||
+                (type == 0xe0U && (mask & 2U) != 0U) ||
+                ((type == 0xa0U || type == 0xd0U) && (mask & 4U) != 0U);
+            if (filtered) {
+                continue;
+            }
+            if (emittedIndex >= current.midiCallCount) {
+                allFilterCombinationsMatch = false;
+                continue;
+            }
+            const midibuffer_test::MidiCall& call =
+                current.midiCalls[emittedIndex++];
+            allFilterCombinationsMatch =
+                call.destination == kNT_destinationBreakout &&
+                call.size == messageSizes[eventIndex] &&
+                call.bytes[0] == recordedMessages[eventIndex][0] &&
+                call.bytes[1] == recordedMessages[eventIndex][1] &&
+                (call.size == 2U ||
+                 call.bytes[2] == recordedMessages[eventIndex][2]) &&
+                allFilterCombinationsMatch;
+        }
+        allFilterCombinationsMatch =
+            emittedIndex == current.midiCallCount &&
+            sameHistory(recordedHistory, host) && allFilterCombinationsMatch;
+    }
+    expect(allFilterCombinationsMatch,
+           "all eight playback-filter combinations suppress only their grouped "
+           "eligible expression and leave retained history byte-identical");
+
+    // Safety dispatch intentionally bypasses recorded-event filtering and the
+    // playback channel override while retaining the selected destination.
+    changeParameter(host, kPlaybackDestinationParameter, 1);
+    changeParameter(host, kPlaybackChannelParameter, 16);
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    changeParameter(host, kFilterPitchBendParameter, 1);
+    changeParameter(host, kFilterAftertouchParameter, 1);
+    midibuffer_test::resetTrace();
+    midibuffer::dispatchSafetyMidi3(host.algorithm(), 0xB2, 64, 0);
+    midibuffer::dispatchSafetyMidi3(host.algorithm(), 0x82, 60, 0);
+    const midibuffer_test::Trace& safety = midibuffer_test::trace();
+    expect(safety.midiCallCount == 2 &&
+               safety.midiCalls[0].destination == kNT_destinationUSB &&
+               safety.midiCalls[0].bytes[0] == 0xB2 &&
+               safety.midiCalls[0].bytes[1] == 64 &&
+               safety.midiCalls[0].bytes[2] == 0 &&
+               safety.midiCalls[1].destination == kNT_destinationUSB &&
+               safety.midiCalls[1].bytes[0] == 0x82,
+           "safety CC and note-off dispatch bypasses expressive filters and "
+           "recorded-event channel rewriting");
+
+    changeParameter(host, kPlaybackDestinationParameter, 0);
+    changeParameter(host, kPlaybackChannelParameter, 0);
+    changeParameter(host, kFilterControlChangeParameter, 0);
+    changeParameter(host, kFilterPitchBendParameter, 0);
+    changeParameter(host, kFilterAftertouchParameter, 0);
+    midibuffer_test::resetTrace();
+    const bool restarted = midibuffer::startPlayback(host.algorithm());
+    clockPulse(host);
+    midibuffer::stopPlayback(host.algorithm());
+    const midibuffer_test::Trace& restored = midibuffer_test::trace();
+    bool restoredBytesMatch = restarted &&
+                              restored.midiCallCount ==
+                                  ARRAY_SIZE(recordedMessages);
+    for (size_t index = 0;
+         index < restored.midiCallCount &&
+         index < ARRAY_SIZE(recordedMessages);
+         ++index) {
+        restoredBytesMatch =
+            restored.midiCalls[index].size == messageSizes[index] &&
+            std::memcmp(restored.midiCalls[index].bytes,
+                        recordedMessages[index], messageSizes[index]) == 0 &&
+            restoredBytesMatch;
+    }
+    expect(restoredBytesMatch && sameHistory(recordedHistory, host),
+           "turning every filter back off restores exact expression output "
+           "from the unchanged recorded bytes");
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -547,6 +773,7 @@ int main() {
     verifyChannelAndEventEligibility();
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();
+    verifyRecoverableExpressionFiltering();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {
