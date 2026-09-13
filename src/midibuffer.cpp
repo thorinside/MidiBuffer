@@ -16,12 +16,19 @@ const float kGateThresholdVolts = 1.0f;
 
 static_assert(sizeof(RecordedEvent) == 16,
               "recording event size is part of capacity accounting");
+static_assert(kNT_destinationBreakout == 0x01 &&
+                  kNT_destinationSelectBus == 0x02 &&
+                  kNT_destinationUSB == 0x04 &&
+                  kNT_destinationInternal == 0x08,
+              "playback destination mapping must match the pinned API");
 
 enum Parameter {
     kParameterClock,
     kParameterReset,
     kParameterCapture,
     kParameterRecordingChannel,
+    kParameterPlaybackDestination,
+    kParameterPlaybackChannel,
     kNumParameters,
 };
 
@@ -48,10 +55,10 @@ struct Algorithm : public _NT_algorithm {
           recordingBufferBytes(recordingBufferBytesValue),
           eventCapacity(recordingBufferBytesValue / sizeof(RecordedEvent)),
           eventHead(0), eventCount(0), sampleCursor(0), currentPulse(0),
-          lastPulseSample(0), lastClockIntervalSamples(0), selection(), state(),
-          captureEnabled(false), clockRunning(false),
-          haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
-          selectionValid(false) {}
+          lastPulseSample(0), lastClockIntervalSamples(0), playbackPulse(0),
+          playbackEventIndex(0), selection(), state(), captureEnabled(false),
+          clockRunning(false), haveAcquisitionPulse(false), clockHigh(false),
+          resetHigh(false), selectionValid(false), playbackActive(false) {}
 
     RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
@@ -63,6 +70,8 @@ struct Algorithm : public _NT_algorithm {
     uint64_t currentPulse;
     uint64_t lastPulseSample;
     uint64_t lastClockIntervalSamples;
+    uint64_t playbackPulse;
+    uint32_t playbackEventIndex;
     PulseRange selection;
     CallbackState state;
 
@@ -72,6 +81,7 @@ struct Algorithm : public _NT_algorithm {
     bool clockHigh;
     bool resetHigh;
     bool selectionValid;
+    bool playbackActive;
 };
 
 static const char* const kCaptureStrings[] = {
@@ -82,6 +92,15 @@ static const char* const kCaptureStrings[] = {
 static const char* const kRecordingChannelStrings[] = {
     "Omni", "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
     "9",    "10", "11", "12", "13", "14", "15", "16",
+};
+
+static const char* const kPlaybackDestinationStrings[] = {
+    "Breakout", "USB", "Select Bus", "Internal", "All",
+};
+
+static const char* const kPlaybackChannelStrings[] = {
+    "Original", "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+    "9",        "10", "11", "12", "13", "14", "15", "16",
 };
 
 // The API macros include their own trailing commas.
@@ -107,6 +126,24 @@ static const _NT_parameter kParameters[] = {
         .scaling = kNT_scalingNone,
         .enumStrings = kRecordingChannelStrings,
     },
+    {
+        .name = "MIDI Out",
+        .min = 0,
+        .max = 4,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kPlaybackDestinationStrings,
+    },
+    {
+        .name = "Play Ch",
+        .min = 0,
+        .max = 16,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kPlaybackChannelStrings,
+    },
 };
 // clang-format on
 
@@ -118,6 +155,11 @@ static const uint8_t kInputPageParameters[] = {
 static const uint8_t kCapturePageParameters[] = {
     kParameterCapture,
     kParameterRecordingChannel,
+};
+
+static const uint8_t kPlaybackPageParameters[] = {
+    kParameterPlaybackDestination,
+    kParameterPlaybackChannel,
 };
 
 static const _NT_parameterPage kParameterPageDefinitions[] = {
@@ -134,6 +176,13 @@ static const _NT_parameterPage kParameterPageDefinitions[] = {
         .group = 0,
         .unused = {0, 0},
         .params = kCapturePageParameters,
+    },
+    {
+        .name = "Playback",
+        .numParams = ARRAY_SIZE(kPlaybackPageParameters),
+        .group = 0,
+        .unused = {0, 0},
+        .params = kPlaybackPageParameters,
     },
 };
 
@@ -217,6 +266,9 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
 
 void clearSelection(Algorithm& algorithm) {
     algorithm.selectionValid = false;
+    algorithm.playbackActive = false;
+    algorithm.playbackPulse = 0;
+    algorithm.playbackEventIndex = 0;
     algorithm.selection.startPulse = 0;
     algorithm.selection.endPulse = 0;
 }
@@ -256,6 +308,93 @@ void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
     algorithm.recordingEvents[writeIndex] = event;
 }
 
+uint32_t playbackDestinationMask(const Algorithm& algorithm) {
+    int destination = 0;
+    if (algorithm.v != NULL) {
+        destination = algorithm.v[kParameterPlaybackDestination];
+    }
+
+    switch (destination) {
+    case 1:
+        return kNT_destinationUSB;
+    case 2:
+        return kNT_destinationSelectBus;
+    case 3:
+        return kNT_destinationInternal;
+    case 4:
+        return kNT_destinationBreakout | kNT_destinationUSB |
+               kNT_destinationSelectBus | kNT_destinationInternal;
+    case 0:
+    default:
+        return kNT_destinationBreakout;
+    }
+}
+
+uint8_t playbackStatus(const Algorithm& algorithm, uint8_t recordedStatus) {
+    int channel = 0;
+    if (algorithm.v != NULL) {
+        channel = algorithm.v[kParameterPlaybackChannel];
+    }
+    if (channel < 1 || channel > 16) {
+        return recordedStatus;
+    }
+    return static_cast<uint8_t>((recordedStatus & 0xf0U) |
+                                static_cast<uint8_t>(channel - 1));
+}
+
+void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event) {
+    const uint32_t destination = playbackDestinationMask(algorithm);
+    const uint8_t status = playbackStatus(algorithm, event.bytes[0]);
+    if (event.size == 2U) {
+        nt_host::sendMidi2(destination, status, event.bytes[1]);
+    } else if (event.size == 3U) {
+        nt_host::sendMidi3(destination, status, event.bytes[1], event.bytes[2]);
+    }
+}
+
+uint32_t findPlaybackEventIndex(const Algorithm& algorithm, uint64_t pulse) {
+    for (uint32_t index = 0; index < algorithm.eventCount; ++index) {
+        uint32_t ringIndex = algorithm.eventHead + index;
+        if (ringIndex >= algorithm.eventCapacity) {
+            ringIndex -= algorithm.eventCapacity;
+        }
+        if (algorithm.recordingEvents[ringIndex].pulse >= pulse) {
+            return index;
+        }
+    }
+    return algorithm.eventCount;
+}
+
+void replayCurrentPulse(Algorithm& algorithm) {
+    if (!algorithm.playbackActive || !algorithm.selectionValid) {
+        return;
+    }
+
+    while (algorithm.playbackEventIndex < algorithm.eventCount) {
+        uint32_t ringIndex =
+            algorithm.eventHead + algorithm.playbackEventIndex;
+        if (ringIndex >= algorithm.eventCapacity) {
+            ringIndex -= algorithm.eventCapacity;
+        }
+        const RecordedEvent& event = algorithm.recordingEvents[ringIndex];
+        if (event.pulse > algorithm.playbackPulse) {
+            break;
+        }
+        ++algorithm.playbackEventIndex;
+        if (event.pulse == algorithm.playbackPulse &&
+            event.pulse < algorithm.selection.endPulse) {
+            emitRecordedEvent(algorithm, event);
+        }
+    }
+
+    ++algorithm.playbackPulse;
+    if (algorithm.playbackPulse >= algorithm.selection.endPulse) {
+        algorithm.playbackPulse = algorithm.selection.startPulse;
+        algorithm.playbackEventIndex =
+            findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+    }
+}
+
 void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
     ++algorithm.state.clockEdges;
     ++algorithm.currentPulse;
@@ -266,6 +405,7 @@ void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
             algorithm.lastClockIntervalSamples = interval;
         }
         algorithm.lastPulseSample = sample;
+        replayCurrentPulse(algorithm);
         return;
     }
 
@@ -281,6 +421,7 @@ void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
         algorithm.lastClockIntervalSamples = interval;
         algorithm.clockRunning = true;
         algorithm.haveAcquisitionPulse = false;
+        replayCurrentPulse(algorithm);
     }
 }
 
@@ -520,6 +661,7 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
+    snapshot.playbackActive = algorithm->playbackActive;
     snapshot.selection = algorithm->selection;
     if (algorithm->eventCount != 0) {
         snapshot.oldestPulse =
@@ -593,6 +735,27 @@ bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range) {
 
     range = algorithm->selection;
     return true;
+}
+
+bool startPlayback(_NT_algorithm* self) {
+    Algorithm* algorithm = asAlgorithm(self);
+    PulseRange range = {};
+    if (algorithm == NULL || !acquirePlaybackSelection(self, range)) {
+        return false;
+    }
+
+    algorithm->playbackPulse = range.startPulse;
+    algorithm->playbackEventIndex =
+        findPlaybackEventIndex(*algorithm, algorithm->playbackPulse);
+    algorithm->playbackActive = true;
+    return true;
+}
+
+void stopPlayback(_NT_algorithm* self) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm != NULL) {
+        algorithm->playbackActive = false;
+    }
 }
 
 namespace nt_host {

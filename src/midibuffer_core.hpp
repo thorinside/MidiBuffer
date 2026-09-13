@@ -34,6 +34,7 @@ struct CaptureSnapshot {
     bool captureEnabled;
     bool clockRunning;
     bool selectionValid;
+    bool playbackActive;
     PulseRange selection;
 };
 
@@ -48,6 +49,12 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
                        uint64_t endPulse);
 void clearPulseSelection(_NT_algorithm* self);
 bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range);
+
+// Minimal transport seam for the clock-driven replay path. The timeline
+// controls will own this contract; starting is refused without a valid retained
+// selection.
+bool startPlayback(_NT_algorithm* self);
+void stopPlayback(_NT_algorithm* self);
 
 } // namespace midibuffer
 

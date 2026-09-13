@@ -12,6 +12,8 @@ const size_t kClockParameter = 0;
 const size_t kResetParameter = 1;
 const size_t kCaptureParameter = 2;
 const size_t kRecordingChannelParameter = 3;
+const size_t kPlaybackDestinationParameter = 4;
+const size_t kPlaybackChannelParameter = 5;
 
 int gFailures = 0;
 
@@ -99,9 +101,9 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
             minimumRequirements.dram == 1000000U &&
             maximumRequirements.dram == 5000000U,
         "allocation requirements default and clamp to the approved byte range");
-    expect(host.requirements().numParameters == 4,
-           "clock, reset, capture, and recording-channel parameters are "
-           "requested");
+    expect(host.requirements().numParameters == 6,
+           "clock, reset, capture, recording-channel, destination, and "
+           "playback-channel parameters are requested");
     expect(host.requirements().dram == 3000000U,
            "selected recording bytes are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
@@ -145,6 +147,39 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                                .enumStrings[0],
                            "Omni") == 0,
            "recording channel offers Omni and channels 1 through 16");
+    expect(host.algorithm()->parameters[kPlaybackDestinationParameter].min ==
+                   0 &&
+               host.algorithm()->parameters[kPlaybackDestinationParameter]
+                       .max == 4 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackDestinationParameter]
+                               .enumStrings[0],
+                           "Breakout") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackDestinationParameter]
+                               .enumStrings[1],
+                           "USB") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackDestinationParameter]
+                               .enumStrings[2],
+                           "Select Bus") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackDestinationParameter]
+                               .enumStrings[3],
+                           "Internal") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackDestinationParameter]
+                               .enumStrings[4],
+                           "All") == 0,
+           "playback destination exposes all five approved choices");
+    expect(host.algorithm()->parameters[kPlaybackChannelParameter].min == 0 &&
+               host.algorithm()->parameters[kPlaybackChannelParameter].max ==
+                   16 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackChannelParameter]
+                               .enumStrings[0],
+                           "Original") == 0,
+           "playback channel defaults to Original and offers 1 through 16");
 }
 
 void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
@@ -383,6 +418,96 @@ void verifyRollingHistoryAndSelectionInvalidation() {
            "mixed-density capture and ring wrap perform no heap allocation");
 }
 
+void verifyRetainedReplayRoutingMatrix() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "retained replay routing host constructs");
+    startCapture(host);
+    acquireClock(host);
+
+    const uint8_t recordedMessages[][3] = {
+        {0x81, 48, 0},   {0x92, 49, 100}, {0xA3, 50, 60},
+        {0xB4, 1, 72},   {0xD5, 80, 0},   {0xE6, 0, 64},
+    };
+    const uint8_t messageSizes[] = {3, 3, 3, 3, 2, 3};
+    for (size_t index = 0; index < ARRAY_SIZE(recordedMessages); ++index) {
+        sendMidi(host, recordedMessages[index][0], recordedMessages[index][1],
+                 recordedMessages[index][2]);
+    }
+    const uint64_t recordedPulse = snapshot(host).currentPulse;
+    clockPulse(host);
+    stopCapture(host);
+    expect(midibuffer::setPulseSelection(host.algorithm(), recordedPulse,
+                                         recordedPulse + 1U),
+           "retained pulse is selectable for replay routing");
+
+    const uint32_t destinations[] = {
+        kNT_destinationBreakout,
+        kNT_destinationUSB,
+        kNT_destinationSelectBus,
+        kNT_destinationInternal,
+        kNT_destinationBreakout | kNT_destinationUSB |
+            kNT_destinationSelectBus | kNT_destinationInternal,
+    };
+    expect(destinations[4] == 0x0fU,
+           "All is exactly the four pinned destination bits");
+
+    const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
+    bool completeMatrixMatches = true;
+    for (int destinationSetting = 0; destinationSetting < 5;
+         ++destinationSetting) {
+        changeParameter(host, kPlaybackDestinationParameter,
+                        static_cast<int16_t>(destinationSetting));
+        for (int channelSetting = 0; channelSetting <= 16; ++channelSetting) {
+            changeParameter(host, kPlaybackChannelParameter,
+                            static_cast<int16_t>(channelSetting));
+            midibuffer_test::resetTrace();
+            completeMatrixMatches =
+                midibuffer::startPlayback(host.algorithm()) &&
+                completeMatrixMatches;
+            clockPulse(host);
+            midibuffer::stopPlayback(host.algorithm());
+
+            const midibuffer_test::Trace& current = midibuffer_test::trace();
+            completeMatrixMatches =
+                current.midiCallCount == ARRAY_SIZE(recordedMessages) &&
+                completeMatrixMatches;
+            const size_t callCount =
+                current.midiCallCount < ARRAY_SIZE(recordedMessages)
+                    ? current.midiCallCount
+                    : ARRAY_SIZE(recordedMessages);
+            for (size_t index = 0; index < callCount; ++index) {
+                const uint8_t expectedStatus =
+                    channelSetting == 0
+                        ? recordedMessages[index][0]
+                        : static_cast<uint8_t>(
+                              (recordedMessages[index][0] & 0xf0U) |
+                              static_cast<uint8_t>(channelSetting - 1));
+                completeMatrixMatches =
+                    current.midiCalls[index].destination ==
+                            destinations[destinationSetting] &&
+                    current.midiCalls[index].size == messageSizes[index] &&
+                    current.midiCalls[index].bytes[0] == expectedStatus &&
+                    current.midiCalls[index].bytes[1] ==
+                        recordedMessages[index][1] &&
+                    (messageSizes[index] == 2 ||
+                     current.midiCalls[index].bytes[2] ==
+                         recordedMessages[index][2]) &&
+                    completeMatrixMatches;
+            }
+        }
+    }
+    expect(completeMatrixMatches,
+           "retained note, CC, pitch bend, and pressure traces route only to "
+           "each selected destination and preserve or override all channels");
+    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
+           "clock-driven retained replay performs no heap allocation");
+
+    midibuffer_test::resetTrace();
+    clockPulse(host);
+    expect(midibuffer_test::trace().midiCallCount == 0,
+           "stopped playback emits no retained events on later clock pulses");
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -421,6 +546,7 @@ int main() {
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyRollingHistoryAndSelectionInvalidation();
+    verifyRetainedReplayRoutingMatrix();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {
