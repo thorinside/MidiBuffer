@@ -7,7 +7,7 @@ MidiBuffer is a rolling, clock-relative MIDI recorder and looper for the Expert 
 - **Supported target:** disting NT firmware **1.18 and later**.
 - Firmware earlier than 1.18 is unsupported.
 - The plug-in builds against the pinned API v13 SDK checkout. Native host-double tests and ARM object inspection pass, but those checks do not run firmware.
-- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. A modest physical-module smoke test remains a separate pre-publication check.
+- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. The exact modest pre-publication procedure and result record are in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md).
 
 ## Install
 
@@ -158,7 +158,7 @@ The retained history contains only supported channel messages, so the replay pat
 
 Conventional output-state interpretation follows the MIDI Manufacturers Association’s *MIDI 1.0 Detailed Specification*: `8n` is Note Off, `9n` with velocity zero is treated as Note Off, and CC64 values 0–63 are sustain off while 64–127 are sustain on. Separately, sending CC64 off to a whole output channel during transport cleanup is the approved MidiBuffer product tradeoff; it can also release live sustained notes sharing that channel.
 
-Packaging/publication, external-routing redesign, selection-context reconstruction, instrument-specific silencing guarantees, additional panic gestures, MIDI transport following, corrupt/incomplete preset recovery, unsaved-change recovery, and physical power-cycle/hardware validation remain outside this delivery slice.
+Packaging/publication, external-routing redesign, selection-context reconstruction, instrument-specific silencing guarantees, additional panic gestures, MIDI transport following, corrupt/incomplete preset recovery, and unsaved-change recovery remain outside this delivery slice. Physical power-cycle/hardware validation is the separate release gate documented in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md); it remains pending until that result record is completed on a supported disting NT.
 
 ## Timing method and measured precision
 
