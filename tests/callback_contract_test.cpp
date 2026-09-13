@@ -946,6 +946,54 @@ void verifyShowAllAndRelativeTimelineNavigation() {
         }
     }
 
+    for (uint64_t span = 1U; span <= 4U; ++span) {
+        midibuffer_test::HostDouble stationary;
+        const uint64_t start = 100U;
+        const uint64_t end = start + span;
+        expect(stationary.instantiate(1) &&
+                   midibuffer::setRetainedTimelineFixture(
+                       stationary.algorithm(), start, end) &&
+                   midibuffer::setPulseSelection(stationary.algorithm(),
+                                                  start, start + 1U),
+               "short-span stationary held-zoom fixture installs");
+        const midibuffer::CaptureSnapshot before = snapshot(stationary);
+        const HistoryImage history = captureHistory(stationary);
+
+        beginRightPotZoom(stationary, 0.5f);
+        continueRightPotZoom(stationary, 0.5f);
+        continueRightPotZoom(stationary, 0.5f);
+        endRightPotZoom(stationary, 0.5f);
+        const midibuffer::CaptureSnapshot released = snapshot(stationary);
+        expect(released.timelineShowAll &&
+                   released.timelineViewStartPulse == start &&
+                   released.timelineViewEndPulse == end &&
+                   released.selection.startPulse ==
+                       before.selection.startPulse &&
+                   released.selection.endPulse == before.selection.endPulse &&
+                   released.playbackArmed == before.playbackArmed &&
+                   released.playbackActive == before.playbackActive &&
+                   released.playbackClockLossPaused ==
+                       before.playbackClockLossPaused &&
+                   sameHistory(history, stationary),
+               "repeated stationary held callbacks and release preserve Show All for retained spans one through four");
+
+        expect(midibuffer::setRetainedTimelineFixture(stationary.algorithm(),
+                                                       start, start + 8U),
+               "short-span retained history grows beyond four pulses");
+        const midibuffer::CaptureSnapshot grown = snapshot(stationary);
+        expect(grown.timelineShowAll &&
+                   grown.timelineViewStartPulse == start &&
+                   grown.timelineViewEndPulse == start + 8U &&
+                   grown.selection.startPulse == before.selection.startPulse &&
+                   grown.selection.endPulse == before.selection.endPulse &&
+                   grown.playbackArmed == before.playbackArmed &&
+                   grown.playbackActive == before.playbackActive &&
+                   grown.playbackClockLossPaused ==
+                       before.playbackClockLossPaused &&
+                   sameHistory(history, stationary),
+               "stationary short-span Show All follows retained growth without selection, event, or transport mutation");
+    }
+
     midibuffer_test::HostDouble growth;
     expect(growth.instantiate(1), "Show All growth host constructs");
     startCapture(growth);

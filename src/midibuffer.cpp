@@ -120,8 +120,9 @@ struct Algorithm : public _NT_algorithm {
           rangeTransitionPending(false), playbackPositionValid(false),
           playbackIntervalOpen(false), playbackNextEventScheduled(false),
           pendingNextEndingScheduled(false), lastMovedBoundaryIsStart(false),
-          timelineShowAll(true), rightPotZoomActive(false),
-          rightEncoderHoldActive(false), rightEncoderPanicFired(false),
+          timelineShowAll(true), zoomPressShowAll(true),
+          rightPotZoomActive(false), rightEncoderHoldActive(false),
+          rightEncoderPanicFired(false),
           pendingNextEndingSample(0), rightEncoderHoldStartSample(0) {}
 
     RecordedEvent* recordingEvents;
@@ -170,6 +171,7 @@ struct Algorithm : public _NT_algorithm {
     bool pendingNextEndingScheduled;
     bool lastMovedBoundaryIsStart;
     bool timelineShowAll;
+    bool zoomPressShowAll;
     bool rightPotZoomActive;
     bool rightEncoderHoldActive;
     bool rightEncoderPanicFired;
@@ -1953,6 +1955,7 @@ void beginTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
     algorithm.zoomPressCoordinate = coordinate;
     algorithm.zoomPressVisiblePulses =
         timelineVisibleIntervals(algorithm, retained);
+    algorithm.zoomPressShowAll = algorithm.timelineShowAll;
 }
 
 void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
@@ -1974,6 +1977,18 @@ void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
     const uint64_t minimum = retained < kTimelineMinimumVisiblePulses
                                  ? retained
                                  : kTimelineMinimumVisiblePulses;
+
+    if (coordinate == algorithm.zoomPressCoordinate) {
+        algorithm.timelineShowAll = algorithm.zoomPressShowAll;
+        if (algorithm.zoomPressShowAll) {
+            algorithm.timelineScrollPulses = 0U;
+        } else {
+            algorithm.timelineVisiblePulses =
+                algorithm.zoomPressVisiblePulses;
+            scrollTimeline(algorithm, 0);
+        }
+        return;
+    }
 
     if (coordinate > algorithm.zoomPressCoordinate) {
         if (startSpan >= retained) {
