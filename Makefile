@@ -2,6 +2,7 @@ PLUGIN_NAME := MidiBuffer
 API_INCLUDE := distingNT_API/include
 SOURCE := src/midibuffer.cpp
 NATIVE_TEST := build/callback_contract_test
+RANGE_MOTION_TEST := build/range_motion_test
 ARM_OBJECT := plugins/$(PLUGIN_NAME).o
 
 NATIVE_CXX ?= clang++
@@ -19,8 +20,9 @@ ARM_FLAGS := $(COMMON_FLAGS) -Os -fPIC -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-ab
 
 all: verify
 
-test: $(NATIVE_TEST)
+test: $(NATIVE_TEST) $(RANGE_MOTION_TEST)
 	./$(NATIVE_TEST)
+	./$(RANGE_MOTION_TEST)
 
 hardware: $(ARM_OBJECT)
 
@@ -38,6 +40,9 @@ verify: test hardware inspect
 
 $(NATIVE_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp tests/host_double.cpp tests/host_double.hpp tests/callback_contract_test.cpp | build
 	$(NATIVE_CXX) $(NATIVE_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/callback_contract_test.cpp -o $@
+
+$(RANGE_MOTION_TEST): src/range_motion.hpp tests/range_motion_test.cpp | build
+	$(NATIVE_CXX) $(COMMON_FLAGS) tests/range_motion_test.cpp -o $@
 
 $(ARM_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp | plugins
 	$(ARM_CXX) $(ARM_FLAGS) -c $(SOURCE) -o $@
