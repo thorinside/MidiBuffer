@@ -41,6 +41,7 @@ struct CaptureSnapshot {
     bool selectionValid;
     bool playbackArmed;
     bool playbackActive;
+    bool playbackClockLossPaused;
     PulseRange selection;
 };
 
@@ -57,8 +58,8 @@ void clearPulseSelection(_NT_algorithm* self);
 bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range);
 
 // Transport seam for pulse-boundary arming and proportional between-pulse
-// replay. Timeline controls will own this contract; starting is refused without
-// a valid retained selection.
+// replay. Starting pauses/finalizes capture. Manual stop releases playback-held
+// notes/sustain while preserving position; only reset returns to range start.
 bool startPlayback(_NT_algorithm* self);
 void stopPlayback(_NT_algorithm* self);
 

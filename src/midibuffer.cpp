@@ -64,6 +64,18 @@ struct RecordedState {
     uint8_t expressionMasks[16];
 };
 
+enum TransportState {
+    kTransportStopped,
+    kTransportArmed,
+    kTransportPlaying,
+    kTransportClockLossPaused,
+};
+
+struct PlaybackOutputState {
+    uint32_t heldNoteCounts[16][128];
+    uint16_t sustainChannels;
+};
+
 struct Algorithm : public _NT_algorithm {
     Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
         : _NT_algorithm(),
@@ -76,10 +88,12 @@ struct Algorithm : public _NT_algorithm {
           playbackIntervalStartSample(0), playbackNextEventSample(0),
           playbackEventIndex(0), clockIntervalWriteIndex(0),
           clockIntervalCount(0), clockIntervals(), selection(), state(),
-          recordedState(), captureEnabled(false), clockRunning(false),
-          haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
-          selectionValid(false), playbackArmed(false), playbackActive(false),
-          playbackIntervalOpen(false), playbackNextEventScheduled(false) {}
+          recordedState(), playbackOutputState(),
+          transportState(kTransportStopped), captureEnabled(false),
+          clockRunning(false), haveAcquisitionPulse(false), clockHigh(false),
+          resetHigh(false), selectionValid(false),
+          playbackPositionValid(false), playbackIntervalOpen(false),
+          playbackNextEventScheduled(false) {}
 
     RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
@@ -103,6 +117,8 @@ struct Algorithm : public _NT_algorithm {
     PulseRange selection;
     CallbackState state;
     RecordedState recordedState;
+    PlaybackOutputState playbackOutputState;
+    TransportState transportState;
 
     bool captureEnabled;
     bool clockRunning;
@@ -110,8 +126,7 @@ struct Algorithm : public _NT_algorithm {
     bool clockHigh;
     bool resetHigh;
     bool selectionValid;
-    bool playbackArmed;
-    bool playbackActive;
+    bool playbackPositionValid;
     bool playbackIntervalOpen;
     bool playbackNextEventScheduled;
 };
@@ -326,7 +341,8 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
                                kParameters[kParameterCapture].min;
         if (!requested) {
             finalizeCapture(*algorithm);
-        } else if (!algorithm->captureEnabled) {
+        } else if (!algorithm->captureEnabled &&
+                   algorithm->transportState == kTransportStopped) {
             algorithm->recordedState = RecordedState();
             algorithm->captureEnabled = true;
         }
@@ -341,8 +357,9 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
 
 void clearSelection(Algorithm& algorithm) {
     algorithm.selectionValid = false;
-    algorithm.playbackArmed = false;
-    algorithm.playbackActive = false;
+    algorithm.transportState = kTransportStopped;
+    algorithm.playbackOutputState = PlaybackOutputState();
+    algorithm.playbackPositionValid = false;
     algorithm.playbackIntervalOpen = false;
     algorithm.playbackNextEventScheduled = false;
     algorithm.playbackPulse = 0;
@@ -647,7 +664,40 @@ bool recordedEventPassesPlaybackFilters(const Algorithm& algorithm,
     }
 }
 
-void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event,
+void trackPlaybackOutput(Algorithm& algorithm, uint8_t status, uint8_t data1,
+                         uint8_t data2, uint8_t size) {
+    if (size != 3U) {
+        return;
+    }
+
+    const uint8_t type = status & 0xf0U;
+    const uint8_t channel = status & 0x0fU;
+    if (type == 0x80U || type == 0x90U) {
+        uint32_t& count =
+            algorithm.playbackOutputState.heldNoteCounts[channel][data1 & 0x7fU];
+        const bool noteOn = type == 0x90U && data2 != 0U;
+        if (noteOn && count != 0xffffffffU) {
+            ++count;
+        } else if (!noteOn && count != 0U) {
+            --count;
+        }
+    } else if (type == 0xb0U && data1 == 64U) {
+        const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+        if (data2 >= 64U) {
+            algorithm.playbackOutputState.sustainChannels =
+                static_cast<uint16_t>(
+                    algorithm.playbackOutputState.sustainChannels |
+                    channelBit);
+        } else {
+            algorithm.playbackOutputState.sustainChannels =
+                static_cast<uint16_t>(
+                    algorithm.playbackOutputState.sustainChannels &
+                    ~channelBit);
+        }
+    }
+}
+
+void emitRecordedEvent(Algorithm& algorithm, const RecordedEvent& event,
                        uint64_t dispatchSample) {
     if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
         return;
@@ -662,6 +712,32 @@ void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event,
         nt_host::sendMidi3(destination, status, event.bytes[1], event.bytes[2],
                            dispatchSample);
     }
+    trackPlaybackOutput(algorithm, status, event.bytes[1], event.bytes[2],
+                        event.size);
+}
+
+void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample) {
+    const uint32_t destination = playbackDestinationMask(algorithm);
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            const uint32_t count =
+                algorithm.playbackOutputState.heldNoteCounts[channel][note];
+            for (uint32_t occurrence = 0; occurrence < count; ++occurrence) {
+                nt_host::sendMidi3(destination,
+                                   static_cast<uint8_t>(0x80U | channel),
+                                   note, 0, dispatchSample);
+            }
+        }
+    }
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        if ((algorithm.playbackOutputState.sustainChannels &
+             static_cast<uint16_t>(1U << channel)) != 0U) {
+            nt_host::sendMidi3(destination,
+                               static_cast<uint8_t>(0xb0U | channel), 64, 0,
+                               dispatchSample);
+        }
+    }
+    algorithm.playbackOutputState = PlaybackOutputState();
 }
 
 uint32_t findPlaybackEventIndex(const Algorithm& algorithm, uint64_t pulse) {
@@ -781,8 +857,8 @@ void scheduleNextPlaybackEvent(Algorithm& algorithm) {
 }
 
 void dispatchDuePlaybackEvents(Algorithm& algorithm, uint64_t sample) {
-    if (!algorithm.playbackActive || !algorithm.playbackIntervalOpen ||
-        !algorithm.selectionValid) {
+    if (algorithm.transportState != kTransportPlaying ||
+        !algorithm.playbackIntervalOpen || !algorithm.selectionValid) {
         return;
     }
 
@@ -796,7 +872,8 @@ void dispatchDuePlaybackEvents(Algorithm& algorithm, uint64_t sample) {
 }
 
 void flushPendingPlaybackEvents(Algorithm& algorithm, uint64_t sample) {
-    if (!algorithm.playbackActive || !algorithm.playbackIntervalOpen) {
+    if (algorithm.transportState != kTransportPlaying ||
+        !algorithm.playbackIntervalOpen) {
         return;
     }
 
@@ -827,19 +904,21 @@ void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
     dispatchDuePlaybackEvents(algorithm, sample);
 }
 
-void activateArmedPlayback(Algorithm& algorithm, uint64_t sample) {
-    algorithm.playbackArmed = false;
-    algorithm.playbackActive = true;
-    algorithm.playbackPulse = algorithm.selection.startPulse;
-    algorithm.playbackEventIndex =
-        findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+void activatePendingPlayback(Algorithm& algorithm, uint64_t sample) {
+    if (!algorithm.playbackPositionValid) {
+        algorithm.playbackPulse = algorithm.selection.startPulse;
+        algorithm.playbackEventIndex =
+            findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+        algorithm.playbackPositionValid = true;
+    }
+    algorithm.transportState = kTransportPlaying;
     beginPlaybackInterval(algorithm, sample);
 }
 
 void beginOrAdvancePlayback(Algorithm& algorithm, uint64_t sample) {
-    if (algorithm.playbackArmed) {
-        activateArmedPlayback(algorithm, sample);
-    } else if (algorithm.playbackActive) {
+    if (algorithm.transportState == kTransportArmed) {
+        activatePendingPlayback(algorithm, sample);
+    } else if (algorithm.transportState == kTransportPlaying) {
         advancePlaybackPulse(algorithm);
         beginPlaybackInterval(algorithm, sample);
     }
@@ -874,10 +953,9 @@ void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
         addClockInterval(algorithm, interval);
         algorithm.clockRunning = true;
         algorithm.haveAcquisitionPulse = false;
-        if (algorithm.playbackArmed) {
-            activateArmedPlayback(algorithm, sample);
-        } else if (algorithm.playbackActive) {
-            beginPlaybackInterval(algorithm, sample);
+        if (algorithm.transportState == kTransportArmed ||
+            algorithm.transportState == kTransportClockLossPaused) {
+            activatePendingPlayback(algorithm, sample);
         }
     }
 }
@@ -893,12 +971,38 @@ void detectClockLoss(Algorithm& algorithm, uint64_t sample) {
             ? ~static_cast<uint64_t>(0)
             : algorithm.lastClockIntervalSamples * 2U;
     if (sample - algorithm.lastPulseSample >= lossDelay) {
+        if (algorithm.transportState == kTransportPlaying ||
+            algorithm.transportState == kTransportArmed) {
+            releasePlaybackOutput(algorithm, sample);
+            algorithm.transportState = kTransportClockLossPaused;
+        }
         algorithm.clockRunning = false;
         algorithm.haveAcquisitionPulse = false;
         algorithm.lastClockIntervalSamples = 0;
         algorithm.playbackIntervalOpen = false;
         algorithm.playbackNextEventScheduled = false;
         clearClockAverage(algorithm);
+    }
+}
+
+void handleResetEdge(Algorithm& algorithm, uint64_t sample) {
+    ++algorithm.state.resetEdges;
+    releasePlaybackOutput(algorithm, sample);
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+
+    if (!algorithm.selectionValid) {
+        algorithm.playbackPositionValid = false;
+        algorithm.transportState = kTransportStopped;
+        return;
+    }
+
+    algorithm.playbackPulse = algorithm.selection.startPulse;
+    algorithm.playbackEventIndex =
+        findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+    algorithm.playbackPositionValid = true;
+    if (algorithm.transportState == kTransportPlaying) {
+        algorithm.transportState = kTransportArmed;
     }
 }
 
@@ -922,22 +1026,27 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     for (int frame = 0; frame < numFrames; ++frame) {
         const bool clockHigh =
             clockFrames != NULL && clockFrames[frame] > kGateThresholdVolts;
-        if (clockHigh && !algorithm->clockHigh) {
+        const bool resetHigh =
+            resetFrames != NULL && resetFrames[frame] > kGateThresholdVolts;
+        const bool clockEdge = clockHigh && !algorithm->clockHigh;
+        const bool resetEdge = resetHigh && !algorithm->resetHigh;
+        algorithm->clockHigh = clockHigh;
+        algorithm->resetHigh = resetHigh;
+
+        // Reset is intentionally ordered before clock at the same frame. It
+        // releases old output ownership and repositions first, so the clock can
+        // then open (and only then emit) the selected loop's first beat.
+        if (resetEdge) {
+            handleResetEdge(*algorithm, algorithm->sampleCursor);
+        }
+        if (clockEdge) {
             handleClockEdge(*algorithm, algorithm->sampleCursor);
         } else {
             detectClockLoss(*algorithm, algorithm->sampleCursor);
         }
-        algorithm->clockHigh = clockHigh;
         if (algorithm->clockRunning) {
             dispatchDuePlaybackEvents(*algorithm, algorithm->sampleCursor);
         }
-
-        const bool resetHigh =
-            resetFrames != NULL && resetFrames[frame] > kGateThresholdVolts;
-        if (resetHigh && !algorithm->resetHigh) {
-            ++algorithm->state.resetEdges;
-        }
-        algorithm->resetHigh = resetHigh;
         ++algorithm->sampleCursor;
     }
 }
@@ -1124,8 +1233,12 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
-    snapshot.playbackArmed = algorithm->playbackArmed;
-    snapshot.playbackActive = algorithm->playbackActive;
+    snapshot.playbackArmed =
+        algorithm->transportState == kTransportArmed;
+    snapshot.playbackActive =
+        algorithm->transportState == kTransportPlaying;
+    snapshot.playbackClockLossPaused =
+        algorithm->transportState == kTransportClockLossPaused;
     snapshot.selection = algorithm->selection;
     if (algorithm->eventCount != 0) {
         snapshot.oldestPulse =
@@ -1173,6 +1286,7 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
     algorithm->selection.startPulse = startPulse;
     algorithm->selection.endPulse = endPulse;
     algorithm->selectionValid = true;
+    algorithm->playbackPositionValid = false;
     return true;
 }
 
@@ -1210,28 +1324,36 @@ bool startPlayback(_NT_algorithm* self) {
     }
     // Playback is a capture-stop path: freeze a finite performance before
     // validating its retained selection, without transmitting live cleanup.
+    // Capture never restarts as a side effect of any transport transition.
     finalizeCapture(*algorithm);
 
     PulseRange range = {};
     if (!acquirePlaybackSelection(self, range)) {
         return false;
     }
+    if (algorithm->transportState != kTransportStopped) {
+        return true;
+    }
 
-    algorithm->playbackPulse = range.startPulse;
-    algorithm->playbackEventIndex =
-        findPlaybackEventIndex(*algorithm, algorithm->playbackPulse);
+    if (!algorithm->playbackPositionValid ||
+        algorithm->playbackPulse < range.startPulse ||
+        algorithm->playbackPulse >= range.endPulse) {
+        algorithm->playbackPulse = range.startPulse;
+        algorithm->playbackEventIndex =
+            findPlaybackEventIndex(*algorithm, algorithm->playbackPulse);
+        algorithm->playbackPositionValid = true;
+    }
     algorithm->playbackIntervalOpen = false;
     algorithm->playbackNextEventScheduled = false;
-    algorithm->playbackActive = false;
-    algorithm->playbackArmed = true;
+    algorithm->transportState = kTransportArmed;
     return true;
 }
 
 void stopPlayback(_NT_algorithm* self) {
     Algorithm* algorithm = asAlgorithm(self);
     if (algorithm != NULL) {
-        algorithm->playbackArmed = false;
-        algorithm->playbackActive = false;
+        releasePlaybackOutput(*algorithm, algorithm->sampleCursor);
+        algorithm->transportState = kTransportStopped;
         algorithm->playbackIntervalOpen = false;
         algorithm->playbackNextEventScheduled = false;
     }

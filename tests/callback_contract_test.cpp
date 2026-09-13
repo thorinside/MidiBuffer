@@ -63,6 +63,19 @@ void noClockBlock(midibuffer_test::HostDouble& host) {
     host.step(2);
 }
 
+void resetPulse(midibuffer_test::HostDouble& host) {
+    host.clearFrames();
+    host.bus(2)[0] = 2.0f;
+    host.step(2);
+}
+
+void coincidentResetAndClockPulse(midibuffer_test::HostDouble& host) {
+    host.clearFrames();
+    host.bus(1)[0] = 2.0f;
+    host.bus(2)[0] = 2.0f;
+    host.step(2);
+}
+
 bool clockPulseAt(midibuffer_test::HostDouble& host, uint64_t sample) {
     if (sample < host.elapsedSamples()) {
         return false;
@@ -777,7 +790,7 @@ void verifyRetainedReplayRoutingMatrix() {
 
             const midibuffer_test::Trace& current = midibuffer_test::trace();
             completeMatrixMatches =
-                current.midiCallCount == ARRAY_SIZE(recordedMessages) &&
+                current.midiCallCount == ARRAY_SIZE(recordedMessages) + 1U &&
                 completeMatrixMatches;
             const size_t callCount =
                 current.midiCallCount < ARRAY_SIZE(recordedMessages)
@@ -802,11 +815,25 @@ void verifyRetainedReplayRoutingMatrix() {
                          recordedMessages[index][2]) &&
                     completeMatrixMatches;
             }
+            if (current.midiCallCount > ARRAY_SIZE(recordedMessages)) {
+                const midibuffer_test::MidiCall& cleanup =
+                    current.midiCalls[ARRAY_SIZE(recordedMessages)];
+                const uint8_t expectedCleanupStatus =
+                    channelSetting == 0
+                        ? 0x82U
+                        : static_cast<uint8_t>(0x80U | channelSetting - 1U);
+                completeMatrixMatches =
+                    cleanup.destination == destinations[destinationSetting] &&
+                    cleanup.bytes[0] == expectedCleanupStatus &&
+                    cleanup.bytes[1] == 49U && cleanup.bytes[2] == 0U &&
+                    completeMatrixMatches;
+            }
         }
     }
     expect(completeMatrixMatches,
            "retained note, CC, pitch bend, and pressure traces route only to "
-           "each selected destination and preserve or override all channels");
+           "each selected destination and preserve or override all channels; "
+           "manual stop releases the held routed note");
     expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
            "clock-driven retained replay performs no heap allocation");
 
@@ -1183,6 +1210,285 @@ void verifyPlaybackClockAcquisition() {
            "second acquisition pulse measures tempo and starts playback there");
 }
 
+struct TransportFixture {
+    uint64_t firstSelectedPulse;
+    uint64_t lastClockSample;
+};
+
+TransportFixture prepareTransportHistory(midibuffer_test::HostDouble& host,
+                                         uint32_t interval = 16U) {
+    TransportFixture fixture = {};
+    expect(host.instantiate(1), "transport trace host constructs");
+    startCapture(host);
+    expect(clockPulseAt(host, 0), "transport history receives first pulse");
+    expect(clockPulseAt(host, interval),
+           "transport history acquires its source tempo");
+    fixture.firstSelectedPulse = snapshot(host).currentPulse;
+    sendMidi(host, 0x92, 60, 100);
+    sendMidi(host, 0xB2, 64, 127);
+    expect(clockPulseAt(host, interval * 2U),
+           "transport history advances to its release pulse");
+    sendMidi(host, 0x82, 60, 0);
+    sendMidi(host, 0xB2, 64, 0);
+    expect(clockPulseAt(host, interval * 3U),
+           "transport history closes its selected range");
+    fixture.lastClockSample = static_cast<uint64_t>(interval) * 3U;
+    stopCapture(host);
+    expect(midibuffer::setPulseSelection(
+               host.algorithm(), fixture.firstSelectedPulse,
+               fixture.firstSelectedPulse + 2U),
+           "two-pulse transport history is selectable");
+    return fixture;
+}
+
+void beginTransportOnHeldFirstBeat(midibuffer_test::HostDouble& host,
+                                   TransportFixture& fixture,
+                                   uint32_t interval = 16U,
+                                   uint8_t outputChannel = 2U) {
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "transport playback arms");
+    fixture.lastClockSample += interval;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "transport playback receives its start pulse");
+    stepThrough(host, fixture.lastClockSample + interval / 2U);
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    expect(current.midiCallCount == 2U &&
+               current.midiCalls[0].bytes[0] ==
+                   static_cast<uint8_t>(0x90U | outputChannel) &&
+               current.midiCalls[0].bytes[1] == 60U &&
+               current.midiCalls[1].bytes[0] ==
+                   static_cast<uint8_t>(0xB0U | outputChannel) &&
+               current.midiCalls[1].bytes[1] == 64U &&
+               current.midiCalls[1].bytes[2] == 127U,
+           "first selected beat leaves one playback note and sustain held");
+}
+
+void verifyPlaybackCaptureExclusionAndManualStop() {
+    midibuffer_test::HostDouble captureHost;
+    expect(captureHost.instantiate(1),
+           "playback/capture exclusion host constructs");
+    startCapture(captureHost);
+    acquireClock(captureHost);
+    const uint64_t selectedPulse = snapshot(captureHost).currentPulse;
+    sendMidi(captureHost, 0x90, 48, 100);
+    clockPulse(captureHost);
+    expect(midibuffer::setPulseSelection(captureHost.algorithm(),
+                                         selectedPulse,
+                                         selectedPulse + 1U),
+           "active capture range is selected before playback entry");
+    expect(midibuffer::startPlayback(captureHost.algorithm()),
+           "playback entry finalizes active capture");
+    const HistoryImage finalizedHistory = captureHistory(captureHost);
+    expect(!snapshot(captureHost).captureEnabled &&
+               finalizedHistory.count == 2U,
+           "playback entry pauses capture and stores its outstanding ending");
+    startCapture(captureHost);
+    expect(!snapshot(captureHost).captureEnabled,
+           "Start Capture cannot overlap enabled playback");
+    sendMidi(captureHost, 0x90, 49, 100);
+    clockPulse(captureHost);
+    sendMidi(captureHost, 0x90, 50, 100);
+    expect(sameHistory(finalizedHistory, captureHost),
+           "incoming MIDI leaves finalized history stable during playback");
+    midibuffer::stopPlayback(captureHost.algorithm());
+    sendMidi(captureHost, 0x90, 51, 100);
+    expect(!snapshot(captureHost).captureEnabled &&
+               sameHistory(finalizedHistory, captureHost),
+           "manual playback stop does not implicitly restart capture");
+    startCapture(captureHost);
+    sendMidi(captureHost, 0x90, 52, 100);
+    expect(snapshot(captureHost).captureEnabled &&
+               snapshot(captureHost).eventCount == finalizedHistory.count + 1U,
+           "only explicit Start Capture admits MIDI after playback stop");
+
+    midibuffer_test::HostDouble stopHost;
+    TransportFixture stopFixture = prepareTransportHistory(stopHost);
+    changeParameter(stopHost, kPlaybackDestinationParameter, 1);
+    changeParameter(stopHost, kPlaybackChannelParameter, 5);
+    beginTransportOnHeldFirstBeat(stopHost, stopFixture, 16U, 4U);
+    changeParameter(stopHost, kFilterControlChangeParameter, 1);
+    changeParameter(stopHost, kFilterPitchBendParameter, 1);
+    changeParameter(stopHost, kFilterAftertouchParameter, 1);
+    const uint64_t stoppedPulse = snapshot(stopHost).playbackPulse;
+    const HistoryImage beforeStop = captureHistory(stopHost);
+    midibuffer_test::resetTrace();
+    midibuffer::stopPlayback(stopHost.algorithm());
+    const midibuffer_test::Trace& cleanup = midibuffer_test::trace();
+    expect(cleanup.midiCallCount == 2U &&
+               cleanup.midiCalls[0].destination == kNT_destinationUSB &&
+               cleanup.midiCalls[0].bytes[0] == 0x84U &&
+               cleanup.midiCalls[0].bytes[1] == 60U &&
+               cleanup.midiCalls[1].bytes[0] == 0xB4U &&
+               cleanup.midiCalls[1].bytes[1] == 64U &&
+               cleanup.midiCalls[1].bytes[2] == 0U,
+           "manual stop immediately sends routed note-off then sustain-off "
+           "through the filter-bypassing safety path");
+    expect(!snapshot(stopHost).playbackActive &&
+               snapshot(stopHost).playbackPulse == stoppedPulse &&
+               sameHistory(beforeStop, stopHost),
+           "manual stop preserves playback position and retained history");
+
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(stopHost.algorithm()),
+           "manual-stop playback rearms from its saved position");
+    expect(clockPulseAt(stopHost, stopHost.elapsedSamples()),
+           "saved-position playback receives its continuation pulse");
+    stepThrough(stopHost, stopHost.elapsedSamples());
+    bool noRetrigger = true;
+    for (size_t index = 0; index < midibuffer_test::trace().midiCallCount;
+         ++index) {
+        noRetrigger = noRetrigger &&
+                      (midibuffer_test::trace().midiCalls[index].bytes[0] &
+                       0xf0U) != 0x90U;
+    }
+    expect(noRetrigger && snapshot(stopHost).playbackPulse == stoppedPulse,
+           "manual restart continues the saved interval without replaying its "
+           "already-consumed attack");
+}
+
+void verifyResetCleanupAndCoincidence() {
+    midibuffer_test::HostDouble host;
+    TransportFixture fixture = prepareTransportHistory(host);
+    changeParameter(host, kPlaybackDestinationParameter, 1);
+    changeParameter(host, kPlaybackChannelParameter, 5);
+    beginTransportOnHeldFirstBeat(host, fixture, 16U, 4U);
+
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    changeParameter(host, kFilterPitchBendParameter, 1);
+    changeParameter(host, kFilterAftertouchParameter, 1);
+    const HistoryImage beforeReset = captureHistory(host);
+    midibuffer_test::resetTrace();
+    resetPulse(host);
+    const midibuffer_test::Trace& reset = midibuffer_test::trace();
+    expect(reset.midiCallCount == 2U &&
+               reset.midiCalls[0].destination == kNT_destinationUSB &&
+               reset.midiCalls[0].bytes[0] == 0x84U &&
+               reset.midiCalls[0].bytes[1] == 60U &&
+               reset.midiCalls[1].bytes[0] == 0xB4U &&
+               reset.midiCalls[1].bytes[1] == 64U &&
+               reset.midiCalls[1].bytes[2] == 0U,
+           "independent reset immediately orders note cleanup before sustain "
+           "cleanup despite active expressive filters");
+    expect(snapshot(host).playbackArmed &&
+               snapshot(host).playbackPulse == fixture.firstSelectedPulse &&
+               sameHistory(beforeReset, host),
+           "reset repositions to the selection start without emitting attacks");
+
+    changeParameter(host, kFilterControlChangeParameter, 0);
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(host, host.elapsedSamples()),
+           "clock after independent reset opens the first selected beat");
+    stepThrough(host, host.elapsedSamples());
+    expect(midibuffer_test::trace().midiCallCount == 2U,
+           "first beat after reset restores its note and sustain state");
+
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    midibuffer_test::resetTrace();
+    coincidentResetAndClockPulse(host);
+    noClockBlock(host);
+    const midibuffer_test::Trace& coincident = midibuffer_test::trace();
+    expect(coincident.midiCallCount == 3U &&
+               coincident.midiCalls[0].bytes[0] == 0x84U &&
+               coincident.midiCalls[1].bytes[0] == 0xB4U &&
+               coincident.midiCalls[1].bytes[1] == 64U &&
+               coincident.midiCalls[1].bytes[2] == 0U &&
+               coincident.midiCalls[2].bytes[0] == 0x94U &&
+               coincident.midiCalls[2].bytes[1] == 60U,
+           "coincident reset and clock emits note-off then sustain-off before "
+           "the loop's unskipped first-beat attack");
+}
+
+void verifyClockLossCleanupAndContinuation() {
+    midibuffer_test::HostDouble host;
+    TransportFixture fixture = prepareTransportHistory(host);
+    beginTransportOnHeldFirstBeat(host, fixture);
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    changeParameter(host, kFilterPitchBendParameter, 1);
+    changeParameter(host, kFilterAftertouchParameter, 1);
+    const uint64_t pausedPulse = snapshot(host).playbackPulse;
+    const HistoryImage beforeLoss = captureHistory(host);
+
+    midibuffer_test::resetTrace();
+    while (host.elapsedSamples() < fixture.lastClockSample + 32U) {
+        noClockBlock(host);
+    }
+    expect(snapshot(host).clockRunning &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "clock remains running until two complete last-measured intervals");
+    noClockBlock(host);
+    const midibuffer_test::Trace& loss = midibuffer_test::trace();
+    expect(!snapshot(host).clockRunning &&
+               snapshot(host).playbackClockLossPaused &&
+               snapshot(host).playbackPulse == pausedPulse &&
+               loss.midiCallCount == 2U &&
+               loss.midiCalls[0].bytes[0] == 0x82U &&
+               loss.midiCalls[1].bytes[0] == 0xB2U &&
+               loss.midiCalls[1].bytes[1] == 64U &&
+               loss.midiCalls[1].bytes[2] == 0U,
+           "declared clock loss pauses at the saved position and orders every "
+           "held-note release before sustain-off");
+    expect(sameHistory(beforeLoss, host),
+           "clock-loss cleanup does not modify retained history");
+
+    midibuffer_test::resetTrace();
+    const uint64_t firstReturn = host.elapsedSamples();
+    expect(clockPulseAt(host, firstReturn) &&
+               snapshot(host).playbackClockLossPaused &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "first returning pulse only begins fresh tempo acquisition");
+    const uint64_t secondReturn = firstReturn + 16U;
+    expect(clockPulseAt(host, secondReturn) &&
+               snapshot(host).clockRunning &&
+               snapshot(host).playbackActive &&
+               snapshot(host).playbackPulse == pausedPulse,
+           "second returning pulse measures current tempo and continues the "
+           "saved playback interval");
+    stepThrough(host, secondReturn + 8U);
+    bool noFabricatedAttack = true;
+    for (size_t index = 0; index < midibuffer_test::trace().midiCallCount;
+         ++index) {
+        noFabricatedAttack =
+            noFabricatedAttack &&
+            (midibuffer_test::trace().midiCalls[index].bytes[0] & 0xf0U) !=
+                0x90U;
+    }
+    expect(noFabricatedAttack,
+           "clock reacquisition does not retrigger notes silenced at loss");
+    const uint64_t continuedPulse = secondReturn + 16U;
+    expect(clockPulseAt(host, continuedPulse),
+           "reacquired clock advances from the saved interval");
+    stepThrough(host, continuedPulse + 8U);
+    noFabricatedAttack = true;
+    for (size_t index = 0; index < midibuffer_test::trace().midiCallCount;
+         ++index) {
+        noFabricatedAttack =
+            noFabricatedAttack &&
+            (midibuffer_test::trace().midiCalls[index].bytes[0] & 0xf0U) !=
+                0x90U;
+    }
+    expect(snapshot(host).playbackPulse == pausedPulse + 1U &&
+               noFabricatedAttack,
+           "continuation reaches the following recorded pulse without a "
+           "replacement attack");
+
+    midibuffer_test::HostDouble exactDelay;
+    expect(exactDelay.instantiate(1),
+           "500 ms loss-threshold host constructs");
+    expect(clockPulseAt(exactDelay, 0U) &&
+               clockPulseAt(exactDelay, 24000U),
+           "48 kHz host measures a 500 ms clock interval");
+    while (exactDelay.elapsedSamples() < 72000U) {
+        noClockBlock(exactDelay);
+    }
+    expect(snapshot(exactDelay).clockRunning,
+           "500 ms clock remains live through sample 71999");
+    noClockBlock(exactDelay);
+    expect(!snapshot(exactDelay).clockRunning,
+           "500 ms last interval declares loss exactly at 1 second without a "
+           "pulse");
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -1227,6 +1533,9 @@ int main() {
     verifyRunningAverageAndProportionalScheduling();
     verifyEarlyPulseCatchUpOrder();
     verifyPlaybackClockAcquisition();
+    verifyPlaybackCaptureExclusionAndManualStop();
+    verifyResetCleanupAndCoincidence();
+    verifyClockLossCleanupAndContinuation();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {
