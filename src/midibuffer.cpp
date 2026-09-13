@@ -2683,6 +2683,17 @@ bool deserialiseEvents(_NT_jsonParse& parse, Algorithm& algorithm) {
     return offset == byteCount;
 }
 
+uint32_t legacyTimelineVisiblePulses(const Algorithm& algorithm) {
+    // The appended navigation member is authoritative for new readers. Keep
+    // the original v1 slot valid for legacy readers without narrowing or
+    // silently clamping an unlimited manual span to 256 pulses.
+    return algorithm.timelineVisiblePulses >= kTimelineMinimumVisiblePulses &&
+                   algorithm.timelineVisiblePulses <=
+                       kTimelineLegacyMaximumVisiblePulses
+               ? static_cast<uint32_t>(algorithm.timelineVisiblePulses)
+               : static_cast<uint32_t>(kDefaultTimelineVisiblePulses);
+}
+
 void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     const Algorithm* algorithm = static_cast<const Algorithm*>(self);
     if (algorithm == NULL) {
@@ -2727,7 +2738,7 @@ void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     addUnsigned32(stream, algorithm->playbackEventIndex);
     addUnsigned32(stream, algorithm->clockIntervalWriteIndex);
     addUnsigned32(stream, algorithm->clockIntervalCount);
-    addUnsigned32(stream, algorithm->timelineVisiblePulses);
+    addUnsigned32(stream, legacyTimelineVisiblePulses(*algorithm));
     stream.closeArray();
 
     stream.addMemberName("flags");
@@ -2752,6 +2763,18 @@ void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     stream.addBoolean(false);  // encoder button state is physical input
     stream.addBoolean(false);
     stream.addNumber(static_cast<int>(algorithm->transportState));
+    stream.closeArray();
+
+    // Approved v1 compatibility extension. The unchanged u32/flags fields
+    // above let old complete presets keep loading and give legacy readers a
+    // valid fallback. This authoritative member adds explicit view policy, an
+    // exact uint64 manual span, and all three fine-target values.
+    stream.addMemberName("navigation");
+    stream.openArray();
+    stream.addNumber(1);  // navigation representation revision
+    stream.addBoolean(algorithm->timelineShowAll);
+    addUnsigned64(stream, algorithm->timelineVisiblePulses);
+    stream.addNumber(static_cast<int>(algorithm->selectionFineTarget));
     stream.closeArray();
 
     serialiseBytes(stream, "recorded", &algorithm->recordedState,
@@ -2825,6 +2848,32 @@ bool parseU32State(_NT_jsonParse& parse, Algorithm& algorithm) {
     return true;
 }
 
+struct NavigationPresetState {
+    NavigationPresetState()
+        : showAll(false), manualSpan(0U), target(kSelectionFineTargetEnd) {}
+
+    bool showAll;
+    uint64_t manualSpan;
+    SelectionFineTarget target;
+};
+
+bool parseNavigation(_NT_jsonParse& parse, NavigationPresetState& state) {
+    int count = 0;
+    int representation = 0;
+    int target = 0;
+    if (!parse.numberOfArrayElements(count) || count != 7 ||
+        !parse.number(representation) || representation != 1 ||
+        !parse.boolean(state.showAll) ||
+        !parseUnsigned64(parse, state.manualSpan) ||
+        state.manualSpan < kTimelineMinimumVisiblePulses ||
+        !parse.number(target) || target < kSelectionFineTargetStart ||
+        target > kSelectionFineTargetRange) {
+        return false;
+    }
+    state.target = static_cast<SelectionFineTarget>(target);
+    return true;
+}
+
 bool parseFlags(_NT_jsonParse& parse, Algorithm& algorithm) {
     int count = 0;
     bool value[15] = {};
@@ -2867,6 +2916,8 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
     bool u64Seen = false;
     bool u32Seen = false;
     bool flagsSeen = false;
+    bool navigationSeen = false;
+    NavigationPresetState navigation;
     bool recordedSeen = false;
     bool outputSeen = false;
     bool pendingSeen = false;
@@ -2898,6 +2949,11 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
                 return false;
             }
             flagsSeen = true;
+        } else if (parse.matchName("navigation")) {
+            if (!parseNavigation(parse, navigation)) {
+                return false;
+            }
+            navigationSeen = true;
         } else if (parse.matchName("recorded")) {
             if (!deserialiseBytes(parse, &algorithm.recordedState,
                                   sizeof(algorithm.recordedState))) {
@@ -2931,8 +2987,22 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
             return false;
         }
     }
-    return versionSeen && u64Seen && u32Seen && flagsSeen && recordedSeen &&
-           outputSeen && pendingSeen && intervalsSeen && eventsSeen;
+    const bool complete =
+        versionSeen && u64Seen && u32Seen && flagsSeen && recordedSeen &&
+        outputSeen && pendingSeen && intervalsSeen && eventsSeen;
+    if (!complete) {
+        return false;
+    }
+    if (navigationSeen) {
+        algorithm.timelineShowAll = navigation.showAll;
+        algorithm.timelineVisiblePulses = navigation.manualSpan;
+        algorithm.selectionFineTarget = navigation.target;
+    } else {
+        // Before the extension every accepted 4..256 width represented a
+        // manual view. Never reinterpret a legacy width as the fresh default.
+        algorithm.timelineShowAll = false;
+    }
+    return true;
 }
 
 bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
@@ -3123,6 +3193,22 @@ bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
         event.size = 3U;
         algorithm->recordingEvents[0] = event;
     }
+    return true;
+}
+
+bool setTimelineNavigationFixture(_NT_algorithm* self, bool showAll,
+                                  uint64_t manualSpan, uint64_t scrollPulses,
+                                  SelectionFineTarget target) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || manualSpan < kTimelineMinimumVisiblePulses ||
+        target < kSelectionFineTargetStart ||
+        target > kSelectionFineTargetRange) {
+        return false;
+    }
+    algorithm->timelineShowAll = showAll;
+    algorithm->timelineVisiblePulses = manualSpan;
+    algorithm->timelineScrollPulses = scrollPulses;
+    algorithm->selectionFineTarget = target;
     return true;
 }
 #endif

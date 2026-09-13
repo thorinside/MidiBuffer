@@ -55,6 +55,9 @@ class PresetImage {
     uint64_t payloadBytes() const;
     uint64_t valueCount() const;
     bool equals(const PresetImage& other) const;
+    bool navigation(bool& showAll, uint64_t& manualSpan, int& target) const;
+    bool removeNavigation();
+    bool corruptNavigationTarget();
 
   private:
     friend class HostDouble;

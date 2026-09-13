@@ -3311,6 +3311,119 @@ bool sameNormalizedMidiTrace(const midibuffer_test::Trace& left,
     return true;
 }
 
+void verifyLegacyNavigationPresetCompatibility() {
+    const uint64_t historyStart = 100U;
+    const uint64_t historyEnd = 612U;
+    const uint64_t widths[] = {64U, 256U};
+    const uint64_t scrolls[] = {11U, 17U};
+    const midibuffer::SelectionFineTarget targets[] = {
+        midibuffer::kSelectionFineTargetStart,
+        midibuffer::kSelectionFineTargetEnd,
+    };
+
+    for (size_t fixture = 0; fixture < ARRAY_SIZE(widths); ++fixture) {
+        midibuffer_test::HostDouble source;
+        expect(installRangeFixture(source, historyStart, historyEnd, 180U,
+                                   260U) &&
+                   midibuffer::setTimelineNavigationFixture(
+                       source.algorithm(), false, widths[fixture],
+                       scrolls[fixture], targets[fixture]),
+               "legacy manual-view source fixture constructs");
+        const midibuffer::CaptureSnapshot saved = snapshot(source);
+        const HistoryImage savedHistory = captureHistory(source);
+        midibuffer_test::PresetImage legacyImage;
+        bool encodedShowAll = true;
+        uint64_t encodedSpan = 0U;
+        int encodedTarget = -1;
+        expect(source.savePreset(legacyImage) &&
+                   legacyImage.navigation(encodedShowAll, encodedSpan,
+                                          encodedTarget) &&
+                   !encodedShowAll && encodedSpan == widths[fixture] &&
+                   encodedTarget == static_cast<int>(targets[fixture]) &&
+                   legacyImage.removeNavigation(),
+               "complete v1 fixture is reduced to the actual legacy representation");
+
+        midibuffer_test::HostDouble restored;
+        expect(restored.instantiate(1) && restored.loadPreset(legacyImage),
+               "legacy complete v1 state loads through the production parser");
+        const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+        const uint64_t expectedViewEnd = historyEnd - scrolls[fixture];
+        expect(!loaded.timelineShowAll &&
+                   loaded.timelineVisiblePulses == widths[fixture] &&
+                   loaded.timelineScrollPulses == scrolls[fixture] &&
+                   loaded.timelineViewStartPulse ==
+                       expectedViewEnd - widths[fixture] &&
+                   loaded.timelineViewEndPulse == expectedViewEnd &&
+                   loaded.selectionFineTarget == targets[fixture] &&
+                   sameSelectionAndTransport(saved, loaded) &&
+                   sameHistory(savedHistory, restored),
+               "legacy 64/256 widths, end-relative scroll, Start/End target, selection, transport, and event bytes restore as manual state");
+
+        _NT_float3 pots = {-1.0f, -1.0f, -1.0f};
+        restored.factory()->setupUi(restored.algorithm(), pots);
+        moveUi(restored, 0U, pots[0], pots[1], pots[2]);
+        const midibuffer::CaptureSnapshot afterUi = snapshot(restored);
+        expect(!afterUi.timelineShowAll &&
+                   afterUi.timelineVisiblePulses == widths[fixture] &&
+                   afterUi.timelineScrollPulses == scrolls[fixture] &&
+                   afterUi.selection.startPulse == loaded.selection.startPulse &&
+                   afterUi.selection.endPulse == loaded.selection.endPulse &&
+                   afterUi.selectionFineTarget == targets[fixture],
+               "setupUi and first customUi seed physical state without replacing a restored legacy view or selection");
+    }
+}
+
+void verifyShowAllPresetPolicy() {
+    const uint64_t backingSpan = 0x100000000ULL + 4096U;
+    midibuffer_test::HostDouble source;
+    expect(installRangeFixture(source, 100U, 612U, 180U, 260U) &&
+               midibuffer::setTimelineNavigationFixture(
+                   source.algorithm(), true, backingSpan, 23U,
+                   midibuffer::kSelectionFineTargetRange),
+           "Show All compatibility source fixture constructs");
+    const midibuffer::CaptureSnapshot saved = snapshot(source);
+    const HistoryImage savedHistory = captureHistory(source);
+    midibuffer_test::PresetImage image;
+    bool encodedShowAll = false;
+    uint64_t encodedSpan = 0U;
+    int encodedTarget = -1;
+    expect(source.savePreset(image) &&
+               image.navigation(encodedShowAll, encodedSpan, encodedTarget) &&
+               encodedShowAll && encodedSpan == backingSpan &&
+               encodedTarget ==
+                   static_cast<int>(midibuffer::kSelectionFineTargetRange),
+           "v1 navigation extension explicitly carries Show All, uint64 backing span, and Range target");
+
+    midibuffer_test::HostDouble restored;
+    expect(restored.instantiate(1) && restored.loadPreset(image),
+           "new Show All state round-trips through native callbacks");
+    const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+    expect(loaded.timelineShowAll &&
+               loaded.timelineVisiblePulses == backingSpan &&
+               loaded.timelineScrollPulses == saved.timelineScrollPulses &&
+               loaded.timelineViewStartPulse == 100U &&
+               loaded.timelineViewEndPulse == 612U &&
+               loaded.selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetRange &&
+               sameSelectionAndTransport(saved, loaded) &&
+               sameHistory(savedHistory, restored),
+           "Show All restores automatic fit without narrowing its manual backing or changing complete state");
+
+    expect(midibuffer::setRetainedTimelineFixture(restored.algorithm(), 90U,
+                                                   900U),
+           "restored Show All history-growth fixture installs");
+    const midibuffer::CaptureSnapshot grown = snapshot(restored);
+    expect(grown.timelineShowAll && grown.timelineViewStartPulse == 90U &&
+               grown.timelineViewEndPulse == 900U &&
+               grown.timelineVisiblePulses == backingSpan,
+           "restored Show All continues fitting a changed retained envelope automatically");
+
+    midibuffer_test::HostDouble corruptTarget;
+    expect(image.corruptNavigationTarget() && corruptTarget.instantiate(1) &&
+               !corruptTarget.loadPreset(image),
+           "an invalid appended navigation target rejects the complete preset under the existing corruption policy");
+}
+
 void verifyCompletePresetRoundTripsAndContinuation() {
     midibuffer_test::HostDouble source;
     TransportFixture fixture = prepareTransportHistory(source);
@@ -3323,18 +3436,36 @@ void verifyCompletePresetRoundTripsAndContinuation() {
     continueRightPotZoom(source, 0.0f);
     endRightPotZoom(source, 0.0f);
     moveUi(source, kNT_potL, 0.75f, 0.0f, 0.0f);
+    beginRightPotZoom(source, 0.6f);
+    moveUi(source, kNT_potButtonR | kNT_encoderButtonR,
+           0.0f, 0.0f, 0.6f, 0, 0, kNT_potButtonR);
+    const uint64_t longManualSpan = 0x100000000ULL + 12345U;
+    expect(midibuffer::setTimelineNavigationFixture(
+               source.algorithm(), false, longManualSpan, 0U,
+               midibuffer::kSelectionFineTargetRange),
+           "active preset fixture installs an exact long manual view and Range target");
     const midibuffer::CaptureSnapshot saved = snapshot(source);
+    const HistoryImage savedHistory = captureHistory(source);
     expect(saved.playbackActive && saved.rangeTransitionPending &&
                saved.pendingNoteEndingCount == 1U &&
                saved.pendingSustainReleaseCount == 1U &&
-               saved.timelineVisiblePulses == 4U &&
-               saved.lastMovedBoundaryIsStart,
-           "active preset fixture contains pending range, timeline, note, sustain, and scheduler state");
+               !saved.timelineShowAll &&
+               saved.timelineVisiblePulses == longManualSpan &&
+               saved.selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetRange,
+           "active preset fixture contains pending range, long manual navigation, note, sustain, and scheduler state");
 
     midibuffer_test::PresetImage image;
+    bool encodedShowAll = true;
+    uint64_t encodedSpan = 0U;
+    int encodedTarget = -1;
     expect(source.savePreset(image) && image.payloadBytes() != 0U &&
-               image.valueCount() != 0U,
-           "actual NT serialise callback captures the active performance state");
+               image.valueCount() != 0U &&
+               image.navigation(encodedShowAll, encodedSpan, encodedTarget) &&
+               !encodedShowAll && encodedSpan == longManualSpan &&
+               encodedTarget ==
+                   static_cast<int>(midibuffer::kSelectionFineTargetRange),
+           "actual NT serialise callback writes the reviewed navigation extension without uint32/256 truncation");
     const midibuffer::CaptureSnapshot afterPlaybackSave = snapshot(source);
     expect(afterPlaybackSave.eventCount == saved.eventCount &&
                afterPlaybackSave.playbackPulse == saved.playbackPulse &&
@@ -3374,11 +3505,14 @@ void verifyCompletePresetRoundTripsAndContinuation() {
                loaded.pendingSustainReleaseCount ==
                    saved.pendingSustainReleaseCount &&
                loaded.timelineVisiblePulses == saved.timelineVisiblePulses &&
-               loaded.lastMovedBoundaryIsStart ==
-                   saved.lastMovedBoundaryIsStart &&
+               loaded.timelineScrollPulses == saved.timelineScrollPulses &&
+               loaded.timelineShowAll == saved.timelineShowAll &&
+               loaded.timelineViewStartPulse == saved.timelineViewStartPulse &&
+               loaded.timelineViewEndPulse == saved.timelineViewEndPulse &&
+               loaded.selectionFineTarget == saved.selectionFineTarget &&
                loaded.playbackActive && !loaded.captureEnabled &&
-               !loaded.clockRunning && sameHistory(captureHistory(source), restored),
-           "fresh reconstruction restores events/timing, ranges, cursor, transport intent, parameters, routing, filters, timeline, and pending ownership while gating on live clock");
+               !loaded.clockRunning && sameHistory(savedHistory, restored),
+           "fresh reconstruction restores events/timing, ranges, cursor, transport intent, parameters, routing, filters, exact manual navigation, and pending ownership while gating on live clock");
     expect(midibuffer_test::trace().midiCallCount == 0U,
            "preset load does not pretend to restore or transmit external instrument state");
 
@@ -3386,6 +3520,29 @@ void verifyCompletePresetRoundTripsAndContinuation() {
     expect(restored.savePreset(reconstructedImage) &&
                image.equals(reconstructedImage),
            "exhaustive canonical saved-state equality has no silently omitted category");
+
+    _NT_float3 restoredPots = {-1.0f, -1.0f, -1.0f};
+    restored.factory()->setupUi(restored.algorithm(), restoredPots);
+    while (restored.elapsedSamples() <= NT_globals.sampleRate) {
+        noClockBlock(restored);
+    }
+    midibuffer_test::resetTrace();
+    moveUi(restored, kNT_potButtonR | kNT_potR | kNT_encoderButtonR,
+           restoredPots[0], restoredPots[1], 0.2f, 0, 0,
+           kNT_potButtonR | kNT_encoderButtonR);
+    const midibuffer::CaptureSnapshot afterUi = snapshot(restored);
+    expect(afterUi.timelineVisiblePulses == loaded.timelineVisiblePulses &&
+               afterUi.timelineScrollPulses == loaded.timelineScrollPulses &&
+               afterUi.timelineShowAll == loaded.timelineShowAll &&
+               afterUi.selectionFineTarget == loaded.selectionFineTarget,
+           "load followed by setupUi/customUi preserves exact navigation fields");
+    expect(afterUi.selection.startPulse == loaded.selection.startPulse &&
+               afterUi.selection.endPulse == loaded.selection.endPulse &&
+               sameSelectionAndTransport(loaded, afterUi),
+           "load followed by setupUi/customUi does not move selection or scheduler state");
+    expect(sameHistory(savedHistory, restored) &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "load followed by setupUi/customUi neither changes event bytes nor replays physical panic/hold state");
 
     midibuffer_test::HostDouble parametersAfter;
     expect(parametersAfter.instantiate(1) &&
@@ -3412,18 +3569,19 @@ void verifyCompletePresetRoundTripsAndContinuation() {
         midibuffer_test::trace();
 
     midibuffer_test::resetTrace();
-    expect(clockPulseAt(restored, 0U) &&
+    const uint64_t restoredAcquisitionStart = restored.elapsedSamples();
+    expect(clockPulseAt(restored, restoredAcquisitionStart) &&
                midibuffer_test::trace().midiCallCount == 0U &&
                !snapshot(restored).clockRunning,
            "restored playback emits nothing on the first external acquisition pulse");
-    expect(clockPulseAt(restored, 16U),
+    expect(clockPulseAt(restored, restoredAcquisitionStart + 16U),
            "restored playback accepts the second external acquisition pulse");
-    stepThrough(restored, 24U);
+    stepThrough(restored, restoredAcquisitionStart + 24U);
     expect(midibuffer_test::trace().midiCallCount == 0U,
            "reacquisition reopens the saved interval without advancing past it");
-    expect(clockPulseAt(restored, 32U),
+    expect(clockPulseAt(restored, restoredAcquisitionStart + 32U),
            "restored playback receives the saved interval's continuation pulse");
-    stepThrough(restored, 40U);
+    stepThrough(restored, restoredAcquisitionStart + 40U);
     const midibuffer_test::Trace restoredContinuation =
         midibuffer_test::trace();
     expect(snapshot(restored).clockRunning &&
@@ -3724,6 +3882,8 @@ int main() {
     verifyLiveEmergencySilenceMatrix();
     verifyTimelinePlaybackToggle();
     verifyTimedRightEncoderPanic();
+    verifyLegacyNavigationPresetCompatibility();
+    verifyShowAllPresetPolicy();
     verifyCompletePresetRoundTripsAndContinuation();
     verifyInflightPresetSchedulingContinuation();
     verifyPresetSupportedBufferRangeAndCost();

@@ -170,6 +170,24 @@ uint64_t jsonValueCount(const JsonNode& node) {
     return count;
 }
 
+JsonNode* namedChild(JsonNode& parent, const char* name) {
+    for (size_t index = 0; index < parent.children.size(); ++index) {
+        if (parent.children[index].name == name) {
+            return &parent.children[index];
+        }
+    }
+    return NULL;
+}
+
+const JsonNode* namedChild(const JsonNode& parent, const char* name) {
+    for (size_t index = 0; index < parent.children.size(); ++index) {
+        if (parent.children[index].name == name) {
+            return &parent.children[index];
+        }
+    }
+    return NULL;
+}
+
 bool sameJsonNode(const JsonNode& left, const JsonNode& right) {
     if (left.type != right.type || left.name != right.name ||
         left.intValue != right.intValue ||
@@ -538,6 +556,65 @@ bool PresetImage::equals(const PresetImage& other) const {
            std::memcmp(left->parameters, right->parameters,
                        sizeof(left->parameters)) == 0 &&
            sameJsonNode(left->root, right->root);
+}
+
+bool PresetImage::navigation(bool& showAll, uint64_t& manualSpan,
+                             int& target) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    const JsonNode* state = namedChild(document->root, "midibufferState");
+    const JsonNode* navigation =
+        state == NULL ? NULL : namedChild(*state, "navigation");
+    if (navigation == NULL || navigation->type != kJsonArray ||
+        navigation->children.size() != 7U ||
+        navigation->children[0].type != kJsonInt ||
+        navigation->children[0].intValue != 1 ||
+        navigation->children[1].type != kJsonBoolean ||
+        navigation->children[6].type != kJsonInt) {
+        return false;
+    }
+    manualSpan = 0U;
+    for (uint32_t part = 0; part < 4U; ++part) {
+        const JsonNode& node = navigation->children[part + 2U];
+        if (node.type != kJsonInt || node.intValue < 0 ||
+            node.intValue > 65535) {
+            return false;
+        }
+        manualSpan |= static_cast<uint64_t>(node.intValue) << (part * 16U);
+    }
+    showAll = navigation->children[1].boolValue;
+    target = navigation->children[6].intValue;
+    return true;
+}
+
+bool PresetImage::removeNavigation() {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    if (state == NULL) {
+        return false;
+    }
+    for (std::vector<JsonNode>::iterator child = state->children.begin();
+         child != state->children.end(); ++child) {
+        if (child->name == "navigation") {
+            state->children.erase(child);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PresetImage::corruptNavigationTarget() {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    JsonNode* navigation =
+        state == NULL ? NULL : namedChild(*state, "navigation");
+    if (navigation == NULL || navigation->type != kJsonArray ||
+        navigation->children.size() != 7U) {
+        return false;
+    }
+    navigation->children[6].type = kJsonInt;
+    navigation->children[6].intValue = 3;
+    return true;
 }
 
 HostDouble::HostDouble()
