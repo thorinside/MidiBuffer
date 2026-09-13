@@ -1415,8 +1415,11 @@ void advancePlaybackPulse(Algorithm& algorithm, uint64_t sample) {
         findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
 }
 
-void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
-    ++algorithm.playbackIntervalOrdinal;
+void openPlaybackInterval(Algorithm& algorithm, uint64_t sample,
+                          bool advanceOrdinal) {
+    if (advanceOrdinal) {
+        ++algorithm.playbackIntervalOrdinal;
+    }
     algorithm.playbackIntervalStartSample = sample;
     algorithm.playbackIntervalOpen = true;
     scheduleNextPlaybackEvent(algorithm);
@@ -1424,7 +1427,14 @@ void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
     dispatchPlaybackEvents(algorithm, sample, false);
 }
 
+void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
+    openPlaybackInterval(algorithm, sample, true);
+}
+
 void activatePendingPlayback(Algorithm& algorithm, uint64_t sample) {
+    const bool resumeSavedInterval =
+        algorithm.transportState == kTransportPlaying &&
+        algorithm.playbackIntervalOpen && algorithm.playbackPositionValid;
     if (!algorithm.playbackPositionValid) {
         algorithm.playbackPulse = algorithm.activeSelection.startPulse;
         algorithm.playbackEventIndex =
@@ -1432,7 +1442,11 @@ void activatePendingPlayback(Algorithm& algorithm, uint64_t sample) {
         algorithm.playbackPositionValid = true;
     }
     algorithm.transportState = kTransportPlaying;
-    beginPlaybackInterval(algorithm, sample);
+    // A loaded active preset retains the logical interval, event cursor, and
+    // pending-ending ordinal from its save boundary. The second fresh clock
+    // pulse supplies a new physical interval origin; it must not advance the
+    // logical interval before the unconsumed events and endings are replayed.
+    openPlaybackInterval(algorithm, sample, !resumeSavedInterval);
 }
 
 void beginOrAdvancePlayback(Algorithm& algorithm, uint64_t sample) {
@@ -2398,9 +2412,12 @@ void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     stream.addBoolean(algorithm->activeSelectionValid);
     stream.addBoolean(algorithm->rangeTransitionPending);
     stream.addBoolean(algorithm->playbackPositionValid);
-    stream.addBoolean(false);  // reopen scheduling after clock acquisition
-    stream.addBoolean(false);
-    stream.addBoolean(false);
+    // These are logical scheduler state, not external clock state. Keeping the
+    // saved interval open lets clock reacquisition rebase (rather than skip)
+    // its unconsumed event cursor and pending-ending ordinal.
+    stream.addBoolean(algorithm->playbackIntervalOpen);
+    stream.addBoolean(algorithm->playbackNextEventScheduled);
+    stream.addBoolean(algorithm->pendingNextEndingScheduled);
     stream.addBoolean(algorithm->lastMovedBoundaryIsStart);
     stream.addBoolean(false);  // encoder button state is physical input
     stream.addBoolean(false);
@@ -2614,15 +2631,12 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
     // Clock/reset levels and instrument state belong to the live patch, not
     // the preset. Retain all internal timing, cursor, ownership, and transport
     // intent, but require two fresh physical clock edges before capture or
-    // resumed playback can emit anything. Closed scheduling is reconstructed
-    // from the saved cursor and pending ownership on that acquired interval.
+    // resumed playback can emit anything. Saved scheduling remains inert while
+    // the clock is gated, then is rebased onto the newly acquired interval.
     algorithm->clockRunning = false;
     algorithm->haveAcquisitionPulse = false;
     algorithm->clockHigh = false;
     algorithm->resetHigh = false;
-    algorithm->playbackIntervalOpen = false;
-    algorithm->playbackNextEventScheduled = false;
-    algorithm->pendingNextEndingScheduled = false;
     algorithm->rightEncoderHoldActive = false;
     algorithm->rightEncoderPanicFired = false;
     return !algorithm->captureEnabled ||
@@ -2676,11 +2690,18 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.metadataBytes = sizeof(Algorithm);
     snapshot.eventCapacity = algorithm->eventCapacity;
     snapshot.eventCount = algorithm->eventCount;
+    snapshot.sampleCursor = algorithm->sampleCursor;
     snapshot.currentPulse = algorithm->currentPulse;
     snapshot.lastClockIntervalSamples = algorithm->lastClockIntervalSamples;
     snapshot.predictedClockIntervalSamples =
         predictedClockInterval(*algorithm);
     snapshot.playbackPulse = algorithm->playbackPulse;
+    snapshot.playbackIntervalStartSample =
+        algorithm->playbackIntervalStartSample;
+    snapshot.playbackIntervalOrdinal = algorithm->playbackIntervalOrdinal;
+    snapshot.playbackNextEventSample = algorithm->playbackNextEventSample;
+    snapshot.pendingNextEndingSample = algorithm->pendingNextEndingSample;
+    snapshot.playbackEventIndex = algorithm->playbackEventIndex;
     snapshot.clockAverageIntervalCount = algorithm->clockIntervalCount;
     snapshot.pendingNoteEndingCount = algorithm->pendingEndings.noteCount;
     snapshot.pendingSustainReleaseCount =
@@ -2700,6 +2721,11 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
         algorithm->transportState == kTransportPlaying;
     snapshot.playbackClockLossPaused =
         algorithm->transportState == kTransportClockLossPaused;
+    snapshot.playbackIntervalOpen = algorithm->playbackIntervalOpen;
+    snapshot.playbackNextEventScheduled =
+        algorithm->playbackNextEventScheduled;
+    snapshot.pendingNextEndingScheduled =
+        algorithm->pendingNextEndingScheduled;
     snapshot.activeSelectionValid = algorithm->activeSelectionValid;
     snapshot.rangeTransitionPending = algorithm->rangeTransitionPending;
     snapshot.lastMovedBoundaryIsStart =

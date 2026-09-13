@@ -2381,6 +2381,24 @@ bool sameMidiTrace(const midibuffer_test::Trace& left,
     return true;
 }
 
+bool sameNormalizedMidiTrace(const midibuffer_test::Trace& left,
+                             uint64_t leftIntervalOrigin,
+                             const midibuffer_test::Trace& right,
+                             uint64_t rightIntervalOrigin) {
+    if (!sameMidiTrace(left, right)) {
+        return false;
+    }
+    for (size_t index = 0; index < left.midiCallCount; ++index) {
+        if (left.midiCalls[index].dispatchSample < leftIntervalOrigin ||
+            right.midiCalls[index].dispatchSample < rightIntervalOrigin ||
+            left.midiCalls[index].dispatchSample - leftIntervalOrigin !=
+                right.midiCalls[index].dispatchSample - rightIntervalOrigin) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void verifyCompletePresetRoundTripsAndContinuation() {
     midibuffer_test::HostDouble source;
     TransportFixture fixture = prepareTransportHistory(source);
@@ -2487,11 +2505,16 @@ void verifyCompletePresetRoundTripsAndContinuation() {
     expect(clockPulseAt(restored, 16U),
            "restored playback accepts the second external acquisition pulse");
     stepThrough(restored, 24U);
+    expect(midibuffer_test::trace().midiCallCount == 0U,
+           "reacquisition reopens the saved interval without advancing past it");
+    expect(clockPulseAt(restored, 32U),
+           "restored playback receives the saved interval's continuation pulse");
+    stepThrough(restored, 40U);
     const midibuffer_test::Trace restoredContinuation =
         midibuffer_test::trace();
     expect(snapshot(restored).clockRunning &&
                sameMidiTrace(originalContinuation, restoredContinuation),
-           "after external-clock reacquisition, subsequent output bytes and routing equal uninterrupted continuation");
+           "after saved-interval reconstruction, subsequent output bytes and routing equal uninterrupted continuation");
 
     midibuffer_test::HostDouble captureSource;
     expect(captureSource.instantiate(1),
@@ -2527,6 +2550,149 @@ void verifyCompletePresetRoundTripsAndContinuation() {
     stopCapture(captureRestored);
     expect(snapshot(captureRestored).eventCount == captureSavedCount + 3U,
            "restored recorded-note ownership contributes its ending alongside subsequent input");
+}
+
+void verifyInflightPresetSchedulingContinuation() {
+    const uint32_t interval = 64U;
+    midibuffer_test::HostDouble source;
+    expect(source.instantiate(1),
+           "in-flight preset scheduling source constructs");
+    startCapture(source);
+    expect(clockPulseAt(source, 0U) && clockPulseAt(source, interval),
+           "in-flight preset history acquires a steady source interval");
+    const uint64_t originalStart = snapshot(source).currentPulse;
+
+    // One pulse deliberately contains multiple scheduled events, including
+    // note/sustain endings after the point where the preset will be saved.
+    sendMidi(source, 0x92U, 60U, 100U);  // offset 8
+    sendMidi(source, 0xB2U, 64U, 127U);  // offset 8
+    noClockBlock(source);
+    sendMidi(source, 0xB2U, 1U, 23U);  // offset 16
+    noClockBlock(source);
+    sendMidi(source, 0xD2U, 31U, 0U);  // offset 24
+    noClockBlock(source);
+    noClockBlock(source);
+    sendMidi(source, 0x82U, 60U, 0U);  // offset 40
+    sendMidi(source, 0xB2U, 64U, 0U);  // offset 40
+    noClockBlock(source);
+    noClockBlock(source);
+    sendMidi(source, 0xB2U, 11U, 79U);  // offset 56
+
+    expect(clockPulseAt(source, interval * 2U),
+           "in-flight history advances to the original range tail");
+    sendMidi(source, 0x92U, 62U, 101U);  // offset 8
+    noClockBlock(source);
+    sendMidi(source, 0xA2U, 62U, 17U);  // offset 16
+    noClockBlock(source);
+    noClockBlock(source);
+    noClockBlock(source);
+    sendMidi(source, 0x82U, 62U, 0U);  // offset 40
+
+    expect(clockPulseAt(source, interval * 3U),
+           "in-flight history reaches the replacement range");
+    const uint64_t replacementStart = snapshot(source).currentPulse;
+    sendMidi(source, 0x93U, 70U, 102U);  // offset 8
+    noClockBlock(source);
+    noClockBlock(source);
+    noClockBlock(source);
+    noClockBlock(source);
+    sendMidi(source, 0x83U, 70U, 0U);  // offset 40
+    expect(clockPulseAt(source, interval * 4U) &&
+               clockPulseAt(source, interval * 5U),
+           "in-flight history closes both selectable ranges");
+    stopCapture(source);
+
+    changeParameter(source, kPlaybackDestinationParameter, 1);
+    changeParameter(source, kPlaybackChannelParameter, 7);
+    expect(midibuffer::setPulseSelection(source.algorithm(), originalStart,
+                                         originalStart + 2U) &&
+               midibuffer::startPlayback(source.algorithm()),
+           "in-flight preset fixture selects and starts the original range");
+    const uint64_t sourceIntervalOrigin = interval * 6U;
+    expect(clockPulseAt(source, sourceIntervalOrigin),
+           "in-flight preset fixture opens its saved playback interval");
+    stepThrough(source, sourceIntervalOrigin + 16U);
+    expect(midibuffer::setPulseSelection(source.algorithm(), replacementStart,
+                                         replacementStart + 2U),
+           "in-flight preset fixture queues a range change before save");
+
+    const midibuffer::CaptureSnapshot saved = snapshot(source);
+    expect(saved.playbackActive && saved.playbackIntervalOpen &&
+               saved.playbackNextEventScheduled &&
+               saved.pendingNextEndingScheduled &&
+               saved.pendingNoteEndingCount == 1U &&
+               saved.pendingSustainReleaseCount == 1U &&
+               saved.rangeTransitionPending &&
+               saved.playbackPulse == originalStart &&
+               saved.playbackNextEventSample == sourceIntervalOrigin + 24U &&
+               saved.pendingNextEndingSample == sourceIntervalOrigin + 40U,
+           "save boundary lies between regular events and before same-interval note/sustain endings");
+
+    midibuffer_test::PresetImage image;
+    expect(source.savePreset(image),
+           "in-flight scheduler state saves through the actual callback");
+    midibuffer_test::HostDouble restored;
+    expect(restored.instantiate(1) && restored.loadPreset(image),
+           "in-flight scheduler state loads into a fresh instance");
+    const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+    expect(loaded.playbackIntervalOpen &&
+               loaded.playbackNextEventScheduled &&
+               loaded.pendingNextEndingScheduled &&
+               loaded.playbackIntervalOrdinal == saved.playbackIntervalOrdinal &&
+               loaded.playbackEventIndex == saved.playbackEventIndex &&
+               loaded.playbackNextEventSample ==
+                   saved.playbackNextEventSample &&
+               loaded.pendingNextEndingSample ==
+                   saved.pendingNextEndingSample,
+           "callback round trip retains the exact in-flight cursor, ordinal, and schedules while clock-gated");
+
+    midibuffer_test::resetTrace();
+    stepThrough(source, sourceIntervalOrigin + 56U);
+    expect(clockPulseAt(source, sourceIntervalOrigin + interval),
+           "uninterrupted control advances through the original range tail");
+    stepThrough(source, sourceIntervalOrigin + interval + 56U);
+    expect(clockPulseAt(source, sourceIntervalOrigin + interval * 2U),
+           "uninterrupted control reaches the pending range wrap");
+    stepThrough(source, sourceIntervalOrigin + interval * 2U + 56U);
+    const midibuffer_test::Trace uninterrupted = midibuffer_test::trace();
+    const midibuffer::CaptureSnapshot uninterruptedState = snapshot(source);
+
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(restored, 0U) &&
+               midibuffer_test::trace().midiCallCount == 0U &&
+               clockPulseAt(restored, interval),
+           "restored in-flight playback remains silent until clock reacquisition");
+    const uint64_t restoredIntervalOrigin =
+        loaded.sampleCursor + static_cast<uint64_t>(interval);
+    stepThrough(restored, interval + 56U);
+    expect(clockPulseAt(restored, interval * 2U),
+           "restored continuation advances through the original range tail");
+    stepThrough(restored, interval * 2U + 56U);
+    expect(clockPulseAt(restored, interval * 3U),
+           "restored continuation reaches the pending range wrap");
+    stepThrough(restored, interval * 3U + 56U);
+    const midibuffer_test::Trace resumed = midibuffer_test::trace();
+    const midibuffer::CaptureSnapshot resumedState = snapshot(restored);
+
+    expect(uninterrupted.midiCallCount >= 8U &&
+               sameNormalizedMidiTrace(
+                   uninterrupted, sourceIntervalOrigin, resumed,
+                   restoredIntervalOrigin),
+           "multiple resumed pulses preserve normalized timestamps, bytes, routing, same-interval endings, and range-wrap output");
+    expect(resumedState.playbackPulse == uninterruptedState.playbackPulse &&
+               resumedState.playbackEventIndex ==
+                   uninterruptedState.playbackEventIndex &&
+               resumedState.playbackIntervalOrdinal ==
+                   uninterruptedState.playbackIntervalOrdinal &&
+               resumedState.pendingNoteEndingCount ==
+                   uninterruptedState.pendingNoteEndingCount &&
+               resumedState.pendingSustainReleaseCount ==
+                   uninterruptedState.pendingSustainReleaseCount &&
+               resumedState.activeSelection.startPulse == replacementStart &&
+               resumedState.activeSelection.endPulse ==
+                   replacementStart + 2U &&
+               !resumedState.rangeTransitionPending,
+           "restored scheduler state remains aligned after subsequent pulses and pending range adoption");
 }
 
 void verifyPresetSupportedBufferRangeAndCost() {
@@ -2642,6 +2808,7 @@ int main() {
     verifyTimelinePlaybackToggle();
     verifyTimedRightEncoderPanic();
     verifyCompletePresetRoundTripsAndContinuation();
+    verifyInflightPresetSchedulingContinuation();
     verifyPresetSupportedBufferRangeAndCost();
     verifyHostOutputTrace();
 

@@ -30,12 +30,18 @@ struct CaptureSnapshot {
     uint32_t metadataBytes;
     uint32_t eventCapacity;
     uint32_t eventCount;
+    uint64_t sampleCursor;
     uint64_t currentPulse;
     uint64_t oldestPulse;
     uint64_t newestPulse;
     uint64_t lastClockIntervalSamples;
     uint64_t predictedClockIntervalSamples;
     uint64_t playbackPulse;
+    uint64_t playbackIntervalStartSample;
+    uint64_t playbackIntervalOrdinal;
+    uint64_t playbackNextEventSample;
+    uint64_t pendingNextEndingSample;
+    uint32_t playbackEventIndex;
     uint32_t clockAverageIntervalCount;
     uint32_t pendingNoteEndingCount;
     uint32_t pendingSustainReleaseCount;
@@ -50,6 +56,9 @@ struct CaptureSnapshot {
     bool playbackArmed;
     bool playbackActive;
     bool playbackClockLossPaused;
+    bool playbackIntervalOpen;
+    bool playbackNextEventScheduled;
+    bool pendingNextEndingScheduled;
     bool activeSelectionValid;
     bool rangeTransitionPending;
     bool lastMovedBoundaryIsStart;
