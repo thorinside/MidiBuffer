@@ -1212,12 +1212,24 @@ void emitSelectedEvent(Algorithm& algorithm, const RecordedEvent& event,
     }
     if (type == 0xb0U && event.bytes[1] == 64U) {
         if (event.bytes[2] < 64U) {
-            if (!emitOwnedEnding(algorithm, eventIndex, dispatchSample)) {
-                // An in-range release without a playback-owned press remains
-                // an ordinary recorded CC. Capture-stop endings also retain
-                // their filter-bypassing safety semantics.
-                emitRecordedEvent(algorithm, event, dispatchSample);
+            if (emitOwnedEnding(algorithm, eventIndex, dispatchSample)) {
+                return;
             }
+            const uint8_t outputChannel =
+                playbackStatus(algorithm, event.bytes[0]) & 0x0fU;
+            const uint16_t outputChannelBit =
+                static_cast<uint16_t>(1U << outputChannel);
+            if ((algorithm.pendingEndings.sustainActiveChannels &
+                 outputChannelBit) != 0U) {
+                // This release belonged to a canceled older press. It cannot
+                // fall through as an ordinary CC and disable the newer routed
+                // owner on the same output channel.
+                return;
+            }
+            // An in-range release without playback-owned sustain remains an
+            // ordinary recorded CC. Capture-stop endings also retain their
+            // filter-bypassing safety semantics.
+            emitRecordedEvent(algorithm, event, dispatchSample);
             return;
         }
         if (!recordedEventPassesPlaybackFilters(algorithm, event)) {

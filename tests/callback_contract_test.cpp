@@ -1739,6 +1739,79 @@ void verifyLoopTailDurationsAndSustainOwnership() {
            "the newest overlapping pedal press owns release and may sustain continuously");
 }
 
+void verifyOverriddenChannelSustainReleaseOwnership() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "override sustain ownership host constructs");
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "override sustain history acquires source clock");
+    startCapture(host);
+
+    expect(clockPulseAt(host, 32U),
+           "override sustain reaches selection start");
+    const uint64_t startPulse = snapshot(host).currentPulse;
+    sendMidi(host, 0xB0, 64, 127);
+    expect(clockPulseAt(host, 48U),
+           "override sustain records newer source-channel press");
+    sendMidi(host, 0xB1, 64, 127);
+    expect(clockPulseAt(host, 64U),
+           "override sustain records older release inside selection");
+    sendMidi(host, 0xB0, 64, 0);
+    expect(clockPulseAt(host, 80U),
+           "override sustain records newest release beyond selection");
+    sendMidi(host, 0xB1, 64, 0);
+    expect(clockPulseAt(host, 96U),
+           "override sustain history closes");
+    stopCapture(host);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), startPulse,
+                                         startPulse + 3U),
+           "override sustain range includes the canceled older release");
+    changeParameter(host, kPlaybackChannelParameter, 5);
+
+    uint64_t lastClock = 96U;
+    for (uint32_t index = 0; index < 8U; ++index) {
+        lastClock += 16U;
+        expect(clockPulseAt(host, lastClock),
+               "override sustain tempo priming pulse is delivered");
+    }
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "override sustain playback arms");
+    const uint64_t playbackStart = lastClock + 16U;
+    for (uint32_t interval = 0; interval < 7U; ++interval) {
+        lastClock += 16U;
+        expect(clockPulseAt(host, lastClock),
+               "override sustain multi-pass clock is delivered");
+        stepThrough(host, lastClock + 8U);
+    }
+
+    const uint64_t expectedPressSamples[] = {
+        playbackStart + 8U,
+        playbackStart + 24U,
+        playbackStart + 56U,
+        playbackStart + 72U,
+        playbackStart + 104U,
+    };
+    const midibuffer_test::Trace& trace = midibuffer_test::trace();
+    bool onlyNewestOwnedPresses =
+        trace.midiCallCount == ARRAY_SIZE(expectedPressSamples);
+    for (size_t index = 0;
+         index < trace.midiCallCount &&
+         index < ARRAY_SIZE(expectedPressSamples);
+         ++index) {
+        const midibuffer_test::MidiCall& call = trace.midiCalls[index];
+        onlyNewestOwnedPresses =
+            onlyNewestOwnedPresses &&
+            call.dispatchSample == expectedPressSamples[index] &&
+            call.bytes[0] == 0xB4U && call.bytes[1] == 64U &&
+            call.bytes[2] == 127U;
+    }
+    expect(onlyNewestOwnedPresses,
+           "canceled in-range sustain releases cannot bypass routed newest-press ownership across wraps");
+    expect(snapshot(host).pendingSustainReleaseCount == 1U,
+           "newest routed sustain press retains sole release ownership after repeated wraps");
+}
+
 void verifyOverriddenChannelRetriggerOwnership() {
     midibuffer_test::HostDouble host;
     expect(host.instantiate(1), "override collision host constructs");
@@ -1904,6 +1977,7 @@ int main() {
     verifyResetCleanupAndCoincidence();
     verifyClockLossCleanupAndContinuation();
     verifyLoopTailDurationsAndSustainOwnership();
+    verifyOverriddenChannelSustainReleaseOwnership();
     verifyOverriddenChannelRetriggerOwnership();
     verifyPendingEndingDiscontinuityCleanup();
     verifyHostOutputTrace();
