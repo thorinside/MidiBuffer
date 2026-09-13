@@ -12,6 +12,82 @@
 namespace midibuffer {
 namespace {
 
+const uint64_t kMaximumDisplayedBars = 9999999999ULL;
+
+bool supportedPulsesPerBeat(uint32_t pulsesPerBeat) {
+    return pulsesPerBeat == 1U || pulsesPerBeat == 2U ||
+           pulsesPerBeat == 4U || pulsesPerBeat == 8U ||
+           pulsesPerBeat == 16U || pulsesPerBeat == 24U ||
+           pulsesPerBeat == 48U;
+}
+
+uint64_t divideUnsigned64By32(uint64_t value, uint32_t divisor,
+                              uint32_t& remainder) {
+    uint64_t quotient = 0;
+    uint64_t workingRemainder = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        workingRemainder =
+            (workingRemainder << 1U) | ((value >> bit) & 1U);
+        if (workingRemainder >= divisor) {
+            workingRemainder -= divisor;
+            quotient |= static_cast<uint64_t>(1) << bit;
+        }
+    }
+    remainder = static_cast<uint32_t>(workingRemainder);
+    return quotient;
+}
+
+class BoundedText {
+  public:
+    BoundedText(char* output, size_t capacity)
+        : output_(output), capacity_(capacity), length_(0U),
+          valid_(output != NULL && capacity != 0U) {
+        if (valid_) {
+            output_[0] = '\0';
+        }
+    }
+
+    void append(char value) {
+        if (!valid_ || length_ + 1U >= capacity_) {
+            valid_ = false;
+            return;
+        }
+        output_[length_++] = value;
+        output_[length_] = '\0';
+    }
+
+    void append(const char* text) {
+        if (text == NULL) {
+            valid_ = false;
+            return;
+        }
+        while (*text != '\0') {
+            append(*text++);
+        }
+    }
+
+    void appendUnsigned64(uint64_t value) {
+        char reversed[20];
+        size_t count = 0U;
+        do {
+            uint32_t remainder = 0U;
+            value = divideUnsigned64By32(value, 10U, remainder);
+            reversed[count++] = static_cast<char>('0' + remainder);
+        } while (value != 0U);
+        while (count != 0U) {
+            append(reversed[--count]);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+  private:
+    char* output_;
+    size_t capacity_;
+    size_t length_;
+    bool valid_;
+};
+
 const uint32_t kBytesPerMegabyte = 1000000U;
 const int32_t kDefaultBufferMegabytes = 1;
 const float kGateThresholdVolts = 1.0f;
@@ -1735,22 +1811,6 @@ bool retainedTimelineBounds(const Algorithm& algorithm, uint64_t& start,
     return end > start;
 }
 
-uint64_t divideUnsigned64By32(uint64_t value, uint32_t divisor,
-                              uint32_t& remainder) {
-    uint64_t quotient = 0;
-    uint64_t workingRemainder = 0;
-    for (int bit = 63; bit >= 0; --bit) {
-        workingRemainder =
-            (workingRemainder << 1U) | ((value >> bit) & 1U);
-        if (workingRemainder >= divisor) {
-            workingRemainder -= divisor;
-            quotient |= static_cast<uint64_t>(1) << bit;
-        }
-    }
-    remainder = static_cast<uint32_t>(workingRemainder);
-    return quotient;
-}
-
 uint64_t scaleTimelineDistance(uint64_t distance, uint32_t numerator,
                                uint32_t denominator) {
     uint32_t remainder = 0;
@@ -2345,62 +2405,6 @@ void setupUi(_NT_algorithm* self, _NT_float3& pots) {
     }
 }
 
-char* appendUnsigned(char* output, uint32_t value) {
-    char reversed[10];
-    int count = 0;
-    do {
-        reversed[count++] = static_cast<char>('0' + (value % 10U));
-        value /= 10U;
-    } while (value != 0U);
-
-    while (count > 0) {
-        *output++ = reversed[--count];
-    }
-    *output = '\0';
-    return output;
-}
-
-char* appendLiteral(char* output, const char* text) {
-    while (*text != '\0') {
-        *output++ = *text++;
-    }
-    *output = '\0';
-    return output;
-}
-
-char* appendUnsigned64(char* output, uint64_t value) {
-    char reversed[20];
-    int count = 0;
-    do {
-        uint32_t remainder = 0;
-        value = divideUnsigned64By32(value, 10U, remainder);
-        reversed[count++] = static_cast<char>('0' + remainder);
-    } while (value != 0U);
-
-    while (count > 0) {
-        *output++ = reversed[--count];
-    }
-    *output = '\0';
-    return output;
-}
-
-char* appendBeatAmount(char* output, uint64_t pulses,
-                       uint32_t pulsesPerBeat) {
-    uint32_t remainder = 0;
-    const uint64_t whole =
-        divideUnsigned64By32(pulses, pulsesPerBeat, remainder);
-    output = appendUnsigned64(output, whole);
-    if (remainder != 0U) {
-        const uint32_t hundredths =
-            (remainder * 100U + pulsesPerBeat / 2U) / pulsesPerBeat;
-        *output++ = '.';
-        *output++ = static_cast<char>('0' + hundredths / 10U);
-        *output++ = static_cast<char>('0' + hundredths % 10U);
-        *output = '\0';
-    }
-    return output;
-}
-
 int pulseTimelineX(uint64_t pulse, uint64_t viewStart, uint64_t viewEnd) {
     if (viewEnd <= viewStart || pulse <= viewStart) {
         return 4;
@@ -2437,27 +2441,32 @@ bool draw(_NT_algorithm* self) {
     }
 
     const uint32_t pulsesPerBeat = pulsesPerDisplayedBeat(*algorithm);
+    char amount[17];
+    formatMusicalDuration(amount, sizeof(amount),
+                          retainedTimelineIntervals(*algorithm),
+                          pulsesPerBeat);
     char availability[40];
-    char* cursor = appendLiteral(availability, "Avail ");
-    cursor = appendBeatAmount(cursor, retainedTimelineIntervals(*algorithm),
-                              pulsesPerBeat);
-    cursor = appendLiteral(cursor, "b  ");
-    cursor = appendUnsigned(cursor, pulsesPerBeat);
-    appendLiteral(cursor, "ppb");
-    nt_host::drawText(0, 7, availability);
+    BoundedText availabilityText(availability, sizeof(availability));
+    availabilityText.append("Avail ");
+    availabilityText.append(amount);
+    availabilityText.append("  ");
+    availabilityText.appendUnsigned64(pulsesPerBeat);
+    availabilityText.append("ppb");
+    nt_host::drawTinyText(0, 7, availability);
 
     char length[32];
-    cursor = appendLiteral(length, "Len ");
+    BoundedText lengthText(length, sizeof(length));
+    lengthText.append("Len ");
     if (algorithm->selectionValid) {
-        cursor = appendBeatAmount(
-            cursor,
+        formatMusicalDuration(
+            amount, sizeof(amount),
             algorithm->selection.endPulse - algorithm->selection.startPulse,
             pulsesPerBeat);
-        appendLiteral(cursor, "b");
+        lengthText.append(amount);
     } else {
-        appendLiteral(cursor, "--");
+        lengthText.append("--");
     }
-    nt_host::drawText(176, 7, length);
+    nt_host::drawTinyText(176, 7, length);
 
     uint64_t viewStart = 0;
     uint64_t viewEnd = 0;
@@ -3084,6 +3093,82 @@ Algorithm* asAlgorithm(_NT_algorithm* self) {
 
 } // namespace
 
+bool musicalDurationFromPulses(uint64_t pulseIntervals,
+                               uint32_t pulsesPerBeat,
+                               MusicalDuration& duration) {
+    duration = MusicalDuration();
+    if (!supportedPulsesPerBeat(pulsesPerBeat)) {
+        return false;
+    }
+
+    uint32_t pulseRemainder = 0U;
+    const uint64_t wholeBeats = divideUnsigned64By32(
+        pulseIntervals, pulsesPerBeat, pulseRemainder);
+    uint32_t beatRemainder = 0U;
+    duration.bars =
+        divideUnsigned64By32(wholeBeats, 4U, beatRemainder);
+    duration.beats = beatRemainder;
+    duration.ticks = pulseRemainder * (480U / pulsesPerBeat);
+    return true;
+}
+
+bool pulsesFromMusicalDuration(const MusicalDuration& duration,
+                               uint32_t pulsesPerBeat,
+                               uint64_t& pulseIntervals) {
+    pulseIntervals = 0U;
+    if (!supportedPulsesPerBeat(pulsesPerBeat) || duration.beats > 3U) {
+        return false;
+    }
+
+    const uint32_t ticksPerPulse = 480U / pulsesPerBeat;
+    if (duration.ticks >= 480U || duration.ticks % ticksPerPulse != 0U) {
+        return false;
+    }
+    const uint32_t pulseRemainder = duration.ticks / ticksPerPulse;
+    if (pulseRemainder >= pulsesPerBeat) {
+        return false;
+    }
+
+    const uint64_t maximum = ~static_cast<uint64_t>(0);
+    uint32_t ignoredRemainder = 0U;
+    const uint64_t maximumBars = divideUnsigned64By32(
+        maximum - duration.beats, 4U, ignoredRemainder);
+    if (duration.bars > maximumBars) {
+        return false;
+    }
+    const uint64_t wholeBeats = duration.bars * 4U + duration.beats;
+    const uint64_t maximumWholeBeats = divideUnsigned64By32(
+        maximum - pulseRemainder, pulsesPerBeat, ignoredRemainder);
+    if (wholeBeats > maximumWholeBeats) {
+        return false;
+    }
+    pulseIntervals = wholeBeats * pulsesPerBeat + pulseRemainder;
+    return true;
+}
+
+bool formatMusicalDuration(char* output, size_t capacity,
+                           uint64_t pulseIntervals,
+                           uint32_t pulsesPerBeat) {
+    BoundedText text(output, capacity);
+    MusicalDuration duration = {};
+    if (!musicalDurationFromPulses(pulseIntervals, pulsesPerBeat, duration)) {
+        return false;
+    }
+    if (duration.bars > kMaximumDisplayedBars) {
+        text.append(">9999999999bar");
+        return text.valid();
+    }
+
+    text.appendUnsigned64(duration.bars);
+    text.append(':');
+    text.append(static_cast<char>('0' + duration.beats));
+    text.append(':');
+    text.append(static_cast<char>('0' + duration.ticks / 100U));
+    text.append(static_cast<char>('0' + (duration.ticks / 10U) % 10U));
+    text.append(static_cast<char>('0' + duration.ticks % 10U));
+    return text.valid();
+}
+
 CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     CaptureSnapshot snapshot = {};
     const Algorithm* algorithm = asAlgorithm(self);
@@ -3332,6 +3417,10 @@ void dispatchSafetyMidi3(_NT_algorithm* self, uint8_t status, uint8_t data1,
 namespace nt_host {
 
 void drawText(int x, int y, const char* text) { NT_drawText(x, y, text); }
+
+void drawTinyText(int x, int y, const char* text) {
+    NT_drawText(x, y, text, 15, kNT_textLeft, kNT_textTiny);
+}
 
 void drawShape(_NT_shape shape, int x0, int y0, int x1, int y1,
                int colour) {

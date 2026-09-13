@@ -38,6 +38,81 @@ void setFramebufferPixel(int x, int y, int colour) {
                : static_cast<uint8_t>((byte & 0xf0U) | nibble);
 }
 
+const uint8_t* tinyGlyph(char character) {
+    static const uint8_t blank[] = {0U, 0U, 0U, 0U, 0U};
+    static const uint8_t zero[] = {7U, 5U, 5U, 5U, 7U};
+    static const uint8_t one[] = {2U, 6U, 2U, 2U, 7U};
+    static const uint8_t two[] = {7U, 1U, 7U, 4U, 7U};
+    static const uint8_t three[] = {7U, 1U, 7U, 1U, 7U};
+    static const uint8_t four[] = {5U, 5U, 7U, 1U, 1U};
+    static const uint8_t five[] = {7U, 4U, 7U, 1U, 7U};
+    static const uint8_t six[] = {7U, 4U, 7U, 5U, 7U};
+    static const uint8_t seven[] = {7U, 1U, 2U, 2U, 2U};
+    static const uint8_t eight[] = {7U, 5U, 7U, 5U, 7U};
+    static const uint8_t nine[] = {7U, 5U, 7U, 1U, 7U};
+    static const uint8_t colon[] = {0U, 2U, 0U, 2U, 0U};
+    static const uint8_t hyphen[] = {0U, 0U, 7U, 0U, 0U};
+    static const uint8_t greater[] = {4U, 2U, 1U, 2U, 4U};
+    static const uint8_t upperA[] = {2U, 5U, 7U, 5U, 5U};
+    static const uint8_t upperL[] = {4U, 4U, 4U, 4U, 7U};
+    static const uint8_t lowerA[] = {0U, 3U, 5U, 7U, 5U};
+    static const uint8_t lowerB[] = {4U, 4U, 6U, 5U, 6U};
+    static const uint8_t lowerE[] = {0U, 2U, 5U, 6U, 3U};
+    static const uint8_t lowerI[] = {2U, 0U, 2U, 2U, 2U};
+    static const uint8_t lowerL[] = {4U, 4U, 4U, 4U, 3U};
+    static const uint8_t lowerN[] = {0U, 6U, 5U, 5U, 5U};
+    static const uint8_t lowerP[] = {0U, 6U, 5U, 6U, 4U};
+    static const uint8_t lowerR[] = {0U, 5U, 6U, 4U, 4U};
+    static const uint8_t lowerV[] = {0U, 5U, 5U, 5U, 2U};
+
+    switch (character) {
+    case '0': return zero;
+    case '1': return one;
+    case '2': return two;
+    case '3': return three;
+    case '4': return four;
+    case '5': return five;
+    case '6': return six;
+    case '7': return seven;
+    case '8': return eight;
+    case '9': return nine;
+    case ':': return colon;
+    case '-': return hyphen;
+    case '>': return greater;
+    case 'A': return upperA;
+    case 'L': return upperL;
+    case 'a': return lowerA;
+    case 'b': return lowerB;
+    case 'e': return lowerE;
+    case 'i': return lowerI;
+    case 'l': return lowerL;
+    case 'n': return lowerN;
+    case 'p': return lowerP;
+    case 'r': return lowerR;
+    case 'v': return lowerV;
+    default: return blank;
+    }
+}
+
+void drawTinyFramebufferText(int x, int baselineY, const char* text,
+                             int colour) {
+    if (text == NULL) {
+        return;
+    }
+    const int top = baselineY - 4;
+    for (size_t character = 0; text[character] != '\0'; ++character) {
+        const uint8_t* rows = tinyGlyph(text[character]);
+        const int cellX = x + static_cast<int>(character) * 4;
+        for (int row = 0; row < 5; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                if ((rows[row] & (4U >> column)) != 0U) {
+                    setFramebufferPixel(cellX + column, top + row, colour);
+                }
+            }
+        }
+    }
+}
+
 void drawFramebufferLine(int x0, int y0, int x1, int y1, int colour) {
     const int dx = x1 >= x0 ? x1 - x0 : x0 - x1;
     const int sx = x0 < x1 ? 1 : -1;
@@ -437,16 +512,19 @@ const _NT_globals NT_globals = {
 
 uint8_t NT_screen[128 * 64];
 
-void NT_drawText(int x, int y, const char* text, int, _NT_textAlignment,
-                 _NT_textSize) {
-    if (gTrace.drawCallCount >= ARRAY_SIZE(gTrace.drawCalls)) {
-        return;
+void NT_drawText(int x, int y, const char* text, int colour,
+                 _NT_textAlignment, _NT_textSize size) {
+    if (gTrace.drawCallCount < ARRAY_SIZE(gTrace.drawCalls)) {
+        midibuffer_test::DrawCall& call =
+            gTrace.drawCalls[gTrace.drawCallCount++];
+        call.x = x;
+        call.y = y;
+        call.size = size;
+        copyText(call.text, sizeof(call.text), text);
     }
-    midibuffer_test::DrawCall& call =
-        gTrace.drawCalls[gTrace.drawCallCount++];
-    call.x = x;
-    call.y = y;
-    copyText(call.text, sizeof(call.text), text);
+    if (size == kNT_textTiny) {
+        drawTinyFramebufferText(x, y, text, colour);
+    }
 }
 
 void NT_drawShapeI(_NT_shape shape, int x0, int y0, int x1, int y1,

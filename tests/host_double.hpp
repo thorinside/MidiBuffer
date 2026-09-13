@@ -11,6 +11,7 @@ namespace midibuffer_test {
 struct DrawCall {
     int x;
     int y;
+    _NT_textSize size;
     char text[48];
 };
 

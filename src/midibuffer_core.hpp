@@ -25,6 +25,25 @@ struct PulseRange {
     uint64_t endPulse;
 };
 
+struct MusicalDuration {
+    uint64_t bars;
+    uint32_t beats;
+    uint32_t ticks;
+};
+
+// Exact display conversion for supported Pulses/Beat values. Formatting is
+// bounded (capacity includes the NUL) and replaces amounts above the approved
+// bar limit with the complete lower-bound marker rather than truncating them.
+bool musicalDurationFromPulses(uint64_t pulseIntervals,
+                               uint32_t pulsesPerBeat,
+                               MusicalDuration& duration);
+bool pulsesFromMusicalDuration(const MusicalDuration& duration,
+                               uint32_t pulsesPerBeat,
+                               uint64_t& pulseIntervals);
+bool formatMusicalDuration(char* output, size_t capacity,
+                           uint64_t pulseIntervals,
+                           uint32_t pulsesPerBeat);
+
 enum SelectionFineTarget {
     kSelectionFineTargetStart,
     kSelectionFineTargetEnd,
