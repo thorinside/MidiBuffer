@@ -1,8 +1,110 @@
 # MidiBuffer
 
-MidiBuffer is an Expert Sleepers disting NT plug-in targeting firmware 1.18 and later through the pinned API v13 SDK.
+MidiBuffer is a rolling, clock-relative MIDI recorder and looper for the Expert Sleepers disting NT. It is intended for musicians who want to capture a performance, select a pulse-aligned section on the module's timeline, and repeat it against a patched external clock without flattening expression between clock pulses.
 
-## Current behavior
+## Compatibility and test status
+
+- **Supported target:** disting NT firmware **1.18 and later**.
+- Firmware earlier than 1.18 is unsupported.
+- The plug-in builds against the pinned API v13 SDK checkout. Native host-double tests and ARM object inspection pass, but those checks do not run firmware.
+- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. A modest physical-module smoke test remains a separate pre-publication check.
+
+## Install
+
+Build or obtain `MidiBuffer.o`, then place it at:
+
+```text
+/programs/plug-ins/MidiBuffer.o
+```
+
+Load **MidiBuffer** using the disting NT's normal plug-in loading workflow. The repository build product is `plugins/MidiBuffer.o`.
+
+## Controls and defaults
+
+Choose **Buffer MB** when creating the algorithm; the other controls are ordinary run-time parameters.
+
+| Page | Control | Values or range | Default | Purpose |
+| --- | --- | --- | --- | --- |
+| Specification | **Buffer MB** | 1–5 MB | 1 MB | Fixes rolling-event memory for this instance; it cannot be resized at run time. |
+| Inputs | **Clock** | CV bus 1–64 | Input 1 | Rising pulses provide the recording grid and playback tempo. |
+| Inputs | **Reset** | CV bus 1–64 | Input 2 | Immediately cleans up playback output and returns playback to the active range start. |
+| Capture | **Capture** | Stop Capture, Start Capture | Stop Capture | Explicitly enables or stops recording. |
+| Capture | **Record Ch** | Omni, 1–16 | Omni | Admits all channels or one selected incoming MIDI channel. |
+| Playback | **MIDI Out** | Breakout, USB, Select Bus, Internal, All | Breakout | Chooses the replay, cleanup, and panic destination. |
+| Playback | **Play Ch** | Original, 1–16 | Original | Preserves recorded channels or rewrites every replayed channel message to one channel. |
+| Playback | **Filter CC** | Off, On | Off | Suppresses eligible recorded CC during playback when On. |
+| Playback | **Filter Pitch Bend** | Off, On | Off | Suppresses recorded pitch bend during playback when On. |
+| Playback | **Filter Aftertouch** | Off, On | Off | Suppresses channel and polyphonic pressure during playback when On. |
+| Timeline | **Pulses/Beat** | 1, 2, 4, 8, 16, 24, 48 | 1 | Changes only the timeline's beat conversion, not timing or loop boundaries. |
+
+The CV inputs respond to rising edges above 1 V. **Clock** and **Reset** require a routed bus; neither has a None setting.
+
+### Timeline controls
+
+| Physical control | Action |
+| --- | --- |
+| Left pot | Move the selection start. The first boundary edit creates a full-history selection before applying the edit. |
+| Centre pot | Move the selection end. |
+| Right pot | Zoom between 4 and 256 visible clock pulses. |
+| Left encoder turn | Scroll the view toward older or newer retained history without moving the selection. |
+| Left encoder press | Start or stop playback. It is a no-op until a valid selection exists. |
+| Right encoder turn | Trim whichever selection boundary was moved most recently, one pulse per detent. |
+| Right encoder hold for one second | Panic once: stop playback and send CC120 plus CC123 on all 16 channels to the selected destination. |
+
+## Capture and loop workflow
+
+1. Add MidiBuffer and choose **Buffer MB**. Patch the external pulse source to **Clock**, and patch **Reset** if wanted.
+2. Set **Record Ch**, **MIDI Out**, **Play Ch**, and the three playback filters. The filters do not alter retained history.
+3. Start the external clock. MidiBuffer needs two pulses to measure an interval when it has no current clock measurement.
+4. Set **Capture** to **Start Capture**, then perform. Only eligible channel MIDI received while capture is enabled and the external clock is running is retained.
+5. Set **Capture** to **Stop Capture**. MidiBuffer stores finite endings for active notes and selected expressive state; stopping capture does not transmit those endings to live outputs.
+6. Touch a selection boundary control to create and trim a valid pulse-aligned range. Use **Pulses/Beat**, zoom, and scroll to navigate without changing recorded timing.
+7. Press the left encoder to play. If a clock interval is still known, playback begins on the next pulse; otherwise it waits for two fresh pulses. Starting playback also finalizes and pauses active capture.
+8. Press the left encoder again to stop. Playback position is preserved for continuation. Use **Reset** to clean up and return to the range start. Capture never restarts automatically; select **Start Capture** again when you want to record more.
+
+Edits made while playing are adopted together at the next loop wrap. The current range finishes first, then held-note and sustain cleanup occurs before the new range emits anything.
+
+## Memory and history length
+
+Each retained event currently occupies 24 bytes. **Buffer MB** uses decimal megabytes and produces these event capacities:
+
+| Buffer MB | Event capacity |
+| ---: | ---: |
+| 1 | 41,666 |
+| 2 | 83,333 |
+| 3 | 125,000 |
+| 4 | 166,666 |
+| 5 | 208,333 |
+
+Capacity is an event count, not a duration. Dense streams of notes, controllers, pitch bend, or pressure consume it faster and retain fewer clock pulses than sparse playing. At capacity, the oldest event is replaced. If replacement reaches the selected range, MidiBuffer clears that selection while capture continues so stale history cannot be played.
+
+Larger buffers also make larger presets. In the native host model, a full 5 MB event history serializes to approximately 10.1 MB of custom JSON string payload. API v13 publishes no payload-size or save/load-time guarantee, so this measurement is not a firmware guarantee.
+
+## Routing and shared-channel safety
+
+- **MIDI Out: All** sends to Breakout, USB, Select Bus, and Internal. Existing external or internal forwarding can therefore duplicate messages or create feedback; MidiBuffer cannot detect the rest of the routing graph.
+- **Play Ch: Original** keeps recorded channels. A 1–16 override merges all recorded channels onto one output channel. Same-note and sustain ownership collisions are then resolved on that shared output channel, not on the original channels.
+- Manual stop, reset, clock loss, panic, and adoption of a changed range clean up output state through the selected destination. Ordinary stop/reset cleanup sends note-offs for notes MidiBuffer still owns, followed by CC64 value 0 on channels where its playback left sustain enabled.
+- CC64 cleanup is channel-wide MIDI. It may also release live sustained notes from another source sharing that output channel. Use separate channels or destinations where that tradeoff is unacceptable.
+- Panic is broader than ordinary cleanup: it sends All Sound Off (CC120) and All Notes Off (CC123) on all 16 channels. Incoming CC120 or CC123 during playback invokes the same panic. Incoming MIDI Stop is ignored because transport follows the patched clock.
+
+## Presets and continuation
+
+Valid NT presets preserve the retained event contents, order, and pulse-relative timing; selected, active, and pending ranges; playback cursor and scheduler state; capture/playback intent; parameters, filters, and routing; timeline state; and MidiBuffer's internal note, controller, and pending-ending ownership.
+
+Loading is silent. The live clock and reset levels, partial clock acquisition, current button holds, external routing, and connected instruments are not preset data. Restored capture or playback waits for two fresh clock pulses. Saved in-flight playback then continues its unconsumed interval and pending endings before advancing the loop; loading does not synthesize replacement attacks for external notes that were sounding before the load.
+
+Only valid saved state is in MidiBuffer's scope. If a preset is corrupt or incomplete and firmware cannot load it, the algorithm is not loaded; failure handling and error presentation belong to the firmware. MidiBuffer does not promise plug-in-specific recovery, partial restoration, or recovery of edits made after the preset was saved.
+
+## Version-one limits
+
+- Version one does **not** provide direct MIDI-file export.
+- No MIDI-file export workaround is provided or required. Reconsidering export depends on suitable future firmware/API file-writing support.
+- Program changes, SysEx, MIDI realtime/transport, Channel Mode CC120–127, and RPN/NRPN-related CC6, CC38, and CC96–101 are not recorded.
+- The plug-in does not reconstruct notes that began before the selected range, serialize external clocks/instruments/routing, guarantee silence for other devices sharing a channel, recover corrupt/incomplete presets, or recover unsaved changes.
+- Licensing, distribution/publication, routing redesign, extra panic gestures, MIDI transport following, and a broad hardware compatibility programme are outside version one. The remaining physical release check is intentionally modest rather than a firmware/hardware matrix.
+
+## Detailed behavior reference
 
 MidiBuffer retains eligible channel MIDI as pulse-relative events in a fixed rolling history:
 
