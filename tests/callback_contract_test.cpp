@@ -145,7 +145,7 @@ bool sameHistory(const HistoryImage& expected,
             actual.sourceIntervalSamples !=
                 expected.events[index].sourceIntervalSamples ||
             actual.size != expected.events[index].size ||
-            actual.flags != expected.events[index].flags ||
+            (actual.flags & 1U) != (expected.events[index].flags & 1U) ||
             std::memcmp(actual.bytes, expected.events[index].bytes,
                         sizeof(actual.bytes)) != 0) {
             return false;
@@ -745,10 +745,11 @@ void verifyRetainedReplayRoutingMatrix() {
     acquireClock(host);
 
     const uint8_t recordedMessages[][3] = {
-        {0x81, 48, 0},   {0x92, 49, 100}, {0xA3, 50, 60},
-        {0xB4, 1, 72},   {0xD5, 80, 0},   {0xE6, 0, 64},
+        {0x91, 48, 100}, {0x81, 48, 0},   {0x92, 49, 100},
+        {0xA3, 50, 60},  {0xB4, 1, 72},   {0xD5, 80, 0},
+        {0xE6, 0, 64},
     };
-    const uint8_t messageSizes[] = {3, 3, 3, 3, 2, 3};
+    const uint8_t messageSizes[] = {3, 3, 3, 3, 3, 2, 3};
     for (size_t index = 0; index < ARRAY_SIZE(recordedMessages); ++index) {
         sendMidi(host, recordedMessages[index][0], recordedMessages[index][1],
                  recordedMessages[index][2]);
@@ -1594,6 +1595,266 @@ void verifyClockLossCleanupAndContinuation() {
            "pulse");
 }
 
+struct LoopTailFixture {
+    uint64_t selectionStart;
+    uint64_t lastClockSample;
+};
+
+LoopTailFixture prepareLoopTailHistory(midibuffer_test::HostDouble& host) {
+    LoopTailFixture fixture = {};
+    expect(host.instantiate(1), "loop-tail ownership host constructs");
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "loop-tail history acquires a 16-sample source clock");
+    startCapture(host);
+
+    // This attack precedes the selection. Its release lies inside, but neither
+    // event may fabricate or otherwise include the note in playback.
+    sendMidi(host, 0x90, 50, 100);
+    expect(clockPulseAt(host, 32U),
+           "loop-tail history reaches the selected start pulse");
+    fixture.selectionStart = snapshot(host).currentPulse;
+    sendMidi(host, 0x90, 60, 100);
+
+    expect(clockPulseAt(host, 48U),
+           "loop-tail history reaches its second selected pulse");
+    sendMidi(host, 0x80, 50, 0);
+    sendMidi(host, 0x91, 61, 100);
+    sendMidi(host, 0xB2, 64, 127);
+    sendMidi(host, 0xB3, 64, 127);
+
+    expect(clockPulseAt(host, 64U),
+           "short note and pedal endings are recorded outside selection");
+    sendMidi(host, 0x81, 61, 0);
+    sendMidi(host, 0xB2, 64, 0);
+    expect(clockPulseAt(host, 80U),
+           "long note and overlapping pedal endings remain retained");
+    sendMidi(host, 0x80, 60, 0);
+    sendMidi(host, 0xB3, 64, 0);
+    expect(clockPulseAt(host, 96U),
+           "loop-tail history closes after every outside ending");
+    stopCapture(host);
+    expect(midibuffer::setPulseSelection(host.algorithm(),
+                                         fixture.selectionStart,
+                                         fixture.selectionStart + 2U),
+           "two-pulse loop-tail range is selectable");
+
+    fixture.lastClockSample = 96U;
+    for (uint32_t index = 0; index < 8U; ++index) {
+        fixture.lastClockSample += 24U;
+        expect(clockPulseAt(host, fixture.lastClockSample),
+               "loop-tail playback tempo priming pulse is delivered");
+    }
+    expect(snapshot(host).predictedClockIntervalSamples == 24U,
+           "loop-tail playback clock converges to the slower tempo");
+    return fixture;
+}
+
+void openLoopTailFirstPass(midibuffer_test::HostDouble& host,
+                           LoopTailFixture& fixture) {
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "loop-tail playback arms");
+    fixture.lastClockSample += 24U;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "loop-tail playback starts on its first selected pulse");
+    stepThrough(host, fixture.lastClockSample + 12U);
+    fixture.lastClockSample += 24U;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "loop-tail playback reaches its second selected pulse");
+    stepThrough(host, fixture.lastClockSample + 12U);
+}
+
+void verifyLoopTailDurationsAndSustainOwnership() {
+    midibuffer_test::HostDouble host;
+    LoopTailFixture fixture = prepareLoopTailHistory(host);
+    openLoopTailFirstPass(host, fixture);
+
+    const uint64_t playbackStart = fixture.lastClockSample - 24U;
+    const midibuffer_test::Trace& firstPass = midibuffer_test::trace();
+    expect(firstPass.midiCallCount == 4U &&
+               firstPass.midiCalls[0].dispatchSample == playbackStart + 12U &&
+               firstPass.midiCalls[0].bytes[0] == 0x90U &&
+               firstPass.midiCalls[0].bytes[1] == 60U &&
+               firstPass.midiCalls[1].dispatchSample == playbackStart + 36U &&
+               firstPass.midiCalls[1].bytes[0] == 0x91U &&
+               firstPass.midiCalls[1].bytes[1] == 61U &&
+               firstPass.midiCalls[2].bytes[0] == 0xB2U &&
+               firstPass.midiCalls[2].bytes[2] == 127U &&
+               firstPass.midiCalls[3].bytes[0] == 0xB3U &&
+               firstPass.midiCalls[3].bytes[2] == 127U,
+           "only in-range attacks and presses play at tempo-scaled offsets");
+    bool preSelectionNoteAbsent = true;
+    for (size_t index = 0; index < firstPass.midiCallCount; ++index) {
+        preSelectionNoteAbsent =
+            preSelectionNoteAbsent && firstPass.midiCalls[index].bytes[1] != 50U;
+    }
+    expect(preSelectionNoteAbsent,
+           "a note begun before selection receives no fabricated attack or release");
+    expect(snapshot(host).pendingNoteEndingCount == 2U &&
+               snapshot(host).pendingSustainReleaseCount == 2U,
+           "in-range attacks and presses retain their outside-range endings");
+
+    fixture.lastClockSample += 24U;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "ordinary wrap keeps pending note and sustain ownership");
+    stepThrough(host, fixture.lastClockSample + 12U);
+    const midibuffer_test::Trace& wrapped = midibuffer_test::trace();
+    expect(wrapped.midiCallCount == 8U &&
+               wrapped.midiCalls[4].dispatchSample == playbackStart + 60U &&
+               wrapped.midiCalls[4].bytes[0] == 0x80U &&
+               wrapped.midiCalls[4].bytes[1] == 60U &&
+               wrapped.midiCalls[5].bytes[0] == 0x90U &&
+               wrapped.midiCalls[5].bytes[1] == 60U &&
+               wrapped.midiCalls[6].bytes[0] == 0x81U &&
+               wrapped.midiCalls[6].bytes[1] == 61U &&
+               wrapped.midiCalls[7].bytes[0] == 0xB2U &&
+               wrapped.midiCalls[7].bytes[1] == 64U &&
+               wrapped.midiCalls[7].bytes[2] == 0U,
+           "wrap retriggers the long note safely while the short note and pedal "
+           "keep their recorded 24-sample scaled lifetimes");
+
+    fixture.lastClockSample += 24U;
+    expect(clockPulseAt(host, fixture.lastClockSample),
+           "second pass reaches overlapping presses");
+    stepThrough(host, fixture.lastClockSample + 12U);
+    const midibuffer_test::Trace& overlap = midibuffer_test::trace();
+    bool staleLongNoteOffAbsent = true;
+    bool staleSustainOffAbsent = true;
+    for (size_t index = 8U; index < overlap.midiCallCount; ++index) {
+        const midibuffer_test::MidiCall& call = overlap.midiCalls[index];
+        if (call.dispatchSample == playbackStart + 84U &&
+            call.bytes[0] == 0x80U && call.bytes[1] == 60U) {
+            staleLongNoteOffAbsent = false;
+        }
+        if (call.dispatchSample == playbackStart + 84U &&
+            call.bytes[0] == 0xB3U && call.bytes[1] == 64U &&
+            call.bytes[2] < 64U) {
+            staleSustainOffAbsent = false;
+        }
+    }
+    expect(staleLongNoteOffAbsent,
+           "a canceled older note ending cannot cut its replacement short");
+    expect(staleSustainOffAbsent &&
+               snapshot(host).pendingSustainReleaseCount == 2U,
+           "the newest overlapping pedal press owns release and may sustain continuously");
+}
+
+void verifyOverriddenChannelRetriggerOwnership() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "override collision host constructs");
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "override collision history acquires source clock");
+    startCapture(host);
+    expect(clockPulseAt(host, 32U),
+           "override collision reaches selection start");
+    const uint64_t startPulse = snapshot(host).currentPulse;
+    sendMidi(host, 0x90, 64, 100);
+    expect(clockPulseAt(host, 48U),
+           "override collision reaches second source channel attack");
+    sendMidi(host, 0x91, 64, 110);
+    expect(clockPulseAt(host, 64U),
+           "override collision records first outside ending");
+    sendMidi(host, 0x81, 64, 0);
+    expect(clockPulseAt(host, 80U),
+           "override collision records second outside ending");
+    sendMidi(host, 0x80, 64, 0);
+    expect(clockPulseAt(host, 96U),
+           "override collision history closes");
+    stopCapture(host);
+    expect(midibuffer::setPulseSelection(host.algorithm(), startPulse,
+                                         startPulse + 2U),
+           "override collision range is selectable");
+    changeParameter(host, kPlaybackChannelParameter, 5);
+
+    uint64_t lastClock = 96U;
+    for (uint32_t index = 0; index < 8U; ++index) {
+        lastClock += 16U;
+        expect(clockPulseAt(host, lastClock),
+               "override collision tempo priming pulse is delivered");
+    }
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "override collision playback arms");
+    lastClock += 16U;
+    expect(clockPulseAt(host, lastClock),
+           "override collision starts first source attack");
+    stepThrough(host, lastClock + 8U);
+    lastClock += 16U;
+    expect(clockPulseAt(host, lastClock),
+           "override collision reaches replacement attack");
+    stepThrough(host, lastClock + 8U);
+    const midibuffer_test::Trace& collision = midibuffer_test::trace();
+    expect(collision.midiCallCount == 3U &&
+               collision.midiCalls[0].bytes[0] == 0x94U &&
+               collision.midiCalls[1].bytes[0] == 0x84U &&
+               collision.midiCalls[1].bytes[1] == 64U &&
+               collision.midiCalls[2].bytes[0] == 0x94U &&
+               collision.midiCalls[2].bytes[1] == 64U,
+           "channel override releases the older same-pitch owner before replacement");
+
+    lastClock += 16U;
+    expect(clockPulseAt(host, lastClock),
+           "override collision reaches the older ending interval");
+    stepThrough(host, lastClock + 8U);
+    const midibuffer_test::Trace& afterWrap = midibuffer_test::trace();
+    expect(afterWrap.midiCallCount == 5U &&
+               afterWrap.midiCalls[3].bytes[0] == 0x84U &&
+               afterWrap.midiCalls[4].bytes[0] == 0x94U,
+           "next-pass retrigger has exactly one release before one attack and no stale ending");
+}
+
+void expectNoPendingEndings(midibuffer_test::HostDouble& host,
+                            const char* message) {
+    expect(snapshot(host).pendingNoteEndingCount == 0U &&
+               snapshot(host).pendingSustainReleaseCount == 0U,
+           message);
+}
+
+void verifyPendingEndingDiscontinuityCleanup() {
+    {
+        midibuffer_test::HostDouble host;
+        LoopTailFixture fixture = prepareLoopTailHistory(host);
+        openLoopTailFirstPass(host, fixture);
+        midibuffer::stopPlayback(host.algorithm());
+        expectNoPendingEndings(host,
+                               "manual stop cancels every pending recorded ending");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        LoopTailFixture fixture = prepareLoopTailHistory(host);
+        openLoopTailFirstPass(host, fixture);
+        resetPulse(host);
+        expectNoPendingEndings(host,
+                               "reset cancels every pending recorded ending");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        LoopTailFixture fixture = prepareLoopTailHistory(host);
+        openLoopTailFirstPass(host, fixture);
+        while (snapshot(host).clockRunning) {
+            noClockBlock(host);
+        }
+        expect(snapshot(host).playbackClockLossPaused,
+               "pending-ending clock-loss case reaches paused cleanup");
+        expectNoPendingEndings(host,
+                               "clock loss cancels every pending recorded ending");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        LoopTailFixture fixture = prepareLoopTailHistory(host);
+        openLoopTailFirstPass(host, fixture);
+        expect(midibuffer::setPulseSelection(host.algorithm(),
+                                             fixture.selectionStart + 2U,
+                                             fixture.selectionStart + 4U),
+               "pending-ending range replacement is accepted");
+        fixture.lastClockSample += 24U;
+        expect(clockPulseAt(host, fixture.lastClockSample),
+               "pending-ending range replacement reaches adoption wrap");
+        expectNoPendingEndings(host,
+                               "range transition cancels previous-range endings");
+    }
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -1642,6 +1903,9 @@ int main() {
     verifyPlaybackCaptureExclusionAndManualStop();
     verifyResetCleanupAndCoincidence();
     verifyClockLossCleanupAndContinuation();
+    verifyLoopTailDurationsAndSustainOwnership();
+    verifyOverriddenChannelRetriggerOwnership();
+    verifyPendingEndingDiscontinuityCleanup();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {

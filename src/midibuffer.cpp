@@ -14,7 +14,8 @@ const uint32_t kBytesPerMegabyte = 1000000U;
 const int32_t kDefaultBufferMegabytes = 1;
 const float kGateThresholdVolts = 1.0f;
 const uint32_t kClockAverageWindow = 8U;
-const uint8_t kRecordedEventFlagCaptureEnding = 0x01U;
+const uint32_t kRecordedEventFlagCaptureEnding = 0x01U;
+const uint32_t kRecordedEventEndingIndexShift = 1U;
 
 static_assert(sizeof(RecordedEvent) == 24,
               "recording event size is part of capacity accounting");
@@ -76,6 +77,20 @@ struct PlaybackOutputState {
     uint16_t sustainChannels;
 };
 
+// Note tails and sustain releases are owned by the attack/press that admitted
+// them into playback. The event indices remain stable while playback excludes
+// capture, and split arrays avoid padding thousands of small records.
+struct PendingPlaybackEndings {
+    uint64_t noteDueIntervals[16][128];
+    uint32_t noteEventIndices[16][128];
+    uint32_t noteActiveMasks[16][4];
+    uint64_t sustainDueIntervals[16];
+    uint32_t sustainEventIndices[16];
+    uint32_t noteCount;
+    uint32_t sustainCount;
+    uint16_t sustainActiveChannels;
+};
+
 struct Algorithm : public _NT_algorithm {
     Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
         : _NT_algorithm(),
@@ -89,12 +104,14 @@ struct Algorithm : public _NT_algorithm {
           playbackEventIndex(0), clockIntervalWriteIndex(0),
           clockIntervalCount(0), clockIntervals(), selection(),
           activeSelection(), state(), recordedState(), playbackOutputState(),
-          transportState(kTransportStopped), captureEnabled(false),
+          pendingEndings(), transportState(kTransportStopped),
+          playbackIntervalOrdinal(0), captureEnabled(false),
           clockRunning(false), haveAcquisitionPulse(false), clockHigh(false),
           resetHigh(false), selectionValid(false),
           activeSelectionValid(false), rangeTransitionPending(false),
           playbackPositionValid(false), playbackIntervalOpen(false),
-          playbackNextEventScheduled(false) {}
+          playbackNextEventScheduled(false), pendingNextEndingScheduled(false),
+          pendingNextEndingSample(0) {}
 
     RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
@@ -120,7 +137,9 @@ struct Algorithm : public _NT_algorithm {
     CallbackState state;
     RecordedState recordedState;
     PlaybackOutputState playbackOutputState;
+    PendingPlaybackEndings pendingEndings;
     TransportState transportState;
+    uint64_t playbackIntervalOrdinal;
 
     bool captureEnabled;
     bool clockRunning;
@@ -133,6 +152,8 @@ struct Algorithm : public _NT_algorithm {
     bool playbackPositionValid;
     bool playbackIntervalOpen;
     bool playbackNextEventScheduled;
+    bool pendingNextEndingScheduled;
+    uint64_t pendingNextEndingSample;
 };
 
 static const char* const kCaptureStrings[] = {
@@ -332,6 +353,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
 }
 
 void finalizeCapture(Algorithm& algorithm);
+void clearPendingPlaybackEndings(Algorithm& algorithm);
 
 void parameterChanged(_NT_algorithm* self, int parameter) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
@@ -365,6 +387,7 @@ void clearSelection(Algorithm& algorithm) {
     algorithm.rangeTransitionPending = false;
     algorithm.transportState = kTransportStopped;
     algorithm.playbackOutputState = PlaybackOutputState();
+    clearPendingPlaybackEndings(algorithm);
     algorithm.playbackPositionValid = false;
     algorithm.playbackIntervalOpen = false;
     algorithm.playbackNextEventScheduled = false;
@@ -672,6 +695,19 @@ bool recordedEventPassesPlaybackFilters(const Algorithm& algorithm,
     }
 }
 
+void clearPendingPlaybackEndings(Algorithm& algorithm) {
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t word = 0; word < 4U; ++word) {
+            algorithm.pendingEndings.noteActiveMasks[channel][word] = 0U;
+        }
+    }
+    algorithm.pendingEndings.noteCount = 0;
+    algorithm.pendingEndings.sustainCount = 0;
+    algorithm.pendingEndings.sustainActiveChannels = 0;
+    algorithm.pendingNextEndingScheduled = false;
+    algorithm.pendingNextEndingSample = 0;
+}
+
 void trackPlaybackOutput(Algorithm& algorithm, uint8_t status, uint8_t data1,
                          uint8_t data2, uint8_t size) {
     if (size != 3U) {
@@ -746,6 +782,7 @@ void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample) {
         }
     }
     algorithm.playbackOutputState = PlaybackOutputState();
+    clearPendingPlaybackEndings(algorithm);
 }
 
 uint32_t findPlaybackEventIndex(const Algorithm& algorithm, uint64_t pulse) {
@@ -853,6 +890,352 @@ uint64_t eventDispatchSample(const Algorithm& algorithm,
                : algorithm.playbackIntervalStartSample + scaledOffset;
 }
 
+RecordedEvent* recordedEventByIndex(Algorithm& algorithm,
+                                    uint32_t oldestFirstIndex) {
+    if (oldestFirstIndex >= algorithm.eventCount) {
+        return NULL;
+    }
+    uint32_t ringIndex = algorithm.eventHead + oldestFirstIndex;
+    if (ringIndex >= algorithm.eventCapacity) {
+        ringIndex -= algorithm.eventCapacity;
+    }
+    return &algorithm.recordingEvents[ringIndex];
+}
+
+bool notePending(const Algorithm& algorithm, uint8_t channel, uint8_t note) {
+    return (algorithm.pendingEndings.noteActiveMasks[channel][note / 32U] &
+            (static_cast<uint32_t>(1U) << (note % 32U))) != 0U;
+}
+
+void setNotePending(Algorithm& algorithm, uint8_t channel, uint8_t note,
+                    bool active) {
+    uint32_t& mask =
+        algorithm.pendingEndings.noteActiveMasks[channel][note / 32U];
+    const uint32_t bit = static_cast<uint32_t>(1U) << (note % 32U);
+    const bool wasActive = (mask & bit) != 0U;
+    if (wasActive == active) {
+        return;
+    }
+    mask = active ? mask | bit : mask & ~bit;
+    if (active) {
+        ++algorithm.pendingEndings.noteCount;
+    } else {
+        --algorithm.pendingEndings.noteCount;
+    }
+}
+
+uint32_t encodedEndingIndex(uint32_t eventIndex) {
+    return (eventIndex + 1U) << kRecordedEventEndingIndexShift;
+}
+
+bool decodedEndingIndex(const RecordedEvent& event, uint32_t& eventIndex) {
+    const uint32_t encoded =
+        event.flags >> kRecordedEventEndingIndexShift;
+    if (encoded == 0U) {
+        return false;
+    }
+    eventIndex = encoded - 1U;
+    return true;
+}
+
+void prepareRecordedEndingOwnership(Algorithm& algorithm) {
+    clearPendingPlaybackEndings(algorithm);
+    const uint32_t none = algorithm.eventCount;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            algorithm.pendingEndings.noteEventIndices[channel][note] = none;
+            algorithm.pendingEndings.noteDueIntervals[channel][note] = none;
+        }
+        algorithm.pendingEndings.sustainEventIndices[channel] = none;
+        algorithm.pendingEndings.sustainDueIntervals[channel] = none;
+    }
+
+    // Build FIFO note occurrence pairs in one bounded pass. During this pass a
+    // queued note-on's metadata temporarily links to the next queued attack;
+    // popping it replaces that link with its recorded note-off index.
+    for (uint32_t index = 0; index < algorithm.eventCount; ++index) {
+        RecordedEvent* event = recordedEventByIndex(algorithm, index);
+        event->flags &= kRecordedEventFlagCaptureEnding;
+        const uint8_t type = event->bytes[0] & 0xf0U;
+        const uint8_t channel = event->bytes[0] & 0x0fU;
+        const uint8_t note = event->bytes[1] & 0x7fU;
+        const bool noteOn = type == 0x90U && event->bytes[2] != 0U;
+        const bool noteOff = type == 0x80U ||
+                             (type == 0x90U && event->bytes[2] == 0U);
+        if (noteOn) {
+            const uint32_t tail = static_cast<uint32_t>(
+                algorithm.pendingEndings.noteDueIntervals[channel][note]);
+            if (tail == none) {
+                algorithm.pendingEndings.noteEventIndices[channel][note] =
+                    index;
+            } else {
+                RecordedEvent* tailEvent =
+                    recordedEventByIndex(algorithm, tail);
+                tailEvent->flags |= encodedEndingIndex(index);
+            }
+            algorithm.pendingEndings.noteDueIntervals[channel][note] = index;
+        } else if (noteOff) {
+            const uint32_t head =
+                algorithm.pendingEndings.noteEventIndices[channel][note];
+            if (head != none) {
+                RecordedEvent* attack = recordedEventByIndex(algorithm, head);
+                uint32_t next = none;
+                decodedEndingIndex(*attack, next);
+                attack->flags &= kRecordedEventFlagCaptureEnding;
+                attack->flags |= encodedEndingIndex(index);
+                algorithm.pendingEndings.noteEventIndices[channel][note] = next;
+                if (next == none) {
+                    algorithm.pendingEndings.noteDueIntervals[channel][note] =
+                        none;
+                }
+            }
+        } else if (type == 0xb0U && event->bytes[1] == 64U) {
+            if (event->bytes[2] >= 64U) {
+                const uint32_t tail = static_cast<uint32_t>(
+                    algorithm.pendingEndings.sustainDueIntervals[channel]);
+                if (tail == none) {
+                    algorithm.pendingEndings.sustainEventIndices[channel] =
+                        index;
+                } else {
+                    RecordedEvent* tailEvent =
+                        recordedEventByIndex(algorithm, tail);
+                    tailEvent->flags |= encodedEndingIndex(index);
+                }
+                algorithm.pendingEndings.sustainDueIntervals[channel] = index;
+            } else {
+                uint32_t press =
+                    algorithm.pendingEndings.sustainEventIndices[channel];
+                while (press != none) {
+                    RecordedEvent* pressEvent =
+                        recordedEventByIndex(algorithm, press);
+                    uint32_t next = none;
+                    decodedEndingIndex(*pressEvent, next);
+                    pressEvent->flags &= kRecordedEventFlagCaptureEnding;
+                    pressEvent->flags |= encodedEndingIndex(index);
+                    press = next;
+                }
+                algorithm.pendingEndings.sustainEventIndices[channel] = none;
+                algorithm.pendingEndings.sustainDueIntervals[channel] = none;
+            }
+        }
+    }
+    clearPendingPlaybackEndings(algorithm);
+}
+
+bool findRecordedEnding(const Algorithm& algorithm,
+                        const RecordedEvent& beginning,
+                        uint32_t& endingIndex) {
+    return decodedEndingIndex(beginning, endingIndex) &&
+           endingIndex < algorithm.eventCount;
+}
+
+void emitTrackedMidi3(Algorithm& algorithm, uint8_t status, uint8_t data1,
+                      uint8_t data2, uint64_t dispatchSample) {
+    nt_host::sendMidi3(playbackDestinationMask(algorithm), status, data1,
+                       data2, dispatchSample);
+    trackPlaybackOutput(algorithm, status, data1, data2, 3U);
+}
+
+void refreshPendingEndingSchedule(Algorithm& algorithm) {
+    algorithm.pendingNextEndingScheduled = false;
+    uint64_t nextSample = 0;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            if (!notePending(algorithm, channel, note) ||
+                algorithm.pendingEndings.noteDueIntervals[channel][note] !=
+                    algorithm.playbackIntervalOrdinal) {
+                continue;
+            }
+            const RecordedEvent* ending = recordedEventByIndex(
+                algorithm,
+                algorithm.pendingEndings.noteEventIndices[channel][note]);
+            if (ending == NULL) {
+                continue;
+            }
+            const uint64_t sample = eventDispatchSample(algorithm, *ending);
+            if (!algorithm.pendingNextEndingScheduled || sample < nextSample) {
+                nextSample = sample;
+                algorithm.pendingNextEndingScheduled = true;
+            }
+        }
+        const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+        if ((algorithm.pendingEndings.sustainActiveChannels & channelBit) !=
+                0U &&
+            algorithm.pendingEndings.sustainDueIntervals[channel] ==
+                algorithm.playbackIntervalOrdinal) {
+            const RecordedEvent* release = recordedEventByIndex(
+                algorithm,
+                algorithm.pendingEndings.sustainEventIndices[channel]);
+            if (release != NULL) {
+                const uint64_t sample = eventDispatchSample(algorithm, *release);
+                if (!algorithm.pendingNextEndingScheduled ||
+                    sample < nextSample) {
+                    nextSample = sample;
+                    algorithm.pendingNextEndingScheduled = true;
+                }
+            }
+        }
+    }
+    algorithm.pendingNextEndingSample = nextSample;
+}
+
+void cancelPendingNote(Algorithm& algorithm, uint8_t channel, uint8_t note,
+                       uint64_t dispatchSample, bool releaseNow) {
+    if (!notePending(algorithm, channel, note)) {
+        return;
+    }
+    setNotePending(algorithm, channel, note, false);
+    if (releaseNow) {
+        emitTrackedMidi3(algorithm, static_cast<uint8_t>(0x80U | channel),
+                         note, 0U, dispatchSample);
+    }
+    refreshPendingEndingSchedule(algorithm);
+}
+
+void schedulePendingNote(Algorithm& algorithm, uint8_t outputChannel,
+                         uint8_t note, const RecordedEvent& attack) {
+    uint32_t endingIndex = 0;
+    if (!findRecordedEnding(algorithm, attack, endingIndex)) {
+        return;
+    }
+    const RecordedEvent* ending = recordedEventByIndex(algorithm, endingIndex);
+    algorithm.pendingEndings.noteEventIndices[outputChannel][note] =
+        endingIndex;
+    algorithm.pendingEndings.noteDueIntervals[outputChannel][note] =
+        algorithm.playbackIntervalOrdinal + ending->pulse - attack.pulse;
+    setNotePending(algorithm, outputChannel, note, true);
+    refreshPendingEndingSchedule(algorithm);
+}
+
+void cancelPendingSustain(Algorithm& algorithm, uint8_t channel) {
+    const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+    if ((algorithm.pendingEndings.sustainActiveChannels & channelBit) == 0U) {
+        return;
+    }
+    algorithm.pendingEndings.sustainActiveChannels =
+        static_cast<uint16_t>(algorithm.pendingEndings.sustainActiveChannels &
+                              ~channelBit);
+    --algorithm.pendingEndings.sustainCount;
+    refreshPendingEndingSchedule(algorithm);
+}
+
+void schedulePendingSustain(Algorithm& algorithm, uint8_t outputChannel,
+                            const RecordedEvent& press) {
+    uint32_t releaseIndex = 0;
+    if (!findRecordedEnding(algorithm, press, releaseIndex)) {
+        return;
+    }
+    const RecordedEvent* release =
+        recordedEventByIndex(algorithm, releaseIndex);
+    const uint16_t channelBit = static_cast<uint16_t>(1U << outputChannel);
+    if ((algorithm.pendingEndings.sustainActiveChannels & channelBit) == 0U) {
+        algorithm.pendingEndings.sustainActiveChannels =
+            static_cast<uint16_t>(
+                algorithm.pendingEndings.sustainActiveChannels | channelBit);
+        ++algorithm.pendingEndings.sustainCount;
+    }
+    algorithm.pendingEndings.sustainEventIndices[outputChannel] = releaseIndex;
+    algorithm.pendingEndings.sustainDueIntervals[outputChannel] =
+        algorithm.playbackIntervalOrdinal + release->pulse - press.pulse;
+    refreshPendingEndingSchedule(algorithm);
+}
+
+bool emitOwnedEnding(Algorithm& algorithm, uint32_t eventIndex,
+                     uint64_t dispatchSample) {
+    const RecordedEvent* ending = recordedEventByIndex(algorithm, eventIndex);
+    if (ending == NULL) {
+        return false;
+    }
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            if (notePending(algorithm, channel, note) &&
+                algorithm.pendingEndings.noteEventIndices[channel][note] ==
+                    eventIndex &&
+                algorithm.pendingEndings.noteDueIntervals[channel][note] ==
+                    algorithm.playbackIntervalOrdinal) {
+                setNotePending(algorithm, channel, note, false);
+                emitTrackedMidi3(
+                    algorithm,
+                    static_cast<uint8_t>((ending->bytes[0] & 0xf0U) | channel),
+                    note, ending->bytes[2], dispatchSample);
+                refreshPendingEndingSchedule(algorithm);
+                return true;
+            }
+        }
+        const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+        if ((algorithm.pendingEndings.sustainActiveChannels & channelBit) !=
+                0U &&
+            algorithm.pendingEndings.sustainEventIndices[channel] ==
+                eventIndex &&
+            algorithm.pendingEndings.sustainDueIntervals[channel] ==
+                algorithm.playbackIntervalOrdinal) {
+            algorithm.pendingEndings.sustainActiveChannels =
+                static_cast<uint16_t>(
+                    algorithm.pendingEndings.sustainActiveChannels &
+                    ~channelBit);
+            --algorithm.pendingEndings.sustainCount;
+            emitTrackedMidi3(algorithm, static_cast<uint8_t>(0xb0U | channel),
+                             64U, ending->bytes[2], dispatchSample);
+            refreshPendingEndingSchedule(algorithm);
+            return true;
+        }
+    }
+    return false;
+}
+
+void emitSelectedEvent(Algorithm& algorithm, const RecordedEvent& event,
+                       uint32_t eventIndex, uint64_t dispatchSample) {
+    const uint8_t type = event.bytes[0] & 0xf0U;
+    const bool noteOn = type == 0x90U && event.bytes[2] != 0U;
+    const bool noteEnding = type == 0x80U ||
+                            (type == 0x90U && event.bytes[2] == 0U);
+    if (noteEnding) {
+        // Only an ending owned by an in-range attack is eligible. This also
+        // suppresses releases for notes that began before the selection.
+        emitOwnedEnding(algorithm, eventIndex, dispatchSample);
+        return;
+    }
+    if (noteOn) {
+        if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
+            return;
+        }
+        const uint8_t status = playbackStatus(algorithm, event.bytes[0]);
+        const uint8_t channel = status & 0x0fU;
+        const uint8_t note = event.bytes[1] & 0x7fU;
+        // Output-channel ownership is resolved after override. A replacement
+        // cannot inherit the older occurrence's delayed ending.
+        cancelPendingNote(algorithm, channel, note, dispatchSample, true);
+        emitTrackedMidi3(algorithm, status, event.bytes[1], event.bytes[2],
+                         dispatchSample);
+        schedulePendingNote(algorithm, channel, note, event);
+        return;
+    }
+    if (type == 0xb0U && event.bytes[1] == 64U) {
+        if (event.bytes[2] < 64U) {
+            if (!emitOwnedEnding(algorithm, eventIndex, dispatchSample)) {
+                // An in-range release without a playback-owned press remains
+                // an ordinary recorded CC. Capture-stop endings also retain
+                // their filter-bypassing safety semantics.
+                emitRecordedEvent(algorithm, event, dispatchSample);
+            }
+            return;
+        }
+        if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
+            return;
+        }
+        const uint8_t status = playbackStatus(algorithm, event.bytes[0]);
+        const uint8_t channel = status & 0x0fU;
+        // A newer press silently takes release ownership; sustain may remain
+        // continuously enabled across repeated overlapping loop passes.
+        cancelPendingSustain(algorithm, channel);
+        emitTrackedMidi3(algorithm, status, event.bytes[1], event.bytes[2],
+                         dispatchSample);
+        schedulePendingSustain(algorithm, channel, event);
+        return;
+    }
+    emitRecordedEvent(algorithm, event, dispatchSample);
+}
+
 bool sameRange(const PulseRange& left, const PulseRange& right) {
     return left.startPulse == right.startPulse &&
            left.endPulse == right.endPulse;
@@ -870,38 +1253,92 @@ void scheduleNextPlaybackEvent(Algorithm& algorithm) {
     }
 }
 
-void dispatchDuePlaybackEvents(Algorithm& algorithm, uint64_t sample) {
+void dispatchPendingEndingsAt(Algorithm& algorithm, uint64_t sample,
+                              bool forceCurrentInterval) {
+    if (!algorithm.pendingNextEndingScheduled ||
+        (!forceCurrentInterval &&
+         algorithm.pendingNextEndingSample > sample)) {
+        return;
+    }
+    const uint64_t dueSample = algorithm.pendingNextEndingSample;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            if (!notePending(algorithm, channel, note) ||
+                algorithm.pendingEndings.noteDueIntervals[channel][note] !=
+                    algorithm.playbackIntervalOrdinal) {
+                continue;
+            }
+            const uint32_t eventIndex =
+                algorithm.pendingEndings.noteEventIndices[channel][note];
+            const RecordedEvent* ending =
+                recordedEventByIndex(algorithm, eventIndex);
+            if (ending != NULL &&
+                eventDispatchSample(algorithm, *ending) == dueSample) {
+                emitOwnedEnding(algorithm, eventIndex, sample);
+            }
+        }
+        const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+        if ((algorithm.pendingEndings.sustainActiveChannels & channelBit) !=
+                0U &&
+            algorithm.pendingEndings.sustainDueIntervals[channel] ==
+                algorithm.playbackIntervalOrdinal) {
+            const uint32_t eventIndex =
+                algorithm.pendingEndings.sustainEventIndices[channel];
+            const RecordedEvent* release =
+                recordedEventByIndex(algorithm, eventIndex);
+            if (release != NULL &&
+                eventDispatchSample(algorithm, *release) == dueSample) {
+                emitOwnedEnding(algorithm, eventIndex, sample);
+            }
+        }
+    }
+    refreshPendingEndingSchedule(algorithm);
+}
+
+void dispatchPlaybackEvents(Algorithm& algorithm, uint64_t sample,
+                            bool forceCurrentInterval) {
     if (algorithm.transportState != kTransportPlaying ||
         !algorithm.playbackIntervalOpen ||
         !algorithm.activeSelectionValid) {
         return;
     }
 
-    while (algorithm.playbackNextEventScheduled &&
-           algorithm.playbackNextEventSample <= sample) {
-        const RecordedEvent* event = nextPlaybackEvent(algorithm);
-        ++algorithm.playbackEventIndex;
-        emitRecordedEvent(algorithm, *event, sample);
-        scheduleNextPlaybackEvent(algorithm);
+    while (true) {
+        const bool regularDue =
+            algorithm.playbackNextEventScheduled &&
+            (forceCurrentInterval ||
+             algorithm.playbackNextEventSample <= sample);
+        const bool pendingDue =
+            algorithm.pendingNextEndingScheduled &&
+            (forceCurrentInterval ||
+             algorithm.pendingNextEndingSample <= sample);
+        if (!regularDue && !pendingDue) {
+            break;
+        }
+
+        // At an equal timestamp, process the new selected event first. This
+        // lets a same-time retrigger/new sustain press cancel the older pass's
+        // ending exactly as ownership requires.
+        if (regularDue &&
+            (!pendingDue || algorithm.playbackNextEventSample <=
+                                algorithm.pendingNextEndingSample)) {
+            const uint32_t eventIndex = algorithm.playbackEventIndex;
+            const RecordedEvent* event = nextPlaybackEvent(algorithm);
+            ++algorithm.playbackEventIndex;
+            emitSelectedEvent(algorithm, *event, eventIndex, sample);
+            scheduleNextPlaybackEvent(algorithm);
+        } else {
+            dispatchPendingEndingsAt(algorithm, sample,
+                                     forceCurrentInterval);
+        }
     }
 }
 
 void flushPendingPlaybackEvents(Algorithm& algorithm, uint64_t sample) {
-    if (algorithm.transportState != kTransportPlaying ||
-        !algorithm.playbackIntervalOpen ||
-        !algorithm.activeSelectionValid) {
-        return;
-    }
-
-    const RecordedEvent* event = nextPlaybackEvent(algorithm);
-    while (event != NULL && event->pulse == algorithm.playbackPulse &&
-           event->pulse < algorithm.activeSelection.endPulse) {
-        ++algorithm.playbackEventIndex;
-        emitRecordedEvent(algorithm, *event, sample);
-        event = nextPlaybackEvent(algorithm);
-    }
+    dispatchPlaybackEvents(algorithm, sample, true);
     algorithm.playbackIntervalOpen = false;
     algorithm.playbackNextEventScheduled = false;
+    algorithm.pendingNextEndingScheduled = false;
 }
 
 void advancePlaybackPulse(Algorithm& algorithm, uint64_t sample) {
@@ -924,10 +1361,12 @@ void advancePlaybackPulse(Algorithm& algorithm, uint64_t sample) {
 }
 
 void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
+    ++algorithm.playbackIntervalOrdinal;
     algorithm.playbackIntervalStartSample = sample;
     algorithm.playbackIntervalOpen = true;
     scheduleNextPlaybackEvent(algorithm);
-    dispatchDuePlaybackEvents(algorithm, sample);
+    refreshPendingEndingSchedule(algorithm);
+    dispatchPlaybackEvents(algorithm, sample, false);
 }
 
 void activatePendingPlayback(Algorithm& algorithm, uint64_t sample) {
@@ -1076,7 +1515,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             detectClockLoss(*algorithm, algorithm->sampleCursor);
         }
         if (algorithm->clockRunning) {
-            dispatchDuePlaybackEvents(*algorithm, algorithm->sampleCursor);
+            dispatchPlaybackEvents(*algorithm, algorithm->sampleCursor,
+                                   false);
         }
         ++algorithm->sampleCursor;
     }
@@ -1261,6 +1701,9 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
         predictedClockInterval(*algorithm);
     snapshot.playbackPulse = algorithm->playbackPulse;
     snapshot.clockAverageIntervalCount = algorithm->clockIntervalCount;
+    snapshot.pendingNoteEndingCount = algorithm->pendingEndings.noteCount;
+    snapshot.pendingSustainReleaseCount =
+        algorithm->pendingEndings.sustainCount;
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
@@ -1376,6 +1819,7 @@ bool startPlayback(_NT_algorithm* self) {
         return true;
     }
 
+    prepareRecordedEndingOwnership(*algorithm);
     algorithm->activeSelection = range;
     algorithm->activeSelectionValid = true;
     algorithm->rangeTransitionPending = false;

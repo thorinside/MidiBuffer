@@ -16,7 +16,8 @@ struct RecordedEvent {
     uint32_t sourceIntervalSamples;
     uint8_t bytes[3];
     uint8_t size;
-    uint8_t flags;
+    // Bit zero marks a capture ending; remaining bits cache its owner pairing.
+    uint32_t flags;
 };
 
 struct PulseRange {
@@ -36,6 +37,8 @@ struct CaptureSnapshot {
     uint64_t predictedClockIntervalSamples;
     uint64_t playbackPulse;
     uint32_t clockAverageIntervalCount;
+    uint32_t pendingNoteEndingCount;
+    uint32_t pendingSustainReleaseCount;
     bool captureEnabled;
     bool clockRunning;
     bool selectionValid;
