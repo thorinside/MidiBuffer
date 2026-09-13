@@ -109,6 +109,8 @@ bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
 // the production view/navigation implementation.
 bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
                                 uint64_t endPulse);
+bool addRetainedTimelineNoteFixture(_NT_algorithm* self, uint64_t pulse,
+                                    uint8_t note);
 bool setTimelineNavigationFixture(_NT_algorithm* self, bool showAll,
                                   uint64_t manualSpan, uint64_t scrollPulses,
                                   SelectionFineTarget target);

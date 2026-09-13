@@ -2405,6 +2405,35 @@ void setupUi(_NT_algorithm* self, _NT_float3& pots) {
     }
 }
 
+uint32_t scaleTimelineOffset(uint64_t offset, uint64_t span) {
+    if (offset >= span) {
+        return 247U;
+    }
+
+    // Find floor(offset * 247 / span) without forming the overflowing
+    // product.  For candidate x, ceil(x * span / 247) is the first pulse
+    // offset that maps to x.  Splitting span by 247 keeps every intermediate
+    // within uint64 while the eight-step search stays bounded.
+    uint32_t spanRemainder = 0U;
+    const uint64_t spanQuotient =
+        divideUnsigned64By32(span, 247U, spanRemainder);
+    uint32_t lower = 0U;
+    uint32_t upper = 246U;
+    while (lower < upper) {
+        const uint32_t candidate = (lower + upper + 1U) / 2U;
+        const uint32_t remainderProduct = candidate * spanRemainder;
+        const uint64_t firstOffset =
+            spanQuotient * candidate +
+            (remainderProduct + 246U) / 247U;
+        if (firstOffset <= offset) {
+            lower = candidate;
+        } else {
+            upper = candidate - 1U;
+        }
+    }
+    return lower;
+}
+
 int pulseTimelineX(uint64_t pulse, uint64_t viewStart, uint64_t viewEnd) {
     if (viewEnd <= viewStart || pulse <= viewStart) {
         return 4;
@@ -2412,15 +2441,35 @@ int pulseTimelineX(uint64_t pulse, uint64_t viewStart, uint64_t viewEnd) {
     if (pulse >= viewEnd) {
         return 251;
     }
-    uint32_t remainder = 0;
-    const uint64_t denominator = viewEnd - viewStart;
-    if (denominator > 0xffffffffULL) {
-        return 4;
-    }
     return 4 + static_cast<int>(
-                   divideUnsigned64By32((pulse - viewStart) * 247U,
-                                       static_cast<uint32_t>(denominator),
-                                       remainder));
+                   scaleTimelineOffset(pulse - viewStart,
+                                       viewEnd - viewStart));
+}
+
+struct TimelineDrawSnapshot {
+    uint64_t viewStart;
+    uint64_t viewEnd;
+    uint64_t retainedIntervals;
+    uint64_t playbackPulse;
+    PulseRange selection;
+    uint32_t pulsesPerBeat;
+    bool selectionValid;
+    bool headEligible;
+};
+
+TimelineDrawSnapshot observeTimelineDraw(const Algorithm& algorithm) {
+    TimelineDrawSnapshot observed = {};
+    timelineViewBounds(algorithm, observed.viewStart, observed.viewEnd);
+    observed.retainedIntervals = retainedTimelineIntervals(algorithm);
+    observed.playbackPulse = algorithm.playbackPulse;
+    observed.selection = algorithm.selection;
+    observed.pulsesPerBeat = pulsesPerDisplayedBeat(algorithm);
+    observed.selectionValid = algorithm.selectionValid;
+    observed.headEligible =
+        algorithm.transportState == kTransportPlaying &&
+        algorithm.clockRunning && algorithm.playbackPositionValid &&
+        algorithm.playbackIntervalOpen && algorithm.activeSelectionValid;
+    return observed;
 }
 
 void drawSelectionBracket(uint64_t pulse, uint64_t viewStart,
@@ -2440,61 +2489,68 @@ bool draw(_NT_algorithm* self) {
         return true;
     }
 
-    const uint32_t pulsesPerBeat = pulsesPerDisplayedBeat(*algorithm);
+    const TimelineDrawSnapshot observed = observeTimelineDraw(*algorithm);
     char amount[17];
     formatMusicalDuration(amount, sizeof(amount),
-                          retainedTimelineIntervals(*algorithm),
-                          pulsesPerBeat);
+                          observed.retainedIntervals,
+                          observed.pulsesPerBeat);
     char availability[40];
     BoundedText availabilityText(availability, sizeof(availability));
     availabilityText.append("Avail ");
     availabilityText.append(amount);
     availabilityText.append("  ");
-    availabilityText.appendUnsigned64(pulsesPerBeat);
+    availabilityText.appendUnsigned64(observed.pulsesPerBeat);
     availabilityText.append("ppb");
     nt_host::drawTinyText(0, 7, availability);
 
     char length[32];
     BoundedText lengthText(length, sizeof(length));
     lengthText.append("Len ");
-    if (algorithm->selectionValid) {
+    if (observed.selectionValid) {
         formatMusicalDuration(
             amount, sizeof(amount),
-            algorithm->selection.endPulse - algorithm->selection.startPulse,
-            pulsesPerBeat);
+            observed.selection.endPulse - observed.selection.startPulse,
+            observed.pulsesPerBeat);
         lengthText.append(amount);
     } else {
         lengthText.append("--");
     }
     nt_host::drawTinyText(176, 7, length);
 
-    uint64_t viewStart = 0;
-    uint64_t viewEnd = 0;
-    timelineViewBounds(*algorithm, viewStart, viewEnd);
     nt_host::drawShape(kNT_line, 4, 52, 251, 52, 5);
-    if (viewEnd > viewStart) {
-        uint32_t eventIndex = findPlaybackEventIndex(*algorithm, viewStart);
+    if (observed.viewEnd > observed.viewStart) {
+        uint32_t eventIndex =
+            findPlaybackEventIndex(*algorithm, observed.viewStart);
         uint32_t drawnNotes = 0;
         while (eventIndex < algorithm->eventCount && drawnNotes < 256U) {
             const RecordedEvent* event = recordedEventByIndex(
                 *algorithm, eventIndex++);
-            if (event == NULL || event->pulse >= viewEnd) {
+            if (event == NULL || event->pulse >= observed.viewEnd) {
                 break;
             }
             if ((event->bytes[0] & 0xf0U) != 0x90U ||
                 event->bytes[2] == 0U) {
                 continue;
             }
-            const int x = pulseTimelineX(event->pulse, viewStart, viewEnd);
+            const int x = pulseTimelineX(event->pulse, observed.viewStart,
+                                         observed.viewEnd);
             const int y = 47 - static_cast<int>(event->bytes[1]) * 24 / 127;
             nt_host::drawShape(kNT_line, x, y, x, 51, 9);
             ++drawnNotes;
         }
-        if (algorithm->selectionValid) {
-            drawSelectionBracket(algorithm->selection.startPulse, viewStart,
-                                 viewEnd, true);
-            drawSelectionBracket(algorithm->selection.endPulse, viewStart,
-                                 viewEnd, false);
+        if (observed.headEligible &&
+            observed.playbackPulse >= observed.viewStart &&
+            observed.playbackPulse < observed.viewEnd) {
+            const int x = pulseTimelineX(observed.playbackPulse,
+                                         observed.viewStart,
+                                         observed.viewEnd);
+            nt_host::drawShape(kNT_line, x, 17, x, 55, 12);
+        }
+        if (observed.selectionValid) {
+            drawSelectionBracket(observed.selection.startPulse,
+                                 observed.viewStart, observed.viewEnd, true);
+            drawSelectionBracket(observed.selection.endPulse,
+                                 observed.viewStart, observed.viewEnd, false);
         }
     }
     return true;
@@ -3278,6 +3334,38 @@ bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
         event.size = 3U;
         algorithm->recordingEvents[0] = event;
     }
+    return true;
+}
+
+bool addRetainedTimelineNoteFixture(_NT_algorithm* self, uint64_t pulse,
+                                    uint8_t note) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || algorithm->eventCount == 0U ||
+        algorithm->eventCount >= algorithm->eventCapacity) {
+        return false;
+    }
+    uint32_t lastIndex =
+        algorithm->eventHead + algorithm->eventCount - 1U;
+    if (lastIndex >= algorithm->eventCapacity) {
+        lastIndex -= algorithm->eventCapacity;
+    }
+    if (pulse < algorithm->recordingEvents[lastIndex].pulse ||
+        pulse >= algorithm->historyEndPulseExclusive) {
+        return false;
+    }
+    RecordedEvent event = {};
+    event.pulse = pulse;
+    event.sourceIntervalSamples = 1U;
+    event.bytes[0] = 0x90U;
+    event.bytes[1] = note;
+    event.bytes[2] = 100U;
+    event.size = 3U;
+    uint32_t writeIndex = algorithm->eventHead + algorithm->eventCount;
+    if (writeIndex >= algorithm->eventCapacity) {
+        writeIndex -= algorithm->eventCapacity;
+    }
+    algorithm->recordingEvents[writeIndex] = event;
+    ++algorithm->eventCount;
     return true;
 }
 

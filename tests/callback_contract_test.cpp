@@ -81,6 +81,77 @@ bool framebufferHasInk(int left, int top, int right, int bottom) {
     return false;
 }
 
+bool framebufferHasColour(uint8_t colour) {
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 256; ++x) {
+            if (midibuffer_test::framebufferPixel(x, y) == colour) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+size_t matchingShapeCount(int x0, int y0, int x1, int y1, int colour) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    size_t count = 0U;
+    for (size_t index = 0; index < current.shapeCallCount; ++index) {
+        const midibuffer_test::ShapeCall& call = current.shapeCalls[index];
+        if (call.shape == kNT_line && call.x0 == x0 && call.y0 == y0 &&
+            call.x1 == x1 && call.y1 == y1 && call.colour == colour) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+size_t shapeColourCount(int colour) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    size_t count = 0U;
+    for (size_t index = 0; index < current.shapeCallCount; ++index) {
+        if (current.shapeCalls[index].colour == colour) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+size_t playbackHeadLineCount(int* x = NULL, size_t* traceIndex = NULL) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    size_t count = 0U;
+    for (size_t index = 0; index < current.shapeCallCount; ++index) {
+        const midibuffer_test::ShapeCall& call = current.shapeCalls[index];
+        if (call.shape == kNT_line && call.y0 == 17 && call.y1 == 55 &&
+            call.x0 == call.x1 && call.colour == 12) {
+            if (count == 0U) {
+                if (x != NULL) {
+                    *x = call.x0;
+                }
+                if (traceIndex != NULL) {
+                    *traceIndex = index;
+                }
+            }
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool drawHasHeadAt(midibuffer_test::HostDouble& host, int expectedX) {
+    midibuffer_test::resetTrace();
+    if (!host.factory()->draw(host.algorithm())) {
+        return false;
+    }
+    int x = -1;
+    return playbackHeadLineCount(&x) == 1U && x == expectedX;
+}
+
+bool drawHasNoHead(midibuffer_test::HostDouble& host) {
+    midibuffer_test::resetTrace();
+    return host.factory()->draw(host.algorithm()) &&
+           playbackHeadLineCount() == 0U && !framebufferHasColour(12U);
+}
+
 bool drawReadouts(midibuffer_test::HostDouble& host,
                   const char* availability, const char* length) {
     midibuffer_test::resetTrace();
@@ -1318,6 +1389,272 @@ void verifyTimelineSelectionDisplayAndControls() {
     expect(midibuffer_test::trace().shapeCallCount != 0U &&
                midibuffer_test::litFramebufferPixelCount() != 0U,
            "playing timeline remains rendered through draw traces and framebuffer");
+}
+
+void preparePlaybackHeadHistory(midibuffer_test::HostDouble& host,
+                                uint64_t startPulse, uint64_t endPulse) {
+    expect(host.instantiate(1), "playback-head callback host constructs");
+    startCapture(host);
+    acquireClock(host);
+    while (snapshot(host).currentPulse < startPulse) {
+        clockPulse(host);
+    }
+    sendMidi(host, 0x90U, 48U, 100U);
+    while (snapshot(host).currentPulse + 1U < endPulse) {
+        clockPulse(host);
+        const uint64_t pulse = snapshot(host).currentPulse;
+        if (pulse == startPulse + 4U) {
+            sendMidi(host, 0x91U, 72U, 100U);
+        }
+        if (pulse + 1U == endPulse) {
+            sendMidi(host, 0x92U, 84U, 100U);
+        }
+    }
+    stopCapture(host);
+    const midibuffer::CaptureSnapshot captured = snapshot(host);
+    expect(captured.timelineViewStartPulse == startPulse &&
+               captured.timelineViewEndPulse == endPulse &&
+               midibuffer::setPulseSelection(host.algorithm(), startPulse,
+                                              endPulse),
+           "callback MIDI and clock sequence creates the requested visible selection");
+}
+
+void verifyPlaybackHeadObservationAndWideMapping() {
+    midibuffer_test::HostDouble head;
+    preparePlaybackHeadHistory(head, 100U, 108U);
+    expect(drawHasNoHead(head),
+           "stopped transport draws no playback head");
+
+    expect(midibuffer::startPlayback(head.algorithm()) &&
+               snapshot(head).playbackArmed && drawHasNoHead(head),
+           "armed transport draws no playback head before its opening clock");
+    clockPulse(head);
+    expect(snapshot(head).playbackActive &&
+               snapshot(head).clockRunning &&
+               snapshot(head).playbackIntervalOpen &&
+               snapshot(head).activeSelectionValid &&
+               snapshot(head).playbackPulse == 100U &&
+               drawHasHeadAt(head, 4),
+           "the actual opened playback pulse 100 maps to x4");
+
+    const midibuffer_test::Trace& coincident = midibuffer_test::trace();
+    size_t headTraceIndex = 0U;
+    int coincidentX = -1;
+    const bool oneHead =
+        playbackHeadLineCount(&coincidentX, &headTraceIndex) == 1U;
+    bool layerOrder = oneHead;
+    for (size_t index = 0; index < coincident.shapeCallCount; ++index) {
+        if (index < headTraceIndex) {
+            layerOrder = layerOrder &&
+                         (coincident.shapeCalls[index].colour == 5 ||
+                          coincident.shapeCalls[index].colour == 9);
+        } else if (index > headTraceIndex) {
+            layerOrder =
+                layerOrder && coincident.shapeCalls[index].colour == 15;
+        }
+    }
+    bool coincidentColumnOccluded = true;
+    for (int y = 17; y <= 55; ++y) {
+        coincidentColumnOccluded = coincidentColumnOccluded &&
+            midibuffer_test::framebufferPixel(4, y) == 15U;
+    }
+    expect(oneHead && shapeColourCount(12) == 1U &&
+               coincidentX == 4 && layerOrder && coincidentColumnOccluded &&
+               matchingShapeCount(4, 16, 8, 16, 15) == 1U &&
+               matchingShapeCount(4, 56, 8, 56, 15) == 1U &&
+               matchingShapeCount(251, 16, 247, 16, 15) == 1U &&
+               matchingShapeCount(251, 56, 247, 56, 15) == 1U,
+           "one y17..55 intensity-12 head follows baseline and notes, then coincident brackets fully occlude it with intact caps");
+
+    for (uint32_t pulse = 0U; pulse < 4U; ++pulse) {
+        clockPulse(head);
+    }
+    expect(snapshot(head).playbackPulse == 104U &&
+               drawHasHeadAt(head, 127),
+           "actual playback pulse 104 maps to x127");
+    bool visibleColumnIsHead = true;
+    for (int y = 17; y <= 55; ++y) {
+        visibleColumnIsHead = visibleColumnIsHead &&
+            midibuffer_test::framebufferPixel(127, y) == 12U;
+    }
+    expect(visibleColumnIsHead,
+           "the unobscured head is exactly one solid 39-pixel intensity-12 column");
+
+    const midibuffer::CaptureSnapshot beforeBetweenPulse = snapshot(head);
+    midibuffer_test::resetTrace();
+    sendMidi(head, 0x93U, 96U, 100U);
+    expect(midibuffer_test::trace().shapeCallCount == 0U &&
+               sameSelectionAndTransport(beforeBetweenPulse, snapshot(head)) &&
+               drawHasHeadAt(head, 127) && drawHasHeadAt(head, 127),
+           "between-pulse MIDI and repeated host draws neither force a frame nor move transport/head");
+
+    const midibuffer::CaptureSnapshot beforeViewChange = snapshot(head);
+    beginRightPotZoom(head, 0.5f);
+    continueRightPotZoom(head, 0.0f);
+    endRightPotZoom(head, 0.0f);
+    const midibuffer::CaptureSnapshot remapped = snapshot(head);
+    expect(!remapped.timelineShowAll &&
+               remapped.timelineViewStartPulse == 104U &&
+               remapped.timelineViewEndPulse == 108U &&
+               sameSelectionAndTransport(beforeViewChange, remapped) &&
+               drawHasHeadAt(head, 4),
+           "view-only navigation remaps the observed pulse on the next draw without moving transport");
+    beginRightPotZoom(head, 0.0f);
+    continueRightPotZoom(head, 1.0f);
+    endRightPotZoom(head, 1.0f);
+    expect(snapshot(head).timelineShowAll &&
+               snapshot(head).timelineViewStartPulse == 100U &&
+               snapshot(head).timelineViewEndPulse == 108U,
+           "head-state fixture returns to exact Show All without follow behavior");
+
+    for (uint32_t pulse = 0U; pulse < 3U; ++pulse) {
+        clockPulse(head);
+    }
+    expect(snapshot(head).playbackPulse == 107U &&
+               drawHasHeadAt(head, 220),
+           "actual playback pulse 107 maps to x220");
+    clockPulse(head);
+    expect(snapshot(head).playbackPulse == 100U &&
+               drawHasHeadAt(head, 4),
+           "ordinary wrap observes the committed active start without interpolation");
+
+    noClockBlock(head);
+    expect(snapshot(head).clockRunning && drawHasHeadAt(head, 4),
+           "before loss is declared the last eligible open pulse remains visible");
+    midibuffer_test::resetTrace();
+    noClockBlock(head);
+    expect(midibuffer_test::trace().shapeCallCount == 0U &&
+               !snapshot(head).clockRunning &&
+               snapshot(head).playbackClockLossPaused &&
+               drawHasNoHead(head),
+           "declared clock loss forces no frame and the next host draw has no stale head pixels");
+    clockPulse(head);
+    expect(snapshot(head).playbackClockLossPaused && drawHasNoHead(head),
+           "the first reacquisition pulse remains ineligible");
+    clockPulse(head);
+    expect(snapshot(head).playbackActive && snapshot(head).clockRunning &&
+               snapshot(head).playbackPulse == 100U &&
+               drawHasHeadAt(head, 4),
+           "the second reacquisition pulse reopens the saved playback interval");
+
+    resetPulse(head);
+    expect(snapshot(head).playbackArmed && drawHasNoHead(head),
+           "reset alone repositions and arms playback without a head");
+    coincidentResetAndClockPulse(head);
+    expect(snapshot(head).playbackActive &&
+               snapshot(head).playbackPulse == 100U &&
+               drawHasHeadAt(head, 4),
+           "coincident reset and valid clock exposes the actually opened start interval");
+
+    expect(midibuffer::setPulseSelection(head.algorithm(), 104U, 108U),
+           "pending playback-head range installs through the public selection seam");
+    const midibuffer::CaptureSnapshot pending = snapshot(head);
+    const bool pendingHeadAtOldActive = drawHasHeadAt(head, 4);
+    expect(pending.rangeTransitionPending &&
+               pending.activeSelection.startPulse == 100U &&
+               pending.playbackPulse == 100U && pendingHeadAtOldActive &&
+               matchingShapeCount(4, 16, 4, 56, 15) == 0U &&
+               matchingShapeCount(127, 16, 127, 56, 15) == 1U &&
+               matchingShapeCount(251, 16, 251, 56, 15) == 1U &&
+               midibuffer_test::framebufferPixel(4, 17) == 12U,
+           "pending brackets replace rather than duplicate active brackets while the head stays on old active playback");
+    for (uint32_t pulse = 0U; pulse < 7U; ++pulse) {
+        clockPulse(head);
+    }
+    expect(snapshot(head).rangeTransitionPending &&
+               snapshot(head).activeSelection.startPulse == 100U &&
+               snapshot(head).playbackPulse == 107U &&
+               drawHasHeadAt(head, 220),
+           "the old active head remains observable through the final pre-adoption pulse");
+    clockPulse(head);
+    expect(!snapshot(head).rangeTransitionPending &&
+               snapshot(head).activeSelection.startPulse == 104U &&
+               snapshot(head).playbackPulse == 104U &&
+               drawHasHeadAt(head, 127),
+           "pending-range wrap observes the new range only after transport adopts it");
+
+    midibuffer_test::PresetImage playingImage;
+    expect(head.savePreset(playingImage),
+           "open playing head state saves through the production callback");
+    midibuffer_test::HostDouble restored;
+    expect(restored.instantiate(1) && restored.loadPreset(playingImage),
+           "open playing head state restores through the production callback");
+    const midibuffer::CaptureSnapshot restoredWithoutClock = snapshot(restored);
+    expect(restoredWithoutClock.playbackActive &&
+               restoredWithoutClock.playbackIntervalOpen &&
+               !restoredWithoutClock.clockRunning &&
+               drawHasNoHead(restored),
+           "restored logical Playing without acquired clock has no stale head");
+    clockPulse(restored);
+    expect(drawHasNoHead(restored),
+           "restored Playing remains hidden on its first acquisition pulse");
+    clockPulse(restored);
+    expect(snapshot(restored).clockRunning &&
+               snapshot(restored).playbackPulse == 104U &&
+               drawHasHeadAt(restored, 127),
+           "restored Playing shows its retained open pulse after second acquisition");
+    midibuffer::stopPlayback(restored.algorithm());
+    expect(drawHasNoHead(restored),
+           "manual stop removes the head on the next host draw");
+
+    midibuffer_test::HostDouble empty;
+    expect(empty.instantiate(1) && drawHasNoHead(empty),
+           "empty history draws only its existing baseline and no head");
+
+    midibuffer_test::HostDouble clipped;
+    preparePlaybackHeadHistory(clipped, 99U, 109U);
+    expect(midibuffer::setTimelineNavigationFixture(
+               clipped.algorithm(), false, 8U, 1U,
+               midibuffer::kSelectionFineTargetEnd) &&
+               snapshot(clipped).timelineViewStartPulse == 100U &&
+               snapshot(clipped).timelineViewEndPulse == 108U &&
+               midibuffer::startPlayback(clipped.algorithm()),
+           "offscreen callback fixture fixes the visible half-open interval at [100,108)");
+    clockPulse(clipped);
+    expect(snapshot(clipped).playbackPulse == 99U && drawHasNoHead(clipped),
+           "playback pulse 99 is excluded rather than pinned or marked with an arrow");
+    clockPulse(clipped);
+    expect(snapshot(clipped).playbackPulse == 100U &&
+               drawHasHeadAt(clipped, 4),
+           "the same fixed view includes pulse 100 at x4");
+    for (uint32_t pulse = 0U; pulse < 8U; ++pulse) {
+        clockPulse(clipped);
+    }
+    expect(snapshot(clipped).playbackPulse == 108U &&
+               snapshot(clipped).timelineViewStartPulse == 100U &&
+               snapshot(clipped).timelineViewEndPulse == 108U &&
+               drawHasNoHead(clipped),
+           "playback pulse 108 is excluded with no edge pinning, arrow, or head-follow view change");
+
+    const uint64_t wideStart = 0U;
+    const uint64_t wideSpan = ~static_cast<uint64_t>(0);
+    const uint64_t wideEnd = wideSpan;
+    midibuffer_test::HostDouble wide;
+    expect(wide.instantiate(1) &&
+               midibuffer::setRetainedTimelineFixture(
+                   wide.algorithm(), wideStart, wideEnd) &&
+               midibuffer::addRetainedTimelineNoteFixture(
+                   wide.algorithm(), wideStart + wideSpan / 2U, 72U) &&
+               midibuffer::addRetainedTimelineNoteFixture(
+                   wide.algorithm(), wideEnd - 1U, 84U) &&
+               midibuffer::setPulseSelection(
+                   wide.algorithm(), wideStart + wideSpan / 4U,
+                   wideStart + (wideSpan / 4U) * 3U),
+           "wide draw fixture installs notes and brackets across a span beyond uint32 without event traversal expansion");
+    midibuffer_test::resetTrace();
+    expect(wide.factory()->draw(wide.algorithm()) &&
+               matchingShapeCount(4, 36, 4, 51, 9) == 1U &&
+               matchingShapeCount(127, 34, 127, 51, 9) == 1U &&
+               matchingShapeCount(250, 32, 250, 51, 9) == 1U &&
+               matchingShapeCount(65, 16, 65, 56, 15) == 1U &&
+               matchingShapeCount(189, 16, 189, 56, 15) == 1U &&
+               matchingShapeCount(65, 16, 69, 16, 15) == 1U &&
+               matchingShapeCount(189, 56, 185, 56, 15) == 1U &&
+               playbackHeadLineCount() == 0U &&
+               midibuffer_test::framebufferPixel(127, 34) == 9U &&
+               midibuffer_test::framebufferPixel(65, 16) == 15U &&
+               midibuffer_test::framebufferPixel(189, 56) == 15U,
+           "shared full-uint64-safe mapping places wide notes at x4/x127/x250 and quarter brackets at x65/x189 with intact caps");
 }
 
 void verifyShowAllAndRelativeTimelineNavigation() {
@@ -4221,6 +4558,7 @@ int main() {
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();
+    verifyPlaybackHeadObservationAndWideMapping();
     verifyShowAllAndRelativeTimelineNavigation();
     verifyIntegratedRangeMotionAndFineTargets();
     verifyCaptureStopEndings();
