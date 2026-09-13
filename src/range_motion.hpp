@@ -11,14 +11,13 @@ namespace midibuffer {
 struct RangeMotionState {
     double logicalPosition;
     double physicalPosition;
-    // Signed numerator over 2^32-1, always less than half a pulse after a
-    // completed transition.
-    int64_t pulseResidualNumerator;
+    // Signed sub-pulse displacement carried between transitions.
+    double pulseResidual;
     bool established;
 
     RangeMotionState()
-        : logicalPosition(0.0), physicalPosition(0.0),
-          pulseResidualNumerator(0), established(false) {}
+        : logicalPosition(0.0), physicalPosition(0.0), pulseResidual(0.0),
+          established(false) {}
 };
 
 struct RangeMotionBounds {
@@ -62,8 +61,6 @@ inline bool movableDomain(const RangeMotionBounds& bounds,
     return travel != 0U;
 }
 
-const uint32_t kFractionDenominator = 0xffffffffU;
-
 inline double normalizedSelectionPosition(
     const RangeMotionBounds& bounds,
     const RangeMotionSelection& selection, uint64_t travel) {
@@ -88,80 +85,151 @@ inline double normalizedSelectionPosition(
     return result;
 }
 
-inline uint64_t divideUnsigned64By32(uint64_t value, uint32_t divisor,
-                                     uint32_t& remainder) {
-    uint64_t quotient = 0;
-    uint64_t workingRemainder = 0;
-    for (int bit = 63; bit >= 0; --bit) {
-        workingRemainder =
-            (workingRemainder << 1U) | ((value >> bit) & 1U);
-        if (workingRemainder >= divisor) {
-            workingRemainder -= divisor;
-            quotient |= static_cast<uint64_t>(1) << bit;
-        }
+struct WideUnsigned {
+    uint64_t high;
+    uint64_t low;
+};
+
+inline WideUnsigned multiplyUnsigned64By53(uint64_t left, uint64_t right) {
+    const uint64_t leftLow = static_cast<uint32_t>(left);
+    const uint64_t leftHigh = left >> 32U;
+    const uint64_t rightLow = static_cast<uint32_t>(right);
+    const uint64_t rightHigh = right >> 32U;
+    const uint64_t lowLow = leftLow * rightLow;
+    const uint64_t lowHigh = leftLow * rightHigh;
+    const uint64_t highLow = leftHigh * rightLow;
+
+    uint64_t low = lowLow;
+    const uint64_t beforeLowHigh = low;
+    low += lowHigh << 32U;
+    const uint64_t carryLowHigh = low < beforeLowHigh ? 1U : 0U;
+    const uint64_t beforeHighLow = low;
+    low += highLow << 32U;
+    const uint64_t carryHighLow = low < beforeHighLow ? 1U : 0U;
+
+    WideUnsigned result = {
+        leftHigh * rightHigh + (lowHigh >> 32U) + (highLow >> 32U) +
+            carryLowHigh + carryHighLow,
+        low,
+    };
+    return result;
+}
+
+inline uint64_t lowBitsMask(unsigned bits) {
+    return bits == 0U ? 0U : (~static_cast<uint64_t>(0) >> (64U - bits));
+}
+
+inline double unsigned64ToDouble(uint64_t value) {
+    // Convert exact 32-bit limbs rather than a potentially lossy absolute pulse
+    // coordinate. This helper is used only for a sub-pulse remainder.
+    return static_cast<double>(static_cast<uint32_t>(value >> 32U)) *
+               4294967296.0 +
+           static_cast<double>(static_cast<uint32_t>(value));
+}
+
+inline double scaleDownByPowerOfTwo(double value, unsigned power) {
+    while (power >= 64U) {
+        value *= 0x1p-64;
+        power -= 64U;
     }
-    remainder = static_cast<uint32_t>(workingRemainder);
-    return quotient;
+    while (power >= 16U) {
+        value *= 0x1p-16;
+        power -= 16U;
+    }
+    while (power != 0U) {
+        value *= 0.5;
+        --power;
+    }
+    return value;
 }
 
-inline void scaleTravel(uint64_t travel, uint32_t numerator,
-                        uint64_t& wholePulses,
-                        uint32_t& fractionalNumerator) {
-    uint32_t travelRemainder = 0;
-    const uint64_t travelQuotient = divideUnsigned64By32(
-        travel, kFractionDenominator, travelRemainder);
-    wholePulses = travelQuotient * numerator;
+inline double wideFraction(const WideUnsigned& product, unsigned shift) {
+    WideUnsigned remainder = product;
+    if (shift < 64U) {
+        remainder.high = 0U;
+        remainder.low &= lowBitsMask(shift);
+    } else if (shift < 128U) {
+        remainder.high &= lowBitsMask(shift - 64U);
+    }
 
-    const uint64_t remainderProduct =
-        static_cast<uint64_t>(travelRemainder) * numerator;
-    uint32_t productRemainder = 0;
-    wholePulses += divideUnsigned64By32(
-        remainderProduct, kFractionDenominator, productRemainder);
-    fractionalNumerator = productRemainder;
+    const double asDouble =
+        unsigned64ToDouble(remainder.high) * 18446744073709551616.0 +
+        unsigned64ToDouble(remainder.low);
+    const double fraction = scaleDownByPowerOfTwo(asDouble, shift);
+    // Rounding while converting the remainder's limbs must not promote a
+    // proper fraction to a second whole pulse.
+    return fraction < 1.0 ? fraction : 0x1.fffffffffffffp-1;
 }
 
-inline uint32_t normalizedMovementNumerator(double magnitude) {
+// Scale the represented binary64 movement by a uint64 travel domain. The
+// integer product is formed explicitly in two uint64 limbs, so neither travel
+// nor an absolute pulse coordinate is narrowed to floating point.
+inline void scaleTravel(uint64_t travel, double magnitude,
+                        uint64_t& wholePulses, double& fractionalPulse) {
+    if (!(magnitude > 0.0)) {
+        wholePulses = 0U;
+        fractionalPulse = 0.0;
+        return;
+    }
     if (magnitude >= 1.0) {
-        return kFractionDenominator;
+        wholePulses = travel;
+        fractionalPulse = 0.0;
+        return;
     }
-    return static_cast<uint32_t>(
-        magnitude * static_cast<double>(kFractionDenominator) + 0.5);
+
+    uint64_t representedBits = 0U;
+    __builtin_memcpy(&representedBits, &magnitude, sizeof(representedBits));
+    const unsigned exponentBits =
+        static_cast<unsigned>((representedBits >> 52U) & 0x7ffU);
+    uint64_t significand = representedBits & 0x000fffffffffffffULL;
+    unsigned shift = 1074U;
+    if (exponentBits != 0U) {
+        significand |= 0x0010000000000000ULL;
+        shift = 1075U - exponentBits;
+    }
+
+    const WideUnsigned product =
+        multiplyUnsigned64By53(travel, significand);
+    if (shift >= 128U) {
+        wholePulses = 0U;
+    } else if (shift >= 64U) {
+        wholePulses = product.high >> (shift - 64U);
+    } else {
+        wholePulses = (product.high << (64U - shift)) |
+                      (product.low >> shift);
+    }
+    fractionalPulse = wideFraction(product, shift);
 }
 
-inline uint64_t roundedScaledMovement(uint64_t travel, uint32_t numerator,
+inline uint64_t roundedScaledMovement(uint64_t travel, double magnitude,
                                       bool towardNewer, uint64_t available,
-                                      int64_t previousResidual,
-                                      int64_t& nextResidual) {
-    if (numerator == 0U) {
+                                      double previousResidual,
+                                      double& nextResidual) {
+    if (!(magnitude > 0.0)) {
         nextResidual = previousResidual;
         return 0U;
     }
 
     uint64_t wholePulses = 0;
-    uint32_t fractionalNumerator = 0;
-    scaleTravel(travel, numerator, wholePulses, fractionalNumerator);
-    int64_t combinedFraction =
+    double fractionalPulse = 0.0;
+    scaleTravel(travel, magnitude, wholePulses, fractionalPulse);
+    double combinedFraction =
         previousResidual +
-        (towardNewer ? static_cast<int64_t>(fractionalNumerator)
-                     : -static_cast<int64_t>(fractionalNumerator));
+        (towardNewer ? fractionalPulse : -fractionalPulse);
 
     // If the whole component reaches the legal limit, do not increment or
     // convert beyond uint64 range. The caller is at a clamp and discards debt.
     if (wholePulses >= available) {
-        nextResidual = 0;
+        nextResidual = 0.0;
         return available;
     }
 
-    if (towardNewer &&
-        combinedFraction * 2 >=
-            static_cast<int64_t>(kFractionDenominator)) {
+    if (towardNewer && combinedFraction >= 0.5) {
         ++wholePulses;
-        combinedFraction -= kFractionDenominator;
-    } else if (!towardNewer &&
-               -combinedFraction * 2 >=
-                   static_cast<int64_t>(kFractionDenominator)) {
+        combinedFraction -= 1.0;
+    } else if (!towardNewer && combinedFraction <= -0.5) {
         ++wholePulses;
-        combinedFraction += kFractionDenominator;
+        combinedFraction += 1.0;
     }
     nextResidual = combinedFraction;
     return wholePulses;
@@ -187,7 +255,7 @@ inline bool establishRangeMotion(RangeMotionState& state,
                                                           travel);
     state.physicalPosition =
         range_motion_detail::clampNormalized(physicalPosition);
-    state.pulseResidualNumerator = 0;
+    state.pulseResidual = 0.0;
     state.established = true;
     return true;
 }
@@ -210,7 +278,7 @@ inline bool rebaseRangeMotion(RangeMotionState& state,
     state.logicalPosition =
         range_motion_detail::normalizedSelectionPosition(bounds, selection,
                                                           travel);
-    state.pulseResidualNumerator = 0;
+    state.pulseResidual = 0.0;
     return true;
 }
 
@@ -274,12 +342,10 @@ inline bool moveRangeMotion(RangeMotionState& state,
     const uint64_t available =
         towardNewer ? bounds.historyEnd - selection.end
                     : selection.start - bounds.historyStart;
-    int64_t nextResidual = state.pulseResidualNumerator;
+    double nextResidual = state.pulseResidual;
     const uint64_t amount = range_motion_detail::roundedScaledMovement(
-        travel,
-        range_motion_detail::normalizedMovementNumerator(
-            range_motion_detail::absolute(normalizedMovement)),
-        towardNewer, available, state.pulseResidualNumerator, nextResidual);
+        travel, range_motion_detail::absolute(normalizedMovement), towardNewer,
+        available, state.pulseResidual, nextResidual);
 
     if (amount != 0U) {
         if (towardNewer) {
@@ -297,7 +363,7 @@ inline bool moveRangeMotion(RangeMotionState& state,
         (!towardNewer && selection.start == bounds.historyStart);
     // Keep logical/physical mismatch, but never accumulate displacement debt
     // that would delay an inward reversal.
-    state.pulseResidualNumerator = reachedOutwardLimit ? 0 : nextResidual;
+    state.pulseResidual = reachedOutwardLimit ? 0.0 : nextResidual;
     return amount != 0U;
 }
 

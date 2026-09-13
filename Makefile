@@ -4,6 +4,7 @@ SOURCE := src/midibuffer.cpp
 NATIVE_TEST := build/callback_contract_test
 RANGE_MOTION_TEST := build/range_motion_test
 ARM_OBJECT := plugins/$(PLUGIN_NAME).o
+ARM_RANGE_MOTION_OBJECT := build/range_motion_arm.o
 
 NATIVE_CXX ?= clang++
 ARM_CXX ?= arm-none-eabi-g++
@@ -24,17 +25,19 @@ test: $(NATIVE_TEST) $(RANGE_MOTION_TEST)
 	./$(NATIVE_TEST)
 	./$(RANGE_MOTION_TEST)
 
-hardware: $(ARM_OBJECT)
+hardware: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 
-inspect: $(ARM_OBJECT)
+inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Class:[[:space:]]+ELF32'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Data:[[:space:]]+2.s complement, little endian'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Type:[[:space:]]+REL \(Relocatable file\)'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Machine:[[:space:]]+ARM'
 	@$(ARM_NM) --defined-only $(ARM_OBJECT) | grep -Eq '[[:space:]]T[[:space:]]pluginEntry$$'
+	@$(ARM_READELF) -h $(ARM_RANGE_MOTION_OBJECT) | grep -Eq 'Machine:[[:space:]]+ARM'
+	@test -z "$$($(ARM_NM) -u $(ARM_RANGE_MOTION_OBJECT))" || { echo "Range motion ARM object has unexpected undefined symbols:"; $(ARM_NM) -u $(ARM_RANGE_MOTION_OBJECT); exit 1; }
 	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|NT_drawShapeI|NT_drawText|NT_globals|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset|_ZN13_NT_jsonParse.*|_ZN14_NT_jsonStream.*)$$' || true )"; \
 		test -z "$$unexpected" || { echo "Unexpected undefined symbols:"; echo "$$unexpected"; exit 1; }
-	@echo "PASS: valid ARM relocatable object exports pluginEntry; undefined symbols match the host/libc allowlist"
+	@echo "PASS: valid ARM objects include range-motion code; pluginEntry and host/libc allowlist verified"
 
 verify: test hardware inspect
 
@@ -46,6 +49,9 @@ $(RANGE_MOTION_TEST): src/range_motion.hpp tests/range_motion_test.cpp | build
 
 $(ARM_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp | plugins
 	$(ARM_CXX) $(ARM_FLAGS) -c $(SOURCE) -o $@
+
+$(ARM_RANGE_MOTION_OBJECT): src/range_motion.hpp tests/range_motion_arm_compile.cpp | build
+	$(ARM_CXX) $(ARM_FLAGS) -c tests/range_motion_arm_compile.cpp -o $@
 
 build plugins:
 	mkdir -p $@

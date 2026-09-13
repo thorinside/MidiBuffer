@@ -25,7 +25,7 @@ bool sameState(const midibuffer::RangeMotionState& left,
                const midibuffer::RangeMotionState& right) {
     return left.logicalPosition == right.logicalPosition &&
            left.physicalPosition == right.physicalPosition &&
-           left.pulseResidualNumerator == right.pulseResidualNumerator &&
+           left.pulseResidual == right.pulseResidual &&
            left.established == right.established;
 }
 
@@ -138,7 +138,7 @@ void verifyResidualStationaryAndReversal() {
     }
     expect(selection.start == 120U && selection.end == 140U,
            "tiny deltas do not fabricate early whole-pulse motion");
-    expect(state.pulseResidualNumerator != 0,
+    expect(state.pulseResidual != 0.0,
            "sub-pulse displacement remains in fixed-size state");
     expect(midibuffer::moveRangeMotion(state, bounds, selection, 0.257),
            "accumulated tiny deltas eventually move one pulse");
@@ -181,7 +181,7 @@ void verifyClampsAndEndpointMismatch() {
     expectNear(upperState.physicalPosition - upperState.logicalPosition,
                -0.1, 1.0e-12,
                "upper clamp preserves physical/logical mismatch");
-    expect(upperState.pulseResidualNumerator == 0,
+    expect(upperState.pulseResidual == 0.0,
            "upper clamp discards outward displacement debt");
     expect(midibuffer::moveRangeMotion(upperState, bounds, upper, 0.8) &&
                upper.start < 180U && upper.end - upper.start == 20U,
@@ -196,7 +196,7 @@ void verifyClampsAndEndpointMismatch() {
     expectNear(lowerState.physicalPosition - lowerState.logicalPosition,
                0.1, 1.0e-12,
                "lower clamp preserves physical/logical mismatch");
-    expect(lowerState.pulseResidualNumerator == 0 &&
+    expect(lowerState.pulseResidual == 0.0 &&
                midibuffer::moveRangeMotion(lowerState, bounds, lower, 0.2) &&
                lower.start > 100U && lower.end - lower.start == 20U,
            "lower-clamp inward reversal has no displacement debt delay");
@@ -220,11 +220,11 @@ void verifyEstablishRebaseAndNoOpDomains() {
     midibuffer::establishRangeMotion(state, bounds, selection, 0.8);
     midibuffer::moveRangeMotion(state, bounds, selection, 0.81);
     const double retainedLogical = state.logicalPosition;
-    const int64_t retainedResidual = state.pulseResidualNumerator;
+    const double retainedResidual = state.pulseResidual;
     expect(midibuffer::seedRangeMotionPhysical(state, 0.4) &&
                state.physicalPosition == 0.4 &&
                state.logicalPosition == retainedLogical &&
-               state.pulseResidualNumerator == retainedResidual,
+               state.pulseResidual == retainedResidual,
            "physical baseline seeding does not become range motion or restart catch-up");
     const double retainedPhysical = state.physicalPosition;
 
@@ -235,7 +235,7 @@ void verifyEstablishRebaseAndNoOpDomains() {
     expectNear(state.logicalPosition, 0.625, 1.0e-12,
                "rebase derives logical position from edited selection");
     expect(state.physicalPosition == retainedPhysical &&
-               state.pulseResidualNumerator == 0,
+               state.pulseResidual == 0.0,
            "rebase retains physical sample and clears stale residual");
 
     midibuffer::RangeMotionState unestablished;
@@ -268,45 +268,103 @@ void verifyEstablishRebaseAndNoOpDomains() {
            "domain no-op checks do not alter the valid fixture");
 }
 
-void verifyWideCoordinatesAndLengthInvariant() {
+void verifyExactWideDisplacementAndLengthInvariant() {
+    const uint64_t halfTravel = static_cast<uint64_t>(1) << 39U;
+    const uint64_t travel = static_cast<uint64_t>(1) << 40U;
+    const midibuffer::RangeMotionBounds wide = {0U, travel + 1U};
+
+    midibuffer::RangeMotionSelection positive = {0U, 1U};
+    midibuffer::RangeMotionState positiveState;
+    midibuffer::establishRangeMotion(positiveState, wide, positive, 0.0);
+    expect(midibuffer::moveRangeMotion(positiveState, wide, positive, 0.5) &&
+               positive.start == halfTravel &&
+               positive.end == halfTravel + 1U,
+           "D=2^40 times positive 0.5 moves exactly 2^39 pulses");
+
+    midibuffer::RangeMotionSelection negative = {travel, travel + 1U};
+    midibuffer::RangeMotionState negativeState;
+    midibuffer::establishRangeMotion(negativeState, wide, negative, 1.0);
+    expect(midibuffer::moveRangeMotion(negativeState, wide, negative, 0.5) &&
+               negative.start == halfTravel &&
+               negative.end == halfTravel + 1U,
+           "D=2^40 times negative 0.5 moves exactly 2^39 pulses");
+
+    const double quarterPulse = 0x1p-42;
+    midibuffer::RangeMotionSelection tiny = {0U, 1U};
+    midibuffer::RangeMotionState tinyState;
+    midibuffer::establishRangeMotion(tinyState, wide, tiny, 0.0);
+    expect(!midibuffer::moveRangeMotion(tinyState, wide, tiny,
+                                        quarterPulse) &&
+               tiny.start == 0U && tinyState.pulseResidual == 0.25,
+           "quarter-pulse movement is retained without early motion");
+    midibuffer::moveRangeMotion(tinyState, wide, tiny, 2.0 * quarterPulse);
+    midibuffer::moveRangeMotion(tinyState, wide, tiny, 3.0 * quarterPulse);
+    midibuffer::moveRangeMotion(tinyState, wide, tiny, 4.0 * quarterPulse);
+    expect(tiny.start == 1U && tiny.end == 2U &&
+               tinyState.pulseResidual == 0.0,
+           "four tiny represented movements accumulate to one exact pulse");
+
+    midibuffer::RangeMotionSelection tinyNegative = {travel, travel + 1U};
+    midibuffer::RangeMotionState tinyNegativeState;
+    midibuffer::establishRangeMotion(tinyNegativeState, wide, tinyNegative,
+                                      1.0);
+    expect(!midibuffer::moveRangeMotion(tinyNegativeState, wide,
+                                         tinyNegative,
+                                         1.0 - quarterPulse) &&
+               tinyNegative.start == travel &&
+               tinyNegativeState.pulseResidual == -0.25,
+           "negative quarter-pulse movement is retained without early motion");
+    midibuffer::moveRangeMotion(tinyNegativeState, wide, tinyNegative,
+                                1.0 - 2.0 * quarterPulse);
+    midibuffer::moveRangeMotion(tinyNegativeState, wide, tinyNegative,
+                                1.0 - 3.0 * quarterPulse);
+    midibuffer::moveRangeMotion(tinyNegativeState, wide, tinyNegative,
+                                1.0 - 4.0 * quarterPulse);
+    expect(tinyNegative.start == travel - 1U &&
+               tinyNegative.end == travel &&
+               tinyNegativeState.pulseResidual == 0.0,
+           "four tiny negative movements accumulate to one exact pulse");
+
     const uint64_t maximum = ~static_cast<uint64_t>(0);
     const midibuffer::RangeMotionBounds nearMaximum = {
-        maximum - 1000U, maximum,
+        maximum - (travel + 1U), maximum,
     };
-    midibuffer::RangeMotionSelection selection = {
-        nearMaximum.historyStart + 100U,
-        nearMaximum.historyStart + 200U,
+    midibuffer::RangeMotionSelection nearMaximumSelection = {
+        nearMaximum.historyStart, nearMaximum.historyStart + 1U,
     };
-    midibuffer::RangeMotionState state;
-    const double initialLogical = 100.0 / 900.0;
-    midibuffer::establishRangeMotion(state, nearMaximum, selection,
-                                      initialLogical);
-    expect(midibuffer::moveRangeMotion(state, nearMaximum, selection,
-                                        initialLogical + 0.1) &&
-               selection.start == nearMaximum.historyStart + 190U &&
-               selection.end == nearMaximum.historyStart + 290U,
-           "relative scaling near UINT64_MAX yields exact expected displacement");
+    midibuffer::RangeMotionState nearMaximumState;
+    midibuffer::establishRangeMotion(nearMaximumState, nearMaximum,
+                                      nearMaximumSelection, 0.0);
+    expect(midibuffer::moveRangeMotion(nearMaximumState, nearMaximum,
+                                        nearMaximumSelection, 0.5) &&
+               nearMaximumSelection.start ==
+                   nearMaximum.historyStart + halfTravel &&
+               nearMaximumSelection.end ==
+                   nearMaximum.historyStart + halfTravel + 1U,
+           "near-UINT64 coordinates retain exact relative displacement");
+
+    const midibuffer::RangeMotionBounds widest = {0U, maximum};
+    midibuffer::RangeMotionSelection onePulse = {0U, 1U};
+    midibuffer::RangeMotionState widestState;
+    midibuffer::establishRangeMotion(widestState, widest, onePulse, 0.0);
+    midibuffer::moveRangeMotion(widestState, widest, onePulse, 0.5);
+    const uint64_t expectedWidestHalf =
+        (maximum - 1U) / 2U;
+    expect(onePulse.start == expectedWidestHalf &&
+               onePulse.end == expectedWidestHalf + 1U,
+           "nearly full uint64 travel has exact half-range displacement");
 
     const double samples[] = {1.0, 0.0, 0.73, 0.21, 0.99, 0.01, 0.5};
     for (size_t index = 0; index < sizeof(samples) / sizeof(samples[0]);
          ++index) {
-        midibuffer::moveRangeMotion(state, nearMaximum, selection,
+        midibuffer::moveRangeMotion(widestState, widest, onePulse,
                                     samples[index]);
-        expect(selection.start >= nearMaximum.historyStart &&
-                   selection.end <= nearMaximum.historyEnd &&
-                   selection.start < selection.end &&
-                   selection.end - selection.start == 100U,
+        expect(onePulse.start >= widest.historyStart &&
+                   onePulse.end <= widest.historyEnd &&
+                   onePulse.start < onePulse.end &&
+                   onePulse.end - onePulse.start == 1U,
                "wide-coordinate motion always preserves a legal fixed-length pair");
     }
-
-    const midibuffer::RangeMotionBounds widest = {0U, maximum};
-    midibuffer::RangeMotionSelection onePulse = {1U, 2U};
-    midibuffer::RangeMotionState widestState;
-    midibuffer::establishRangeMotion(widestState, widest, onePulse, 0.0);
-    midibuffer::moveRangeMotion(widestState, widest, onePulse, 0.5);
-    expect(onePulse.start < onePulse.end && onePulse.end <= maximum &&
-               onePulse.end - onePulse.start == 1U,
-           "overflow-safe scaling supports a nearly full uint64 travel domain");
 }
 
 } // namespace
@@ -319,7 +377,7 @@ int main() {
     verifyResidualStationaryAndReversal();
     verifyClampsAndEndpointMismatch();
     verifyEstablishRebaseAndNoOpDomains();
-    verifyWideCoordinatesAndLengthInvariant();
+    verifyExactWideDisplacementAndLengthInvariant();
 
     if (gFailures != 0) {
         std::fprintf(stderr, "%d range motion checks failed\n", gFailures);
