@@ -1077,6 +1077,70 @@ void verifyShowAllAndRelativeTimelineNavigation() {
                regrown.selection.endPulse == 330U,
            "manual mode remains end-relative when retained history grows after a fit-all eviction");
 
+    const HistoryImage reversalHistory = captureHistory(navigation);
+    beginRightPotZoom(navigation, 0.5f);
+    continueRightPotZoom(navigation, 0.5f);
+    const midibuffer::CaptureSnapshot stationaryPress = snapshot(navigation);
+    expect(!stationaryPress.timelineShowAll &&
+               stationaryPress.timelineVisiblePulses == 128U &&
+               stationaryPress.timelineViewStartPulse ==
+                   regrown.timelineViewStartPulse &&
+               stationaryPress.timelineViewEndPulse ==
+                   regrown.timelineViewEndPulse &&
+               stationaryPress.selection.startPulse ==
+                   regrown.selection.startPulse &&
+               stationaryPress.selection.endPulse ==
+                   regrown.selection.endPulse &&
+               !stationaryPress.playbackArmed &&
+               !stationaryPress.playbackActive &&
+               sameHistory(reversalHistory, navigation),
+           "a stationary initial held press leaves the manual view and capture state unchanged");
+    continueRightPotZoom(navigation, 0.0f);
+    const midibuffer::CaptureSnapshot reversalZoomedIn = snapshot(navigation);
+    expect(!reversalZoomedIn.timelineShowAll &&
+               reversalZoomedIn.timelineVisiblePulses == 4U,
+           "manual reversal fixture first zooms in from the press-relative span");
+    continueRightPotZoom(navigation, 0.5f);
+    endRightPotZoom(navigation, 0.5f);
+    const midibuffer::CaptureSnapshot reversedFromZoomIn = snapshot(navigation);
+    expect(!reversedFromZoomIn.timelineShowAll &&
+               reversedFromZoomIn.timelineVisiblePulses == 128U &&
+               reversedFromZoomIn.timelineViewEndPulse -
+                       reversedFromZoomIn.timelineViewStartPulse ==
+                   128U &&
+               reversedFromZoomIn.selection.startPulse ==
+                   regrown.selection.startPulse &&
+               reversedFromZoomIn.selection.endPulse ==
+                   regrown.selection.endPulse &&
+               !reversedFromZoomIn.playbackArmed &&
+               !reversedFromZoomIn.playbackActive &&
+               sameHistory(reversalHistory, navigation),
+           "returning to the press coordinate after zoom-in restores the manual press-relative span without mutation");
+
+    beginRightPotZoom(navigation, 0.5f);
+    continueRightPotZoom(navigation, 1.0f);
+    const midibuffer::CaptureSnapshot reversalZoomedOut = snapshot(navigation);
+    expect(reversalZoomedOut.timelineShowAll &&
+               reversalZoomedOut.timelineViewStartPulse == 300U &&
+               reversalZoomedOut.timelineViewEndPulse == 500U,
+           "manual reversal fixture first zooms out to exact Show All");
+    continueRightPotZoom(navigation, 0.5f);
+    endRightPotZoom(navigation, 0.5f);
+    const midibuffer::CaptureSnapshot reversedFromZoomOut = snapshot(navigation);
+    expect(!reversedFromZoomOut.timelineShowAll &&
+               reversedFromZoomOut.timelineVisiblePulses == 128U &&
+               reversedFromZoomOut.timelineViewEndPulse -
+                       reversedFromZoomOut.timelineViewStartPulse ==
+                   128U &&
+               reversedFromZoomOut.selection.startPulse ==
+                   regrown.selection.startPulse &&
+               reversedFromZoomOut.selection.endPulse ==
+                   regrown.selection.endPulse &&
+               !reversedFromZoomOut.playbackArmed &&
+               !reversedFromZoomOut.playbackActive &&
+               sameHistory(reversalHistory, navigation),
+           "returning to the press coordinate after zoom-out restores the manual press-relative span without mutation");
+
     midibuffer_test::HostDouble wideZoom;
     const uint64_t wideSpan =
         (static_cast<uint64_t>(1U) << 32U) + 257U;

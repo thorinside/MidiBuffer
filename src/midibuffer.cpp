@@ -1956,8 +1956,7 @@ void beginTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
 }
 
 void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
-    if (!algorithm.rightPotZoomActive ||
-        coordinate == algorithm.zoomPressCoordinate) {
+    if (!algorithm.rightPotZoomActive) {
         return;
     }
 
