@@ -7,6 +7,7 @@
 
 #include "midibuffer_core.hpp"
 #include "nt_host.hpp"
+#include "range_motion.hpp"
 
 namespace midibuffer {
 namespace {
@@ -110,19 +111,22 @@ struct Algorithm : public _NT_algorithm {
           playbackEventIndex(0), clockIntervalWriteIndex(0),
           clockIntervalCount(0), clockIntervals(), selection(),
           activeSelection(), state(), recordedState(), playbackOutputState(),
-          pendingEndings(), transportState(kTransportStopped),
+          pendingEndings(), rangeMotion(), transportState(kTransportStopped),
           playbackIntervalOrdinal(0), timelineScrollPulses(0),
           timelineVisiblePulses(kDefaultTimelineVisiblePulses),
           zoomPressVisiblePulses(0), zoomPressManualVisiblePulses(0),
+          rangeMotionHistoryStart(0), rangeMotionHistoryEnd(0),
           zoomPressCoordinate(0),
           captureEnabled(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
           rangeTransitionPending(false), playbackPositionValid(false),
           playbackIntervalOpen(false), playbackNextEventScheduled(false),
-          pendingNextEndingScheduled(false), lastMovedBoundaryIsStart(false),
+          pendingNextEndingScheduled(false),
+          selectionFineTarget(kSelectionFineTargetEnd),
           timelineShowAll(true), zoomPressShowAll(true),
-          rightPotZoomActive(false), rightEncoderHoldActive(false),
+          rightPotZoomActive(false), rangeMotionDomainKnown(false),
+          rangeMotionNeedsPhysicalSeed(true), rightEncoderHoldActive(false),
           rightEncoderPanicFired(false),
           pendingNextEndingSample(0), rightEncoderHoldStartSample(0) {}
 
@@ -151,12 +155,15 @@ struct Algorithm : public _NT_algorithm {
     RecordedState recordedState;
     PlaybackOutputState playbackOutputState;
     PendingPlaybackEndings pendingEndings;
+    RangeMotionState rangeMotion;
     TransportState transportState;
     uint64_t playbackIntervalOrdinal;
     uint64_t timelineScrollPulses;
     uint64_t timelineVisiblePulses;
     uint64_t zoomPressVisiblePulses;
     uint64_t zoomPressManualVisiblePulses;
+    uint64_t rangeMotionHistoryStart;
+    uint64_t rangeMotionHistoryEnd;
     uint32_t zoomPressCoordinate;
 
     bool captureEnabled;
@@ -171,10 +178,12 @@ struct Algorithm : public _NT_algorithm {
     bool playbackIntervalOpen;
     bool playbackNextEventScheduled;
     bool pendingNextEndingScheduled;
-    bool lastMovedBoundaryIsStart;
+    SelectionFineTarget selectionFineTarget;
     bool timelineShowAll;
     bool zoomPressShowAll;
     bool rightPotZoomActive;
+    bool rangeMotionDomainKnown;
+    bool rangeMotionNeedsPhysicalSeed;
     bool rightEncoderHoldActive;
     bool rightEncoderPanicFired;
     uint64_t pendingNextEndingSample;
@@ -1815,6 +1824,76 @@ void timelineViewBounds(const Algorithm& algorithm, uint64_t& start,
     start = end - visible;
 }
 
+bool currentRangeMotionPair(const Algorithm& algorithm,
+                            RangeMotionBounds& bounds,
+                            RangeMotionSelection& selection) {
+    if (!algorithm.selectionValid ||
+        !retainedTimelineBounds(algorithm, bounds.historyStart,
+                                bounds.historyEnd)) {
+        return false;
+    }
+    selection.start = algorithm.selection.startPulse;
+    selection.end = algorithm.selection.endPulse;
+    return true;
+}
+
+void rememberRangeMotionDomain(Algorithm& algorithm,
+                               const RangeMotionBounds& bounds) {
+    algorithm.rangeMotionHistoryStart = bounds.historyStart;
+    algorithm.rangeMotionHistoryEnd = bounds.historyEnd;
+    algorithm.rangeMotionDomainKnown = true;
+}
+
+// Called once before UI control processing. It establishes from the selected
+// pair, notices retained-domain changes without moving that pair, and consumes
+// setupUi's request to sample the actual physical pot without translation.
+bool prepareRangeMotion(Algorithm& algorithm, float physicalPosition) {
+    RangeMotionBounds bounds = {};
+    RangeMotionSelection selection = {};
+    if (!currentRangeMotionPair(algorithm, bounds, selection)) {
+        return false;
+    }
+
+    bool seededWithoutMotion = false;
+    if (!algorithm.rangeMotion.established) {
+        if (establishRangeMotion(algorithm.rangeMotion, bounds, selection,
+                                 physicalPosition)) {
+            rememberRangeMotionDomain(algorithm, bounds);
+            seededWithoutMotion = true;
+        }
+    } else if (!algorithm.rangeMotionDomainKnown ||
+               bounds.historyStart != algorithm.rangeMotionHistoryStart ||
+               bounds.historyEnd != algorithm.rangeMotionHistoryEnd) {
+        rebaseRangeMotion(algorithm.rangeMotion, bounds, selection);
+        rememberRangeMotionDomain(algorithm, bounds);
+    }
+
+    if (algorithm.rangeMotion.established &&
+        algorithm.rangeMotionNeedsPhysicalSeed) {
+        seedRangeMotionPhysical(algorithm.rangeMotion, physicalPosition);
+        algorithm.rangeMotionNeedsPhysicalSeed = false;
+        seededWithoutMotion = true;
+    }
+    return seededWithoutMotion;
+}
+
+void rebaseRangeMotionAfterEdit(Algorithm& algorithm,
+                                float physicalPosition) {
+    RangeMotionBounds bounds = {};
+    RangeMotionSelection selection = {};
+    if (!currentRangeMotionPair(algorithm, bounds, selection)) {
+        return;
+    }
+    if (!rebaseRangeMotion(algorithm.rangeMotion, bounds, selection)) {
+        establishRangeMotion(algorithm.rangeMotion, bounds, selection,
+                             physicalPosition);
+    }
+    if (algorithm.rangeMotion.established) {
+        rememberRangeMotionDomain(algorithm, bounds);
+        algorithm.rangeMotionNeedsPhysicalSeed = false;
+    }
+}
+
 bool ensureTimelineSelection(_NT_algorithm* self, Algorithm& algorithm) {
     if (algorithm.selectionValid) {
         return true;
@@ -1826,7 +1905,8 @@ bool ensureTimelineSelection(_NT_algorithm* self, Algorithm& algorithm) {
 }
 
 void moveTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
-                          bool startBoundary, uint64_t requested) {
+                          bool startBoundary, uint64_t requested,
+                          float rightPotPhysical) {
     if (!ensureTimelineSelection(self, algorithm)) {
         return;
     }
@@ -1855,13 +1935,76 @@ void moveTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
         return;
     }
     if (setPulseSelection(self, start, end)) {
-        algorithm.lastMovedBoundaryIsStart = startBoundary;
+        algorithm.selectionFineTarget =
+            startBoundary ? kSelectionFineTargetStart
+                          : kSelectionFineTargetEnd;
+        rebaseRangeMotionAfterEdit(algorithm, rightPotPhysical);
     }
 }
 
-void adjustLastTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
-                                int delta) {
-    if (delta == 0 || !ensureTimelineSelection(self, algorithm)) {
+void moveTimelineRange(_NT_algorithm* self, Algorithm& algorithm,
+                       float physicalPosition) {
+    RangeMotionBounds bounds = {};
+    RangeMotionSelection selection = {};
+    if (!currentRangeMotionPair(algorithm, bounds, selection)) {
+        return;
+    }
+    if (!algorithm.rangeMotion.established &&
+        !establishRangeMotion(algorithm.rangeMotion, bounds, selection,
+                              physicalPosition)) {
+        return;
+    }
+    rememberRangeMotionDomain(algorithm, bounds);
+    if (moveRangeMotion(algorithm.rangeMotion, bounds, selection,
+                        physicalPosition) &&
+        setPulseSelection(self, selection.start, selection.end)) {
+        algorithm.selectionFineTarget = kSelectionFineTargetRange;
+    }
+}
+
+void nudgeTimelineRange(_NT_algorithm* self, Algorithm& algorithm,
+                        int delta, float rightPotPhysical) {
+    if (delta == 0 || !algorithm.selectionValid) {
+        return;
+    }
+    uint64_t retainedStart = 0;
+    uint64_t retainedEnd = 0;
+    if (!retainedTimelineBounds(algorithm, retainedStart, retainedEnd) ||
+        algorithm.selection.startPulse < retainedStart ||
+        algorithm.selection.endPulse > retainedEnd ||
+        algorithm.selection.startPulse >= algorithm.selection.endPulse) {
+        return;
+    }
+
+    const uint64_t length = algorithm.selection.endPulse -
+                            algorithm.selection.startPulse;
+    const uint64_t maximumStart = retainedEnd - length;
+    const uint64_t amount = static_cast<uint32_t>(
+        delta > 0 ? delta : -delta);
+    uint64_t start = algorithm.selection.startPulse;
+    if (delta > 0) {
+        start = amount > maximumStart - start ? maximumStart : start + amount;
+    } else {
+        start = amount > start - retainedStart ? retainedStart : start - amount;
+    }
+    if (start == algorithm.selection.startPulse) {
+        return;
+    }
+    if (setPulseSelection(self, start, start + length)) {
+        rebaseRangeMotionAfterEdit(algorithm, rightPotPhysical);
+    }
+}
+
+void adjustTimelineSelection(_NT_algorithm* self, Algorithm& algorithm,
+                             int delta, float rightPotPhysical) {
+    if (delta == 0) {
+        return;
+    }
+    if (algorithm.selectionFineTarget == kSelectionFineTargetRange) {
+        nudgeTimelineRange(self, algorithm, delta, rightPotPhysical);
+        return;
+    }
+    if (!ensureTimelineSelection(self, algorithm)) {
         return;
     }
 
@@ -1871,9 +2014,10 @@ void adjustLastTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
         return;
     }
 
-    uint64_t requested = algorithm.lastMovedBoundaryIsStart
-                             ? algorithm.selection.startPulse
-                             : algorithm.selection.endPulse;
+    const bool startBoundary =
+        algorithm.selectionFineTarget == kSelectionFineTargetStart;
+    uint64_t requested = startBoundary ? algorithm.selection.startPulse
+                                       : algorithm.selection.endPulse;
     int steps = delta > 0 ? delta : -delta;
     while (steps-- > 0) {
         if (delta > 0 && requested < retainedEnd) {
@@ -1882,8 +2026,8 @@ void adjustLastTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
             --requested;
         }
     }
-    moveTimelineBoundary(self, algorithm,
-                         algorithm.lastMovedBoundaryIsStart, requested);
+    moveTimelineBoundary(self, algorithm, startBoundary, requested,
+                         rightPotPhysical);
 }
 
 void scrollTimeline(Algorithm& algorithm, int delta) {
@@ -2090,6 +2234,12 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
         ++algorithm->state.uiChanges;
     }
 
+    bool suppressRightPotTranslation =
+        prepareRangeMotion(*algorithm, data.pots[2]);
+
+    // Buttons are processed before pots and rotations. In particular, the
+    // pot-3 release sample becomes the next relative baseline before a changed
+    // pot bit in the same callback can be interpreted as translation.
     const bool leftEncoderPressed =
         (data.controls & kNT_encoderButtonL) != 0U &&
         (data.lastButtons & kNT_encoderButtonL) == 0U;
@@ -2098,51 +2248,74 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
     }
     updateRightEncoderPanic(*algorithm, data);
 
+    const bool rightPotHeld =
+        (data.controls & kNT_potButtonR) != 0U;
+    const bool rightPotWasHeld =
+        (data.lastButtons & kNT_potButtonR) != 0U;
+    if (rightPotHeld && !rightPotWasHeld) {
+        seedRangeMotionPhysical(algorithm->rangeMotion, data.pots[2]);
+        beginTimelineZoom(*algorithm, normalizedTimelinePot(data.pots[2]));
+        suppressRightPotTranslation = true;
+    } else if (!rightPotHeld && rightPotWasHeld) {
+        seedRangeMotionPhysical(algorithm->rangeMotion, data.pots[2]);
+        algorithm->rightPotZoomActive = false;
+        suppressRightPotTranslation = true;
+    }
+
     if ((data.controls & kNT_potL) != 0U &&
         ensureTimelineSelection(self, *algorithm)) {
         moveTimelineBoundary(
             self, *algorithm, true,
             pulseFromPot(
                 algorithm->recordingEvents[algorithm->eventHead].pulse,
-                algorithm->selection.endPulse - 1U, data.pots[0]));
+                algorithm->selection.endPulse - 1U, data.pots[0]),
+            data.pots[2]);
     }
     if ((data.controls & kNT_potC) != 0U &&
         ensureTimelineSelection(self, *algorithm)) {
         moveTimelineBoundary(
             self, *algorithm, false,
             pulseFromPot(algorithm->selection.startPulse + 1U,
-                         algorithm->historyEndPulseExclusive, data.pots[1]));
+                         algorithm->historyEndPulseExclusive, data.pots[1]),
+            data.pots[2]);
     }
-    const bool rightPotHeld =
-        (data.controls & kNT_potButtonR) != 0U;
-    const bool rightPotWasHeld =
-        (data.lastButtons & kNT_potButtonR) != 0U;
+
     if (rightPotHeld) {
-        const uint32_t coordinate = normalizedTimelinePot(data.pots[2]);
-        if (!rightPotWasHeld || !algorithm->rightPotZoomActive) {
-            beginTimelineZoom(*algorithm, coordinate);
-        } else {
-            updateTimelineZoom(*algorithm, coordinate);
+        if (rightPotWasHeld) {
+            updateTimelineZoom(*algorithm,
+                               normalizedTimelinePot(data.pots[2]));
         }
-    } else {
-        algorithm->rightPotZoomActive = false;
+        // Held movement is zoom-only, but every actual sample advances the
+        // physical baseline while logical catch-up and residual remain intact.
+        seedRangeMotionPhysical(algorithm->rangeMotion, data.pots[2]);
+    } else if ((data.controls & kNT_potR) != 0U &&
+               !suppressRightPotTranslation) {
+        moveTimelineRange(self, *algorithm, data.pots[2]);
     }
+
     scrollTimeline(*algorithm, data.encoders[0]);
-    adjustLastTimelineBoundary(self, *algorithm, data.encoders[1]);
+    adjustTimelineSelection(self, *algorithm, data.encoders[1], data.pots[2]);
 }
 
 void setupUi(_NT_algorithm* self, _NT_float3& pots) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     pots[0] = 0.0f;
     pots[1] = 1.0f;
-    pots[2] = 4.0f / 6.0f;
-    if (algorithm == NULL || !algorithm->selectionValid) {
+    pots[2] = 0.0f;
+    if (algorithm == NULL) {
+        return;
+    }
+    algorithm->rangeMotionNeedsPhysicalSeed = true;
+    if (!algorithm->selectionValid) {
         return;
     }
 
     uint64_t retainedStart = 0;
     uint64_t retainedEnd = 0;
-    if (!retainedTimelineBounds(*algorithm, retainedStart, retainedEnd)) {
+    if (!retainedTimelineBounds(*algorithm, retainedStart, retainedEnd) ||
+        algorithm->selection.startPulse < retainedStart ||
+        algorithm->selection.endPulse > retainedEnd ||
+        algorithm->selection.startPulse >= algorithm->selection.endPulse) {
         return;
     }
     const uint64_t startRange = algorithm->selection.endPulse - 1U -
@@ -2160,13 +2333,16 @@ void setupUi(_NT_algorithm* self, _NT_float3& pots) {
                       (algorithm->selection.startPulse + 1U))) /
                   static_cast<float>(static_cast<uint32_t>(endRange));
     }
-    uint32_t span = kTimelineMinimumVisiblePulses;
-    uint32_t zoomIndex = 0;
-    while (span < algorithm->timelineVisiblePulses && zoomIndex < 6U) {
-        span <<= 1U;
-        ++zoomIndex;
+
+    const RangeMotionBounds bounds = {retainedStart, retainedEnd};
+    const RangeMotionSelection selection = {
+        algorithm->selection.startPulse,
+        algorithm->selection.endPulse,
+    };
+    double logicalPosition = 0.0;
+    if (rangeMotionLogicalPosition(bounds, selection, logicalPosition)) {
+        pots[2] = static_cast<float>(logicalPosition);
     }
-    pots[2] = static_cast<float>(zoomIndex) / 6.0f;
 }
 
 char* appendUnsigned(char* output, uint32_t value) {
@@ -2571,7 +2747,8 @@ void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     stream.addBoolean(algorithm->playbackIntervalOpen);
     stream.addBoolean(algorithm->playbackNextEventScheduled);
     stream.addBoolean(algorithm->pendingNextEndingScheduled);
-    stream.addBoolean(algorithm->lastMovedBoundaryIsStart);
+    stream.addBoolean(algorithm->selectionFineTarget ==
+                      kSelectionFineTargetStart);
     stream.addBoolean(false);  // encoder button state is physical input
     stream.addBoolean(false);
     stream.addNumber(static_cast<int>(algorithm->transportState));
@@ -2676,7 +2853,8 @@ bool parseFlags(_NT_jsonParse& parse, Algorithm& algorithm) {
     algorithm.playbackIntervalOpen = value[9];
     algorithm.playbackNextEventScheduled = value[10];
     algorithm.pendingNextEndingScheduled = value[11];
-    algorithm.lastMovedBoundaryIsStart = value[12];
+    algorithm.selectionFineTarget =
+        value[12] ? kSelectionFineTargetStart : kSelectionFineTargetEnd;
     algorithm.rightEncoderHoldActive = value[13];
     algorithm.rightEncoderPanicFired = value[14];
     algorithm.transportState = static_cast<TransportState>(transport);
@@ -2792,6 +2970,10 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
     algorithm->resetHigh = false;
     algorithm->rightEncoderHoldActive = false;
     algorithm->rightEncoderPanicFired = false;
+    algorithm->rightPotZoomActive = false;
+    algorithm->rangeMotion = RangeMotionState();
+    algorithm->rangeMotionDomainKnown = false;
+    algorithm->rangeMotionNeedsPhysicalSeed = true;
     return !algorithm->captureEnabled ||
            algorithm->transportState == kTransportStopped;
 }
@@ -2884,7 +3066,12 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.activeSelectionValid = algorithm->activeSelectionValid;
     snapshot.rangeTransitionPending = algorithm->rangeTransitionPending;
     snapshot.lastMovedBoundaryIsStart =
-        algorithm->lastMovedBoundaryIsStart;
+        algorithm->selectionFineTarget == kSelectionFineTargetStart;
+    snapshot.rangeMotionEstablished = algorithm->rangeMotion.established;
+    snapshot.selectionFineTarget = algorithm->selectionFineTarget;
+    snapshot.rangeLogicalPosition = algorithm->rangeMotion.logicalPosition;
+    snapshot.rangePhysicalPosition = algorithm->rangeMotion.physicalPosition;
+    snapshot.rangePulseResidual = algorithm->rangeMotion.pulseResidual;
     snapshot.selection = algorithm->selection;
     snapshot.activeSelection = algorithm->activeSelection;
     if (algorithm->eventCount != 0) {

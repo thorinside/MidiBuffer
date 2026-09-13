@@ -260,6 +260,23 @@ inline bool establishRangeMotion(RangeMotionState& state,
     return true;
 }
 
+// Report the selection-derived logical position without changing motion state.
+// setupUi uses this to synchronize the host's normal (unpressed) pot function.
+inline bool rangeMotionLogicalPosition(
+    const RangeMotionBounds& bounds,
+    const RangeMotionSelection& selection, double& logicalPosition) {
+    uint64_t length = 0;
+    uint64_t travel = 0;
+    if (!range_motion_detail::movableDomain(bounds, selection, length,
+                                             travel)) {
+        return false;
+    }
+    (void)length;
+    logicalPosition = range_motion_detail::normalizedSelectionPosition(
+        bounds, selection, travel);
+    return true;
+}
+
 // Rebase after a boundary edit or retained-domain change. The last physical
 // sample is deliberately retained so the next genuine delta remains relative.
 inline bool rebaseRangeMotion(RangeMotionState& state,

@@ -32,6 +32,13 @@ void expect(bool condition, const char* message) {
     }
 }
 
+void expectNear(double actual, double expected, double tolerance,
+                const char* message) {
+    const double difference = actual < expected ? expected - actual
+                                                : actual - expected;
+    expect(difference <= tolerance, message);
+}
+
 bool drawContains(const char* expected) {
     const midibuffer_test::Trace& current = midibuffer_test::trace();
     for (size_t index = 0; index < current.drawCallCount; ++index) {
@@ -67,6 +74,14 @@ void moveUi(midibuffer_test::HostDouble& host, uint16_t controls,
     host.factory()->customUi(host.algorithm(), data);
 }
 
+void seedRightPot(midibuffer_test::HostDouble& host, float pot) {
+    moveUi(host, 0U, 0.0f, 0.0f, pot);
+}
+
+void moveRightPot(midibuffer_test::HostDouble& host, float pot) {
+    moveUi(host, kNT_potR, 0.0f, 0.0f, pot);
+}
+
 void beginRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
     moveUi(host, kNT_potButtonR, 0.0f, 0.0f, pot);
 }
@@ -78,6 +93,16 @@ void continueRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
 
 void endRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
     moveUi(host, 0U, 0.0f, 0.0f, pot, 0, 0, kNT_potButtonR);
+}
+
+bool installRangeFixture(midibuffer_test::HostDouble& host,
+                         uint64_t historyStart, uint64_t historyEnd,
+                         uint64_t selectionStart, uint64_t selectionEnd) {
+    return host.instantiate(1) &&
+           midibuffer::setRetainedTimelineFixture(
+               host.algorithm(), historyStart, historyEnd) &&
+           midibuffer::setPulseSelection(
+               host.algorithm(), selectionStart, selectionEnd);
 }
 
 void changeParameter(midibuffer_test::HostDouble& host, size_t parameter,
@@ -419,9 +444,8 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
 
     _NT_float3 pots = {-1.0f, -1.0f, -1.0f};
     host.factory()->setupUi(host.algorithm(), pots);
-    expect(pots[0] == 0.0f && pots[1] == 1.0f &&
-               pots[2] > 0.66f && pots[2] < 0.67f,
-           "setupUi supplies deterministic start, end, and 64-pulse zoom positions");
+    expect(pots[0] == 0.0f && pots[1] == 1.0f && pots[2] == 0.0f,
+           "setupUi supplies deterministic start, end, and normal-range positions");
     const uint32_t customMask = host.factory()->hasCustomUi(host.algorithm());
     expect((customMask & kNT_encoderL) != 0 &&
                (customMask & kNT_encoderR) != 0 &&
@@ -1257,6 +1281,300 @@ void verifyShowAllAndRelativeTimelineNavigation() {
            "full held zoom-out reaches exact Show All beyond 2^32 without a 256 or uint32 cap");
 }
 
+void verifyIntegratedRangeMotionAndFineTargets() {
+    midibuffer_test::HostDouble range;
+    expect(installRangeFixture(range, 100U, 200U, 120U, 140U),
+           "integrated [100,200)/[120,140) range fixture installs");
+
+    _NT_float3 setupPots = {-1.0f, -1.0f, -1.0f};
+    range.factory()->setupUi(range.algorithm(), setupPots);
+    expectNear(setupPots[2], 0.25, 1.0e-6,
+               "setupUi reports the logical normal range position rather than zoom");
+    const midibuffer::CaptureSnapshot beforeEntry = snapshot(range);
+    moveRightPot(range, 0.25f);
+    const midibuffer::CaptureSnapshot entered = snapshot(range);
+    expect(entered.rangeMotionEstablished &&
+               entered.selection.startPulse == beforeEntry.selection.startPulse &&
+               entered.selection.endPulse == beforeEntry.selection.endPulse,
+           "UI entry suppresses even a changed-pot callback while sampling the physical pot");
+
+    moveRightPot(range, 0.75f);
+    midibuffer::CaptureSnapshot moved = snapshot(range);
+    expect(moved.selection.startPulse == 160U &&
+               moved.selection.endPulse == 180U &&
+               moved.selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetRange,
+           "unpressed pot 3 translates the exact 20-pulse pair and selects Range");
+    moveRightPot(range, 1.0f);
+    moved = snapshot(range);
+    expect(moved.selection.startPulse == 180U &&
+               moved.selection.endPulse == 200U,
+           "range motion clamps at [180,200) without wrapping or shortening");
+    moveRightPot(range, 0.0f);
+    moved = snapshot(range);
+    expect(moved.selection.startPulse == 100U &&
+               moved.selection.endPulse == 120U,
+           "range reversal reaches [100,120) without clamp debt");
+
+    for (size_t index = 0;
+         index < ARRAY_SIZE(kPulsesPerDisplayedBeatValues); ++index) {
+        const uint64_t phraseLength =
+            8U * kPulsesPerDisplayedBeatValues[index];
+        midibuffer_test::HostDouble musical;
+        expect(installRangeFixture(musical, 100U, 1000U, 200U,
+                                   200U + phraseLength),
+               "two-bar range fixture installs for a supported pulse domain");
+        changeParameter(musical, kPulsesPerDisplayedBeatParameter,
+                        static_cast<int16_t>(index));
+        seedRightPot(musical, 0.2f);
+        moveRightPot(musical, 0.3f);
+        moveUi(musical, 0U, 0.0f, 0.0f, 0.3f, 0, 1);
+        const midibuffer::CaptureSnapshot current = snapshot(musical);
+        expect(current.selection.endPulse - current.selection.startPulse ==
+                       phraseLength &&
+                   current.selection.startPulse >= 100U &&
+                   current.selection.endPulse <= 1000U,
+               "pot and encoder Range motion retain eight beats for every supported P");
+    }
+
+    struct CatchUpVector {
+        double logical;
+        float physical;
+        float nextPhysical;
+        double expectedLogical;
+    };
+    const CatchUpVector vectors[] = {
+        {0.2, 0.8f, 0.81f, 0.2175},
+        {0.8, 0.2f, 0.19f, 0.7825},
+        {0.2, 0.8f, 0.79f, 0.1975},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(vectors); ++index) {
+        midibuffer_test::HostDouble vector;
+        const uint64_t start =
+            static_cast<uint64_t>(vectors[index].logical * 100.0 + 0.5);
+        expect(installRangeFixture(vector, 0U, 110U, start, start + 10U),
+               "production callback catch-up vector fixture installs");
+        seedRightPot(vector, vectors[index].physical);
+        moveRightPot(vector, vectors[index].nextPhysical);
+        expectNear(snapshot(vector).rangeLogicalPosition,
+                   vectors[index].expectedLogical, 2.0e-7,
+                   "production pot callback applies the normative catch-up vector");
+    }
+
+    midibuffer_test::HostDouble hold;
+    expect(installRangeFixture(hold, 100U, 200U, 120U, 140U),
+           "repeated held-zoom reconciliation fixture installs");
+    seedRightPot(hold, 0.8f);
+    moveRightPot(hold, 0.81f);
+    const midibuffer::CaptureSnapshot unfinished = snapshot(hold);
+    expect(unfinished.rangePulseResidual != 0.0 &&
+               unfinished.rangePhysicalPosition >
+                   unfinished.rangeLogicalPosition,
+           "production callback retains sub-pulse residual and unfinished mismatch");
+    beginRightPotZoom(hold, 0.81f);
+    continueRightPotZoom(hold, 0.95f);
+    endRightPotZoom(hold, 0.7f);
+    beginRightPotZoom(hold, 0.7f);
+    continueRightPotZoom(hold, 0.6f);
+    endRightPotZoom(hold, 0.6f);
+    const midibuffer::CaptureSnapshot repeatedlyHeld = snapshot(hold);
+    expectNear(repeatedlyHeld.rangeLogicalPosition,
+               unfinished.rangeLogicalPosition, 1.0e-12,
+               "repeated holds preserve unfinished logical reconciliation");
+    expectNear(repeatedlyHeld.rangePulseResidual,
+               unfinished.rangePulseResidual, 1.0e-12,
+               "repeated holds preserve unfinished pulse residual");
+    expect(repeatedlyHeld.selectionFineTarget ==
+               unfinished.selectionFineTarget,
+           "repeated held zoom preserves the prior fine target");
+    const uint64_t beforeReversal = repeatedlyHeld.selection.startPulse;
+    moveRightPot(hold, 0.5f);
+    expect(snapshot(hold).selection.startPulse < beforeReversal,
+           "first post-release travel reverses immediately from the actual release sample");
+    const midibuffer::CaptureSnapshot afterReversal = snapshot(hold);
+    moveRightPot(hold, 0.5f);
+    expect(snapshot(hold).selection.startPulse ==
+                   afterReversal.selection.startPulse &&
+               snapshot(hold).rangeLogicalPosition ==
+                   afterReversal.rangeLogicalPosition,
+           "stationary reconciliation has no second jump");
+
+    midibuffer_test::HostDouble releaseEdge;
+    expect(installRangeFixture(releaseEdge, 100U, 200U, 120U, 140U),
+           "release-edge suppression fixture installs");
+    seedRightPot(releaseEdge, 0.25f);
+    beginRightPotZoom(releaseEdge, 0.25f);
+    continueRightPotZoom(releaseEdge, 0.9f);
+    moveUi(releaseEdge, kNT_potR, 0.0f, 0.0f, 0.4f, 0, 0,
+           kNT_potButtonR);
+    expect(snapshot(releaseEdge).selection.startPulse == 120U &&
+               snapshot(releaseEdge).selection.endPulse == 140U,
+           "release-with-pot-change seeds from release and suppresses edge translation");
+    moveRightPot(releaseEdge, 0.3f);
+    expect(snapshot(releaseEdge).selection.startPulse < 120U,
+           "first unpressed range delta is measured from the release sample");
+
+    midibuffer_test::HostDouble targets;
+    expect(installRangeFixture(targets, 100U, 300U, 120U, 140U),
+           "fine-target and callback-order fixture installs");
+    seedRightPot(targets, 0.1f);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, 1);
+    expect(snapshot(targets).selection.startPulse == 120U &&
+               snapshot(targets).selection.endPulse == 141U &&
+               snapshot(targets).selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetEnd,
+           "fresh encoder target is End and steps it by one pulse");
+    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, 1);
+    expect(snapshot(targets).selection.startPulse == 101U &&
+               snapshot(targets).selection.endPulse == 141U,
+           "effective pot 1 selects Start for an independent one-pulse nudge");
+    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
+    moveUi(targets, kNT_potC, 0.0f, 0.5f, 0.1f);
+    const midibuffer::CaptureSnapshot endTarget = snapshot(targets);
+    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, -1);
+    expect(snapshot(targets).selection.startPulse == 100U &&
+               snapshot(targets).selection.endPulse + 1U ==
+                   endTarget.selection.endPulse,
+           "a clamped pot boundary does not steal the prior effective End target");
+
+    expect(midibuffer::setPulseSelection(targets.algorithm(), 120U, 140U),
+           "Range fine-target pair resets through the public selection seam");
+    seedRightPot(targets, 0.1f);
+    moveRightPot(targets, 0.3f);
+    const midibuffer::CaptureSnapshot rangeTarget = snapshot(targets);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.3f, 0, 1);
+    const midibuffer::CaptureSnapshot nudged = snapshot(targets);
+    expect(nudged.selection.startPulse == rangeTarget.selection.startPulse + 1U &&
+               nudged.selection.endPulse == rangeTarget.selection.endPulse + 1U &&
+               nudged.selection.endPulse - nudged.selection.startPulse == 20U &&
+               nudged.rangePhysicalPosition ==
+                   rangeTarget.rangePhysicalPosition &&
+               nudged.rangePulseResidual == 0.0,
+           "Range nudge moves one pulse, retains length and physical baseline, and clears residual");
+    beginRightPotZoom(targets, 0.3f);
+    continueRightPotZoom(targets, 0.0f);
+    endRightPotZoom(targets, 0.0f);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.0f, 3, 0);
+    const midibuffer::CaptureSnapshot beforeRetainedNudge = snapshot(targets);
+    moveUi(targets, 0U, 0.0f, 0.0f, 0.0f, 0, -1);
+    expect(snapshot(targets).selection.startPulse + 1U ==
+                   beforeRetainedNudge.selection.startPulse &&
+               snapshot(targets).selection.endPulse + 1U ==
+                   beforeRetainedNudge.selection.endPulse,
+           "held zoom and encoder-1 scroll preserve the Range fine target");
+
+    midibuffer_test::HostDouble clampedTarget;
+    expect(installRangeFixture(clampedTarget, 100U, 200U, 180U, 200U),
+           "clamped target fixture installs");
+    seedRightPot(clampedTarget, 0.8f);
+    moveRightPot(clampedTarget, 0.9f);
+    moveUi(clampedTarget, 0U, 0.0f, 0.0f, 0.9f, 0, -1);
+    expect(snapshot(clampedTarget).selection.startPulse == 180U &&
+               snapshot(clampedTarget).selection.endPulse == 199U,
+           "clamped ineffective Range motion does not steal fresh End target");
+
+    midibuffer_test::HostDouble ordered;
+    expect(installRangeFixture(ordered, 100U, 200U, 120U, 140U),
+           "same-callback ordering fixture installs");
+    seedRightPot(ordered, 0.25f);
+    moveUi(ordered, kNT_potC | kNT_potR, 0.0f, 0.0f, 0.75f,
+           0, 1);
+    const midibuffer::CaptureSnapshot orderedResult = snapshot(ordered);
+    expect(orderedResult.selection.startPulse == 175U &&
+               orderedResult.selection.endPulse == 176U &&
+               orderedResult.selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetRange,
+           "same callback applies pot 2, post-edit-length Range motion, then encoder 2");
+
+    midibuffer_test::HostDouble invalid;
+    expect(installRangeFixture(invalid, 100U, 200U, 120U, 140U),
+           "invalid Range target fixture installs");
+    seedRightPot(invalid, 0.25f);
+    moveRightPot(invalid, 0.5f);
+    midibuffer::clearPulseSelection(invalid.algorithm());
+    moveRightPot(invalid, 0.6f);
+    moveUi(invalid, 0U, 0.0f, 0.0f, 0.6f, 0, 1);
+    expect(!snapshot(invalid).selectionValid,
+           "invalid Range target cannot recreate an overwritten selection");
+
+    midibuffer_test::HostDouble full;
+    expect(installRangeFixture(full, 100U, 200U, 100U, 200U),
+           "full-history range fixture installs");
+    seedRightPot(full, 0.2f);
+    moveRightPot(full, 0.9f);
+    expect(snapshot(full).selection.startPulse == 100U &&
+               snapshot(full).selection.endPulse == 200U,
+           "full-history selection is a Range no-op");
+    midibuffer::setRetainedTimelineFixture(full.algorithm(), 0U, 0U);
+    moveRightPot(full, 0.1f);
+    expect(snapshot(full).selection.startPulse == 100U &&
+               snapshot(full).selection.endPulse == 200U,
+           "empty retained history does not move or rescue the stale pair");
+
+    midibuffer_test::HostDouble stationary;
+    expect(installRangeFixture(stationary, 100U, 200U, 120U, 140U),
+           "stationary domain-rebase fixture installs");
+    seedRightPot(stationary, 0.8f);
+    moveRightPot(stationary, 0.801f);
+    const midibuffer::PulseRange stationaryPair = snapshot(stationary).selection;
+    expect(midibuffer::setRetainedTimelineFixture(stationary.algorithm(),
+                                                   90U, 210U),
+           "retained domain grows around the selected pair");
+    seedRightPot(stationary, 0.801f);
+    const midibuffer::CaptureSnapshot rebased = snapshot(stationary);
+    expect(rebased.selection.startPulse == stationaryPair.startPulse &&
+               rebased.selection.endPulse == stationaryPair.endPulse &&
+               rebased.rangePulseResidual == 0.0 &&
+               rebased.rangePhysicalPosition ==
+                   static_cast<double>(0.801f),
+           "stationary retained-domain change rebases the pair, retains physical baseline, and clears residual");
+    changeParameter(stationary, kPulsesPerDisplayedBeatParameter, 6);
+    beginRightPotZoom(stationary, 0.801f);
+    continueRightPotZoom(stationary, 0.7f);
+    endRightPotZoom(stationary, 0.7f);
+    expect(snapshot(stationary).selection.startPulse == stationaryPair.startPulse &&
+               snapshot(stationary).selection.endPulse == stationaryPair.endPulse,
+           "stationary P and view changes do not remap selection");
+
+    const uint64_t maximum = ~static_cast<uint64_t>(0);
+    const uint64_t wideTravel = static_cast<uint64_t>(1U) << 40U;
+    const uint64_t wideStart = maximum - wideTravel - 100U;
+    midibuffer_test::HostDouble wide;
+    expect(installRangeFixture(wide, wideStart, maximum,
+                               wideStart + 100U,
+                               wideStart + 120U),
+           "wide production-callback range fixture installs near UINT64_MAX");
+    seedRightPot(wide, 0.0f);
+    moveRightPot(wide, 0.5f);
+    const midibuffer::CaptureSnapshot wideMoved = snapshot(wide);
+    expect(wideMoved.selection.endPulse - wideMoved.selection.startPulse == 20U &&
+               wideMoved.selection.startPulse >= wideStart &&
+               wideMoved.selection.endPulse <= maximum,
+           "wide callback motion preserves exact integer length and legal bounds");
+    moveUi(wide, 0U, 0.0f, 0.0f, 0.5f, 0, 127);
+    expect(snapshot(wide).selection.startPulse ==
+                   wideMoved.selection.startPulse + 127U &&
+               snapshot(wide).selection.endPulse ==
+                   wideMoved.selection.endPulse + 127U,
+           "large encoder delta remains one pulse per unit without acceleration");
+    const midibuffer::PulseRange beforeWideRebase = snapshot(wide).selection;
+    expect(midibuffer::setRetainedTimelineFixture(wide.algorithm(),
+                                                   wideStart - 10U,
+                                                   maximum),
+           "wide retained-domain rebase fixture expands safely");
+    seedRightPot(wide, 0.5f);
+    const midibuffer::CaptureSnapshot wideRebased = snapshot(wide);
+    expect(wideRebased.selection.startPulse == beforeWideRebase.startPulse &&
+               wideRebased.selection.endPulse == beforeWideRebase.endPulse &&
+               wideRebased.selection.endPulse -
+                       wideRebased.selection.startPulse ==
+                   20U &&
+               wideRebased.rangePulseResidual == 0.0,
+           "wide stationary domain rebase keeps the actual pair and clears residual");
+}
+
 void verifyRollingHistoryAndSelectionInvalidation() {
     const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
     midibuffer_test::HostDouble sparse;
@@ -1272,6 +1590,14 @@ void verifyRollingHistoryAndSelectionInvalidation() {
     expect(midibuffer::setPulseSelection(sparse.algorithm(), full.oldestPulse,
                                          full.oldestPulse + 1U),
            "pulse-aligned retained range can be selected");
+    seedRightPot(sparse, 0.0f);
+    moveRightPot(sparse, 0.1f);
+    expect(snapshot(sparse).selectionFineTarget ==
+               midibuffer::kSelectionFineTargetRange &&
+               midibuffer::setPulseSelection(
+                   sparse.algorithm(), full.oldestPulse,
+                   full.oldestPulse + 1U),
+           "rolling-history fixture selects Range then restores the oldest pair");
     midibuffer::PulseRange playbackRange = {};
     expect(midibuffer::acquirePlaybackSelection(sparse.algorithm(),
                                                 playbackRange) &&
@@ -1287,6 +1613,10 @@ void verifyRollingHistoryAndSelectionInvalidation() {
            "full history replaces its oldest event and capture continues");
     expect(!overwritten.selectionValid,
            "overwriting selected history clears the selection");
+    moveRightPot(sparse, 0.2f);
+    moveUi(sparse, 0U, 0.0f, 0.0f, 0.2f, 0, 1);
+    expect(!snapshot(sparse).selectionValid,
+           "pot and encoder Range controls do not rescue overwritten history");
     expect(!midibuffer::acquirePlaybackSelection(sparse.algorithm(),
                                                  playbackRange),
            "playback-entry contract refuses an invalidated selection");
@@ -3158,6 +3488,7 @@ int main() {
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();
     verifyShowAllAndRelativeTimelineNavigation();
+    verifyIntegratedRangeMotionAndFineTargets();
     verifyCaptureStopEndings();
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();

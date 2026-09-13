@@ -25,6 +25,12 @@ struct PulseRange {
     uint64_t endPulse;
 };
 
+enum SelectionFineTarget {
+    kSelectionFineTargetStart,
+    kSelectionFineTargetEnd,
+    kSelectionFineTargetRange,
+};
+
 struct CaptureSnapshot {
     uint32_t recordingAllocationBytes;
     uint32_t metadataBytes;
@@ -64,6 +70,11 @@ struct CaptureSnapshot {
     bool activeSelectionValid;
     bool rangeTransitionPending;
     bool lastMovedBoundaryIsStart;
+    bool rangeMotionEstablished;
+    SelectionFineTarget selectionFineTarget;
+    double rangeLogicalPosition;
+    double rangePhysicalPosition;
+    double rangePulseResidual;
     PulseRange selection;
     PulseRange activeSelection;
 };

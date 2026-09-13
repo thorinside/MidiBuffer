@@ -41,13 +41,13 @@ inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 
 verify: test hardware inspect
 
-$(NATIVE_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp tests/host_double.cpp tests/host_double.hpp tests/callback_contract_test.cpp | build
+$(NATIVE_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/host_double.cpp tests/host_double.hpp tests/callback_contract_test.cpp | build
 	$(NATIVE_CXX) $(NATIVE_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/callback_contract_test.cpp -o $@
 
 $(RANGE_MOTION_TEST): src/range_motion.hpp tests/range_motion_test.cpp | build
 	$(NATIVE_CXX) $(COMMON_FLAGS) tests/range_motion_test.cpp -o $@
 
-$(ARM_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp | plugins
+$(ARM_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp | plugins
 	$(ARM_CXX) $(ARM_FLAGS) -c $(SOURCE) -o $@
 
 $(ARM_RANGE_MOTION_OBJECT): src/range_motion.hpp tests/range_motion_arm_compile.cpp | build
