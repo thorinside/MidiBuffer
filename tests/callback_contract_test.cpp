@@ -197,6 +197,32 @@ bool sameHistory(const HistoryImage& expected,
     return true;
 }
 
+bool sameSelectionAndTransport(
+    const midibuffer::CaptureSnapshot& expected,
+    const midibuffer::CaptureSnapshot& actual) {
+    return actual.selectionValid == expected.selectionValid &&
+           actual.selection.startPulse == expected.selection.startPulse &&
+           actual.selection.endPulse == expected.selection.endPulse &&
+           actual.activeSelectionValid == expected.activeSelectionValid &&
+           actual.activeSelection.startPulse ==
+               expected.activeSelection.startPulse &&
+           actual.activeSelection.endPulse == expected.activeSelection.endPulse &&
+           actual.rangeTransitionPending == expected.rangeTransitionPending &&
+           actual.playbackArmed == expected.playbackArmed &&
+           actual.playbackActive == expected.playbackActive &&
+           actual.playbackClockLossPaused ==
+               expected.playbackClockLossPaused &&
+           actual.playbackPulse == expected.playbackPulse &&
+           actual.playbackIntervalOrdinal ==
+               expected.playbackIntervalOrdinal &&
+           actual.playbackEventIndex == expected.playbackEventIndex &&
+           actual.playbackIntervalOpen == expected.playbackIntervalOpen &&
+           actual.playbackNextEventScheduled ==
+               expected.playbackNextEventScheduled &&
+           actual.pendingNextEndingScheduled ==
+               expected.pendingNextEndingScheduled;
+}
+
 bool eventBytesMatch(const midibuffer::RecordedEvent& event, uint8_t status,
                      uint8_t data1, uint8_t data2, uint8_t size = 3U) {
     return event.size == size && event.bytes[0] == status &&
@@ -1108,22 +1134,39 @@ void verifyShowAllAndRelativeTimelineNavigation() {
            "eviction fixture preserves a still-retained selection while shrinking below manual width");
     moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f);
     const midibuffer::CaptureSnapshot evicted = snapshot(navigation);
-    expect(!evicted.timelineShowAll && evicted.timelineScrollPulses == 0U &&
+    expect(!evicted.timelineShowAll && evicted.timelineVisiblePulses == 128U &&
+               evicted.timelineScrollPulses == 0U &&
                evicted.timelineViewStartPulse == 300U &&
                evicted.timelineViewEndPulse == 364U &&
                evicted.selection.startPulse == 320U &&
                evicted.selection.endPulse == 330U,
-           "eviction clamps an end-relative manual view without converting it to Show All");
+           "eviction clips an end-relative manual view without changing its configured width or mode");
+
+    const HistoryImage clippedHistory = captureHistory(navigation);
+    beginRightPotZoom(navigation, 0.5f);
+    continueRightPotZoom(navigation, 0.5f);
+    continueRightPotZoom(navigation, 0.5f);
+    endRightPotZoom(navigation, 0.5f);
+    const midibuffer::CaptureSnapshot clippedReleased = snapshot(navigation);
+    expect(!clippedReleased.timelineShowAll &&
+               clippedReleased.timelineVisiblePulses == 128U &&
+               clippedReleased.timelineViewStartPulse == 300U &&
+               clippedReleased.timelineViewEndPulse == 364U &&
+               sameSelectionAndTransport(evicted, clippedReleased) &&
+               sameHistory(clippedHistory, navigation),
+           "stationary press, repeated held callbacks, and release preserve a clipped manual width, selection, events, and transport");
+
     expect(midibuffer::setRetainedTimelineFixture(navigation.algorithm(),
                                                    300U, 500U),
            "post-eviction growth fixture installs");
     const midibuffer::CaptureSnapshot regrown = snapshot(navigation);
     expect(!regrown.timelineShowAll &&
+               regrown.timelineVisiblePulses == 128U &&
                regrown.timelineViewStartPulse == 372U &&
                regrown.timelineViewEndPulse == 500U &&
-               regrown.selection.startPulse == 320U &&
-               regrown.selection.endPulse == 330U,
-           "manual mode remains end-relative when retained history grows after a fit-all eviction");
+               sameSelectionAndTransport(evicted, regrown) &&
+               sameHistory(clippedHistory, navigation),
+           "the retained span can regrow to [300,500) and restore the configured 128-pulse end-relative view without mutation");
 
     const HistoryImage reversalHistory = captureHistory(navigation);
     beginRightPotZoom(navigation, 0.5f);

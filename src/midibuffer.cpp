@@ -113,7 +113,8 @@ struct Algorithm : public _NT_algorithm {
           pendingEndings(), transportState(kTransportStopped),
           playbackIntervalOrdinal(0), timelineScrollPulses(0),
           timelineVisiblePulses(kDefaultTimelineVisiblePulses),
-          zoomPressVisiblePulses(0), zoomPressCoordinate(0),
+          zoomPressVisiblePulses(0), zoomPressManualVisiblePulses(0),
+          zoomPressCoordinate(0),
           captureEnabled(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
@@ -155,6 +156,7 @@ struct Algorithm : public _NT_algorithm {
     uint64_t timelineScrollPulses;
     uint64_t timelineVisiblePulses;
     uint64_t zoomPressVisiblePulses;
+    uint64_t zoomPressManualVisiblePulses;
     uint32_t zoomPressCoordinate;
 
     bool captureEnabled;
@@ -1955,6 +1957,8 @@ void beginTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
     algorithm.zoomPressCoordinate = coordinate;
     algorithm.zoomPressVisiblePulses =
         timelineVisibleIntervals(algorithm, retained);
+    algorithm.zoomPressManualVisiblePulses =
+        algorithm.timelineVisiblePulses;
     algorithm.zoomPressShowAll = algorithm.timelineShowAll;
 }
 
@@ -1984,7 +1988,7 @@ void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
             algorithm.timelineScrollPulses = 0U;
         } else {
             algorithm.timelineVisiblePulses =
-                algorithm.zoomPressVisiblePulses;
+                algorithm.zoomPressManualVisiblePulses;
             scrollTimeline(algorithm, 0);
         }
         return;
