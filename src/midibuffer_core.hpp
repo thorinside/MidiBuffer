@@ -46,10 +46,12 @@ struct CaptureSnapshot {
     uint32_t pendingNoteEndingCount;
     uint32_t pendingSustainReleaseCount;
     uint32_t pulsesPerDisplayedBeat;
-    uint32_t timelineVisiblePulses;
+    uint64_t timelineVisiblePulses;
+    uint64_t timelineScrollPulses;
     uint64_t retainedPulseIntervals;
     uint64_t timelineViewStartPulse;
     uint64_t timelineViewEndPulse;
+    bool timelineShowAll;
     bool captureEnabled;
     bool clockRunning;
     bool selectionValid;
@@ -70,6 +72,14 @@ struct CaptureSnapshot {
 CaptureSnapshot captureSnapshot(const _NT_algorithm* self);
 bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
                      RecordedEvent& event);
+
+#if defined(MIDIBUFFER_NATIVE_TEST)
+// Installs one synthetic retained interval envelope without iterating through
+// its pulse span. This keeps wide-span callback tests practical while using
+// the production view/navigation implementation.
+bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
+                                uint64_t endPulse);
+#endif
 
 // Timeline selection is pulse-identity based. Playback callers must acquire a
 // range through this contract; it refuses absent, malformed, or stale ranges.

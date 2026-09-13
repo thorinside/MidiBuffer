@@ -67,6 +67,19 @@ void moveUi(midibuffer_test::HostDouble& host, uint16_t controls,
     host.factory()->customUi(host.algorithm(), data);
 }
 
+void beginRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
+    moveUi(host, kNT_potButtonR, 0.0f, 0.0f, pot);
+}
+
+void continueRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
+    moveUi(host, kNT_potButtonR | kNT_potR, 0.0f, 0.0f, pot, 0, 0,
+           kNT_potButtonR);
+}
+
+void endRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
+    moveUi(host, 0U, 0.0f, 0.0f, pot, 0, 0, kNT_potButtonR);
+}
+
 void changeParameter(midibuffer_test::HostDouble& host, size_t parameter,
                      int16_t value) {
     host.setParameter(parameter, value);
@@ -387,8 +400,9 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
     expect((customMask & kNT_encoderL) != 0 &&
                (customMask & kNT_encoderR) != 0 &&
                (customMask & kNT_encoderButtonL) != 0 &&
-               (customMask & kNT_encoderButtonR) != 0,
-           "custom control mask includes rotation, playback toggle, and panic hold");
+               (customMask & kNT_encoderButtonR) != 0 &&
+               (customMask & kNT_potButtonR) != 0,
+           "custom control mask includes rotation, held zoom, playback toggle, and panic hold");
 
     midibuffer_test::resetTrace();
     expect(host.factory()->draw(host.algorithm()),
@@ -820,7 +834,9 @@ void verifyTimelineSelectionDisplayAndControls() {
            "right encoder follows the last-moved start boundary by one pulse");
 
     const midibuffer::PulseRange navigationSelection = fineStart.selection;
-    moveUi(host, kNT_potR, 0.0f, 0.0f, 0.0f);
+    beginRightPotZoom(host, 0.5f);
+    continueRightPotZoom(host, 0.0f);
+    endRightPotZoom(host, 0.0f);
     const midibuffer::CaptureSnapshot zoomed = snapshot(host);
     expect(zoomed.timelineVisiblePulses == 4U &&
                zoomed.selection.startPulse ==
@@ -837,9 +853,13 @@ void verifyTimelineSelectionDisplayAndControls() {
                    navigationSelection.startPulse &&
                scrolled.selection.endPulse == navigationSelection.endPulse,
            "left encoder scrolls three history pulses without moving the selection");
-    moveUi(host, kNT_potR, 0.0f, 0.0f, 4.0f / 6.0f);
-    expect(snapshot(host).timelineVisiblePulses == 64U,
-           "right pot returns the timeline to the 64-interval zoom level");
+    beginRightPotZoom(host, 0.0f);
+    continueRightPotZoom(host, 1.0f);
+    endRightPotZoom(host, 1.0f);
+    expect(snapshot(host).timelineShowAll &&
+               snapshot(host).timelineViewStartPulse == current.oldestPulse &&
+               snapshot(host).timelineViewEndPulse == current.oldestPulse + 64U,
+           "explicit full zoom-out returns the timeline to Show All");
 
     const uint64_t selectedStart = current.oldestPulse + 8U;
     const uint64_t selectedEnd = current.oldestPulse + 24U;
@@ -889,6 +909,197 @@ void verifyTimelineSelectionDisplayAndControls() {
     expect(midibuffer_test::trace().shapeCallCount != 0U &&
                midibuffer_test::litFramebufferPixelCount() != 0U,
            "playing timeline remains rendered through draw traces and framebuffer");
+}
+
+void verifyShowAllAndRelativeTimelineNavigation() {
+    const uint64_t spans[] = {
+        1U,
+        64U,
+        257U,
+        (static_cast<uint64_t>(1U) << 32U) + 257U,
+    };
+    for (int megabytes = 1; megabytes <= 5; ++megabytes) {
+        midibuffer_test::HostDouble host;
+        expect(host.instantiate(megabytes),
+               "Show All fixture constructs at an admitted buffer size");
+        expect(midibuffer::setRetainedTimelineFixture(host.algorithm(), 0U,
+                                                       0U),
+               "empty retained-history fixture installs");
+        const midibuffer::CaptureSnapshot empty = snapshot(host);
+        expect(empty.timelineShowAll && empty.retainedPulseIntervals == 0U &&
+                   empty.timelineViewStartPulse == 0U &&
+                   empty.timelineViewEndPulse == 0U,
+               "fresh empty history has Show All state and only the zero-width baseline");
+
+        for (size_t index = 0; index < ARRAY_SIZE(spans); ++index) {
+            const uint64_t start = 100U + static_cast<uint64_t>(megabytes);
+            const uint64_t end = start + spans[index];
+            expect(midibuffer::setRetainedTimelineFixture(host.algorithm(),
+                                                           start, end),
+                   "retained-span fixture installs without pulse iteration");
+            const midibuffer::CaptureSnapshot current = snapshot(host);
+            expect(current.timelineShowAll &&
+                       current.retainedPulseIntervals == spans[index] &&
+                       current.timelineViewStartPulse == start &&
+                       current.timelineViewEndPulse == end,
+                   "fresh Show All exactly fits every required retained span and buffer size");
+        }
+    }
+
+    midibuffer_test::HostDouble growth;
+    expect(growth.instantiate(1), "Show All growth host constructs");
+    startCapture(growth);
+    acquireClock(growth);
+    sendMidi(growth, 0x90, 60, 100);
+    const midibuffer::CaptureSnapshot first = snapshot(growth);
+    expect(first.retainedPulseIntervals == 1U && first.timelineShowAll &&
+               first.timelineViewStartPulse == first.oldestPulse &&
+               first.timelineViewEndPulse == first.oldestPulse + 1U,
+           "one event keeps its one-interval envelope in Show All");
+    expect(midibuffer::setPulseSelection(growth.algorithm(), first.oldestPulse,
+                                         first.oldestPulse + 1U),
+           "growth fixture selects its initial event interval");
+    const HistoryImage growthHistory = captureHistory(growth);
+    for (uint32_t pulse = 0; pulse < 20U; ++pulse) {
+        clockPulse(growth);
+    }
+    const midibuffer::CaptureSnapshot extended = snapshot(growth);
+    expect(extended.timelineShowAll &&
+               extended.timelineViewStartPulse == first.oldestPulse &&
+               extended.timelineViewEndPulse ==
+                   first.oldestPulse + extended.retainedPulseIntervals &&
+               extended.retainedPulseIntervals > first.retainedPulseIntervals &&
+               extended.selection.startPulse == first.oldestPulse &&
+               extended.selection.endPulse == first.oldestPulse + 1U &&
+               sameHistory(growthHistory, growth),
+           "Show All follows capture-end growth without mutating selection or retained events");
+
+    midibuffer_test::HostDouble navigation;
+    expect(navigation.instantiate(1),
+           "relative held-zoom navigation host constructs");
+    expect(midibuffer::setRetainedTimelineFixture(navigation.algorithm(),
+                                                   100U, 357U) &&
+               midibuffer::setPulseSelection(navigation.algorithm(), 120U,
+                                              140U),
+           "relative zoom fixture installs retained bounds and selection");
+    const HistoryImage navigationHistory = captureHistory(navigation);
+    const midibuffer::CaptureSnapshot beforePress = snapshot(navigation);
+
+    beginRightPotZoom(navigation, 0.37f);
+    const midibuffer::CaptureSnapshot pressed = snapshot(navigation);
+    expect(pressed.timelineShowAll &&
+               pressed.timelineViewStartPulse ==
+                   beforePress.timelineViewStartPulse &&
+               pressed.timelineViewEndPulse == beforePress.timelineViewEndPulse &&
+               pressed.selection.startPulse == beforePress.selection.startPulse &&
+               pressed.selection.endPulse == beforePress.selection.endPulse &&
+               sameHistory(navigationHistory, navigation),
+           "held zoom starts relative to the current view with no press-entry jump");
+
+    continueRightPotZoom(navigation, 0.0f);
+    const midibuffer::CaptureSnapshot zoomedIn = snapshot(navigation);
+    expect(!zoomedIn.timelineShowAll &&
+               zoomedIn.timelineVisiblePulses == 4U &&
+               zoomedIn.timelineViewEndPulse -
+                       zoomedIn.timelineViewStartPulse ==
+                   4U &&
+               zoomedIn.selection.startPulse == beforePress.selection.startPulse &&
+               zoomedIn.selection.endPulse == beforePress.selection.endPulse &&
+               !zoomedIn.playbackArmed && !zoomedIn.playbackActive &&
+               sameHistory(navigationHistory, navigation),
+           "decreasing a held pot zooms in to the four-pulse manual minimum without transport or data mutation");
+    endRightPotZoom(navigation, 0.0f);
+
+    moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f, 3, 0);
+    const midibuffer::CaptureSnapshot older = snapshot(navigation);
+    expect(older.timelineViewStartPulse + 3U ==
+                   zoomedIn.timelineViewStartPulse &&
+               older.timelineViewEndPulse + 3U == zoomedIn.timelineViewEndPulse,
+           "encoder 1 positive delta scrolls exactly one pulse per unit toward older history");
+    moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f, -3, 0);
+    const midibuffer::CaptureSnapshot newer = snapshot(navigation);
+    expect(newer.timelineViewStartPulse == zoomedIn.timelineViewStartPulse &&
+               newer.timelineViewEndPulse == zoomedIn.timelineViewEndPulse,
+           "encoder 1 negative delta reverses precise manual scrolling toward newer history");
+
+    beginRightPotZoom(navigation, 0.0f);
+    const midibuffer::CaptureSnapshot secondPress = snapshot(navigation);
+    expect(!secondPress.timelineShowAll &&
+               secondPress.timelineViewStartPulse == newer.timelineViewStartPulse &&
+               secondPress.timelineViewEndPulse == newer.timelineViewEndPulse,
+           "a second held-zoom press also preserves the current manual view");
+    continueRightPotZoom(navigation, 1.0f);
+    endRightPotZoom(navigation, 1.0f);
+    const midibuffer::CaptureSnapshot shownAll = snapshot(navigation);
+    expect(shownAll.timelineShowAll && shownAll.timelineScrollPulses == 0U &&
+               shownAll.timelineViewStartPulse == 100U &&
+               shownAll.timelineViewEndPulse == 357U &&
+               shownAll.selection.startPulse == beforePress.selection.startPulse &&
+               shownAll.selection.endPulse == beforePress.selection.endPulse &&
+               sameHistory(navigationHistory, navigation),
+           "increasing held movement reaches exact full-span Show All and clears effective scroll");
+    moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f, 127, 0);
+    const midibuffer::CaptureSnapshot showAllNoOp = snapshot(navigation);
+    expect(showAllNoOp.timelineShowAll &&
+               showAllNoOp.timelineScrollPulses == 0U &&
+               showAllNoOp.timelineViewStartPulse == 100U &&
+               showAllNoOp.timelineViewEndPulse == 357U,
+           "encoder scrolling is a no-op that preserves automatic Show All");
+
+    beginRightPotZoom(navigation, 0.5f);
+    continueRightPotZoom(navigation, 0.49f);
+    endRightPotZoom(navigation, 0.49f);
+    const midibuffer::CaptureSnapshot manual = snapshot(navigation);
+    expect(!manual.timelineShowAll &&
+               manual.timelineVisiblePulses == 128U,
+           "a small relative zoom-in leaves Show All at the next manual power-of-two span");
+    moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f, 10, 0);
+    expect(midibuffer::setPulseSelection(navigation.algorithm(), 320U, 330U) &&
+               midibuffer::setRetainedTimelineFixture(navigation.algorithm(),
+                                                       300U, 364U),
+           "eviction fixture preserves a still-retained selection while shrinking below manual width");
+    moveUi(navigation, 0U, 0.0f, 0.0f, 0.0f);
+    const midibuffer::CaptureSnapshot evicted = snapshot(navigation);
+    expect(!evicted.timelineShowAll && evicted.timelineScrollPulses == 0U &&
+               evicted.timelineViewStartPulse == 300U &&
+               evicted.timelineViewEndPulse == 364U &&
+               evicted.selection.startPulse == 320U &&
+               evicted.selection.endPulse == 330U,
+           "eviction clamps an end-relative manual view without converting it to Show All");
+    expect(midibuffer::setRetainedTimelineFixture(navigation.algorithm(),
+                                                   300U, 500U),
+           "post-eviction growth fixture installs");
+    const midibuffer::CaptureSnapshot regrown = snapshot(navigation);
+    expect(!regrown.timelineShowAll &&
+               regrown.timelineViewStartPulse == 372U &&
+               regrown.timelineViewEndPulse == 500U &&
+               regrown.selection.startPulse == 320U &&
+               regrown.selection.endPulse == 330U,
+           "manual mode remains end-relative when retained history grows after a fit-all eviction");
+
+    midibuffer_test::HostDouble wideZoom;
+    const uint64_t wideSpan =
+        (static_cast<uint64_t>(1U) << 32U) + 257U;
+    expect(wideZoom.instantiate(5) &&
+               midibuffer::setRetainedTimelineFixture(wideZoom.algorithm(),
+                                                       100U,
+                                                       100U + wideSpan),
+           "wide held-zoom fixture installs beyond the uint32 range");
+    beginRightPotZoom(wideZoom, 0.5f);
+    continueRightPotZoom(wideZoom, 0.0f);
+    endRightPotZoom(wideZoom, 0.0f);
+    expect(!snapshot(wideZoom).timelineShowAll &&
+               snapshot(wideZoom).timelineVisiblePulses == 4U,
+           "held zoom reaches the manual minimum from a span beyond 2^32");
+    beginRightPotZoom(wideZoom, 0.0f);
+    continueRightPotZoom(wideZoom, 1.0f);
+    endRightPotZoom(wideZoom, 1.0f);
+    const midibuffer::CaptureSnapshot wideShownAll = snapshot(wideZoom);
+    expect(wideShownAll.timelineShowAll &&
+               wideShownAll.timelineScrollPulses == 0U &&
+               wideShownAll.timelineViewStartPulse == 100U &&
+               wideShownAll.timelineViewEndPulse == 100U + wideSpan,
+           "full held zoom-out reaches exact Show All beyond 2^32 without a 256 or uint32 cap");
 }
 
 void verifyRollingHistoryAndSelectionInvalidation() {
@@ -2407,7 +2618,9 @@ void verifyCompletePresetRoundTripsAndContinuation() {
     changeParameter(source, kFilterPitchBendParameter, 1);
     changeParameter(source, kPulsesPerDisplayedBeatParameter, 5);
     beginTransportOnHeldFirstBeat(source, fixture, 16U, 4U);
-    moveUi(source, kNT_potR, 0.0f, 0.0f, 0.0f);
+    beginRightPotZoom(source, 0.5f);
+    continueRightPotZoom(source, 0.0f);
+    endRightPotZoom(source, 0.0f);
     moveUi(source, kNT_potL, 0.75f, 0.0f, 0.0f);
     const midibuffer::CaptureSnapshot saved = snapshot(source);
     expect(saved.playbackActive && saved.rangeTransitionPending &&
@@ -2789,6 +3002,7 @@ int main() {
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();
+    verifyShowAllAndRelativeTimelineNavigation();
     verifyCaptureStopEndings();
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();

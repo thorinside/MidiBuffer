@@ -17,9 +17,9 @@ const float kGateThresholdVolts = 1.0f;
 const uint32_t kClockAverageWindow = 8U;
 const uint32_t kRecordedEventFlagCaptureEnding = 0x01U;
 const uint32_t kRecordedEventEndingIndexShift = 1U;
-const uint32_t kDefaultTimelineVisiblePulses = 64U;
-const uint32_t kTimelineMinimumVisiblePulses = 4U;
-const uint32_t kTimelineMaximumVisiblePulses = 256U;
+const uint64_t kDefaultTimelineVisiblePulses = 64U;
+const uint64_t kTimelineMinimumVisiblePulses = 4U;
+const uint32_t kTimelineLegacyMaximumVisiblePulses = 256U;
 const uint32_t kTimelineCoordinateMaximum = 65535U;
 
 static_assert(sizeof(RecordedEvent) == 24,
@@ -113,12 +113,14 @@ struct Algorithm : public _NT_algorithm {
           pendingEndings(), transportState(kTransportStopped),
           playbackIntervalOrdinal(0), timelineScrollPulses(0),
           timelineVisiblePulses(kDefaultTimelineVisiblePulses),
+          zoomPressVisiblePulses(0), zoomPressCoordinate(0),
           captureEnabled(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
           rangeTransitionPending(false), playbackPositionValid(false),
           playbackIntervalOpen(false), playbackNextEventScheduled(false),
           pendingNextEndingScheduled(false), lastMovedBoundaryIsStart(false),
+          timelineShowAll(true), rightPotZoomActive(false),
           rightEncoderHoldActive(false), rightEncoderPanicFired(false),
           pendingNextEndingSample(0), rightEncoderHoldStartSample(0) {}
 
@@ -150,7 +152,9 @@ struct Algorithm : public _NT_algorithm {
     TransportState transportState;
     uint64_t playbackIntervalOrdinal;
     uint64_t timelineScrollPulses;
-    uint32_t timelineVisiblePulses;
+    uint64_t timelineVisiblePulses;
+    uint64_t zoomPressVisiblePulses;
+    uint32_t zoomPressCoordinate;
 
     bool captureEnabled;
     bool clockRunning;
@@ -165,6 +169,8 @@ struct Algorithm : public _NT_algorithm {
     bool playbackNextEventScheduled;
     bool pendingNextEndingScheduled;
     bool lastMovedBoundaryIsStart;
+    bool timelineShowAll;
+    bool rightPotZoomActive;
     bool rightEncoderHoldActive;
     bool rightEncoderPanicFired;
     uint64_t pendingNextEndingSample;
@@ -1768,6 +1774,16 @@ uint64_t retainedTimelineIntervals(const Algorithm& algorithm) {
     return retainedTimelineBounds(algorithm, start, end) ? end - start : 0;
 }
 
+uint64_t timelineVisibleIntervals(const Algorithm& algorithm,
+                                  uint64_t retained) {
+    if (algorithm.timelineShowAll) {
+        return retained;
+    }
+    return algorithm.timelineVisiblePulses < retained
+               ? algorithm.timelineVisiblePulses
+               : retained;
+}
+
 void timelineViewBounds(const Algorithm& algorithm, uint64_t& start,
                         uint64_t& end) {
     uint64_t retainedStart = 0;
@@ -1778,11 +1794,15 @@ void timelineViewBounds(const Algorithm& algorithm, uint64_t& start,
         return;
     }
 
+    if (algorithm.timelineShowAll) {
+        start = retainedStart;
+        end = retainedEnd;
+        return;
+    }
+
     const uint64_t retained = retainedEnd - retainedStart;
     const uint64_t visible =
-        algorithm.timelineVisiblePulses < retained
-            ? algorithm.timelineVisiblePulses
-            : retained;
+        timelineVisibleIntervals(algorithm, retained);
     const uint64_t maximumScroll = retained - visible;
     const uint64_t scroll = algorithm.timelineScrollPulses < maximumScroll
                                 ? algorithm.timelineScrollPulses
@@ -1863,11 +1883,13 @@ void adjustLastTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
 }
 
 void scrollTimeline(Algorithm& algorithm, int delta) {
+    if (algorithm.timelineShowAll) {
+        algorithm.timelineScrollPulses = 0;
+        return;
+    }
+
     const uint64_t retained = retainedTimelineIntervals(algorithm);
-    const uint64_t visible =
-        algorithm.timelineVisiblePulses < retained
-            ? algorithm.timelineVisiblePulses
-            : retained;
+    const uint64_t visible = timelineVisibleIntervals(algorithm, retained);
     const uint64_t maximumScroll = retained - visible;
     if (algorithm.timelineScrollPulses > maximumScroll) {
         algorithm.timelineScrollPulses = maximumScroll;
@@ -1887,9 +1909,122 @@ void scrollTimeline(Algorithm& algorithm, int delta) {
     }
 }
 
+uint32_t zoomStepCount(uint64_t start, uint64_t target, bool zoomOut) {
+    uint32_t count = 0;
+    while (start != target) {
+        if (zoomOut) {
+            start = start > target / 2U ? target : start * 2U;
+        } else {
+            const uint64_t halved = start / 2U;
+            start = halved < target ? target : halved;
+        }
+        ++count;
+    }
+    return count;
+}
+
+uint32_t relativeZoomSteps(uint32_t distance, uint32_t available,
+                           uint32_t stepCount) {
+    if (distance == 0U || available == 0U || stepCount == 0U) {
+        return 0U;
+    }
+    uint32_t remainder = 0;
+    return static_cast<uint32_t>(divideUnsigned64By32(
+        static_cast<uint64_t>(distance) * stepCount + available - 1U,
+        available, remainder));
+}
+
+uint64_t applyZoomSteps(uint64_t span, uint64_t limit, uint32_t steps,
+                        bool zoomOut) {
+    while (steps-- != 0U && span != limit) {
+        if (zoomOut) {
+            span = span > limit / 2U ? limit : span * 2U;
+        } else {
+            const uint64_t halved = span / 2U;
+            span = halved < limit ? limit : halved;
+        }
+    }
+    return span;
+}
+
+void beginTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
+    const uint64_t retained = retainedTimelineIntervals(algorithm);
+    algorithm.rightPotZoomActive = true;
+    algorithm.zoomPressCoordinate = coordinate;
+    algorithm.zoomPressVisiblePulses =
+        timelineVisibleIntervals(algorithm, retained);
+}
+
+void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
+    if (!algorithm.rightPotZoomActive ||
+        coordinate == algorithm.zoomPressCoordinate) {
+        return;
+    }
+
+    const uint64_t retained = retainedTimelineIntervals(algorithm);
+    if (retained == 0U) {
+        return;
+    }
+    uint64_t startSpan =
+        algorithm.zoomPressVisiblePulses < retained
+            ? algorithm.zoomPressVisiblePulses
+            : retained;
+    if (startSpan == 0U) {
+        startSpan = retained;
+    }
+    const uint64_t minimum = retained < kTimelineMinimumVisiblePulses
+                                 ? retained
+                                 : kTimelineMinimumVisiblePulses;
+
+    if (coordinate > algorithm.zoomPressCoordinate) {
+        if (startSpan >= retained) {
+            algorithm.timelineShowAll = true;
+            algorithm.timelineScrollPulses = 0;
+            return;
+        }
+        const uint32_t totalSteps =
+            zoomStepCount(startSpan, retained, true);
+        const uint32_t steps = relativeZoomSteps(
+            coordinate - algorithm.zoomPressCoordinate,
+            kTimelineCoordinateMaximum - algorithm.zoomPressCoordinate,
+            totalSteps);
+        const uint64_t span =
+            applyZoomSteps(startSpan, retained, steps, true);
+        if (span == retained) {
+            algorithm.timelineShowAll = true;
+            algorithm.timelineScrollPulses = 0;
+        } else {
+            algorithm.timelineShowAll = false;
+            algorithm.timelineVisiblePulses = span;
+            scrollTimeline(algorithm, 0);
+        }
+        return;
+    }
+
+    if (startSpan <= minimum) {
+        algorithm.timelineShowAll = false;
+        algorithm.timelineVisiblePulses = kTimelineMinimumVisiblePulses;
+        scrollTimeline(algorithm, 0);
+        return;
+    }
+    const uint32_t totalSteps =
+        zoomStepCount(startSpan, minimum, false);
+    const uint32_t steps = relativeZoomSteps(
+        algorithm.zoomPressCoordinate - coordinate,
+        algorithm.zoomPressCoordinate, totalSteps);
+    const uint64_t span =
+        applyZoomSteps(startSpan, minimum, steps, false);
+    if (span < retained) {
+        algorithm.timelineShowAll = false;
+        algorithm.timelineVisiblePulses = span;
+        scrollTimeline(algorithm, 0);
+    }
+}
+
 uint32_t hasCustomUi(_NT_algorithm*) {
-    return kNT_potL | kNT_potC | kNT_potR | kNT_encoderL | kNT_encoderR |
-           kNT_encoderButtonL | kNT_encoderButtonR;
+    return kNT_potL | kNT_potC | kNT_potR | kNT_potButtonR |
+           kNT_encoderL | kNT_encoderR | kNT_encoderButtonL |
+           kNT_encoderButtonR;
 }
 
 void updateRightEncoderPanic(Algorithm& algorithm, const _NT_uiData& data) {
@@ -1960,19 +2095,19 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
             pulseFromPot(algorithm->selection.startPulse + 1U,
                          algorithm->historyEndPulseExclusive, data.pots[1]));
     }
-    if ((data.controls & kNT_potR) != 0U) {
+    const bool rightPotHeld =
+        (data.controls & kNT_potButtonR) != 0U;
+    const bool rightPotWasHeld =
+        (data.lastButtons & kNT_potButtonR) != 0U;
+    if (rightPotHeld) {
         const uint32_t coordinate = normalizedTimelinePot(data.pots[2]);
-        const uint32_t zoomIndex =
-            (coordinate * 6U + kTimelineCoordinateMaximum / 2U) /
-            kTimelineCoordinateMaximum;
-        algorithm->timelineVisiblePulses =
-            kTimelineMinimumVisiblePulses << zoomIndex;
-        if (algorithm->timelineVisiblePulses >
-            kTimelineMaximumVisiblePulses) {
-            algorithm->timelineVisiblePulses =
-                kTimelineMaximumVisiblePulses;
+        if (!rightPotWasHeld || !algorithm->rightPotZoomActive) {
+            beginTimelineZoom(*algorithm, coordinate);
+        } else {
+            updateTimelineZoom(*algorithm, coordinate);
         }
-        scrollTimeline(*algorithm, 0);
+    } else {
+        algorithm->rightPotZoomActive = false;
     }
     scrollTimeline(*algorithm, data.encoders[0]);
     adjustLastTimelineBoundary(self, *algorithm, data.encoders[1]);
@@ -2482,7 +2617,7 @@ bool parseU32State(_NT_jsonParse& parse, Algorithm& algorithm) {
         (value[1] != 0U && value[2] >= value[1]) ||
         value[6] >= kClockAverageWindow || value[7] > kClockAverageWindow ||
         value[5] > value[3] || value[8] < kTimelineMinimumVisiblePulses ||
-        value[8] > kTimelineMaximumVisiblePulses) {
+        value[8] > kTimelineLegacyMaximumVisiblePulses) {
         return false;
     }
     algorithm.eventHead = value[2];
@@ -2708,10 +2843,12 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
         algorithm->pendingEndings.sustainCount;
     snapshot.pulsesPerDisplayedBeat = pulsesPerDisplayedBeat(*algorithm);
     snapshot.timelineVisiblePulses = algorithm->timelineVisiblePulses;
+    snapshot.timelineScrollPulses = algorithm->timelineScrollPulses;
     snapshot.retainedPulseIntervals =
         retainedTimelineIntervals(*algorithm);
     timelineViewBounds(*algorithm, snapshot.timelineViewStartPulse,
                        snapshot.timelineViewEndPulse);
+    snapshot.timelineShowAll = algorithm->timelineShowAll;
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
@@ -2759,6 +2896,31 @@ bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
     event = algorithm->recordingEvents[ringIndex];
     return true;
 }
+
+#if defined(MIDIBUFFER_NATIVE_TEST)
+bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
+                                uint64_t endPulse) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || algorithm->eventCapacity == 0U) {
+        return false;
+    }
+    algorithm->eventHead = 0U;
+    algorithm->eventCount = endPulse > startPulse ? 1U : 0U;
+    algorithm->historyEndPulseExclusive =
+        endPulse > startPulse ? endPulse : 0U;
+    if (algorithm->eventCount != 0U) {
+        RecordedEvent event = {};
+        event.pulse = startPulse;
+        event.sourceIntervalSamples = 1U;
+        event.bytes[0] = 0x90U;
+        event.bytes[1] = 60U;
+        event.bytes[2] = 100U;
+        event.size = 3U;
+        algorithm->recordingEvents[0] = event;
+    }
+    return true;
+}
+#endif
 
 bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
                        uint64_t endPulse) {
