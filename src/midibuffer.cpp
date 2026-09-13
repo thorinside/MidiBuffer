@@ -4,6 +4,7 @@
 #include <new>
 #include <stdint.h>
 
+#include "midibuffer_core.hpp"
 #include "nt_host.hpp"
 
 namespace midibuffer {
@@ -13,9 +14,14 @@ const uint32_t kBytesPerMegabyte = 1000000U;
 const int32_t kDefaultBufferMegabytes = 1;
 const float kGateThresholdVolts = 1.0f;
 
+static_assert(sizeof(RecordedEvent) == 16,
+              "recording event size is part of capacity accounting");
+
 enum Parameter {
     kParameterClock,
     kParameterReset,
+    kParameterCapture,
+    kParameterRecordingChannel,
     kNumParameters,
 };
 
@@ -33,29 +39,85 @@ struct CallbackState {
     uint32_t uiChanges;
     uint8_t lastMidi[3];
     uint8_t lastRealtime;
-    bool clockHigh;
-    bool resetHigh;
 };
 
 struct Algorithm : public _NT_algorithm {
-    Algorithm(uint8_t* recordingBufferValue, uint32_t recordingBufferBytesValue)
-        : recordingBuffer(recordingBufferValue),
+    Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
+        : _NT_algorithm(),
+          recordingEvents(reinterpret_cast<RecordedEvent*>(recordingBuffer)),
           recordingBufferBytes(recordingBufferBytesValue),
-          state() {}
+          eventCapacity(recordingBufferBytesValue / sizeof(RecordedEvent)),
+          eventHead(0), eventCount(0), sampleCursor(0), currentPulse(0),
+          lastPulseSample(0), lastClockIntervalSamples(0), selection(), state(),
+          captureEnabled(false), clockRunning(false),
+          haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
+          selectionValid(false) {}
 
-    uint8_t* recordingBuffer;
+    RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
+    uint32_t eventCapacity;
+    uint32_t eventHead;
+    uint32_t eventCount;
+
+    uint64_t sampleCursor;
+    uint64_t currentPulse;
+    uint64_t lastPulseSample;
+    uint64_t lastClockIntervalSamples;
+    PulseRange selection;
     CallbackState state;
+
+    bool captureEnabled;
+    bool clockRunning;
+    bool haveAcquisitionPulse;
+    bool clockHigh;
+    bool resetHigh;
+    bool selectionValid;
 };
 
+static const char* const kCaptureStrings[] = {
+    "Stop Capture",
+    "Start Capture",
+};
+
+static const char* const kRecordingChannelStrings[] = {
+    "Omni", "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",
+    "9",    "10", "11", "12", "13", "14", "15", "16",
+};
+
+// The API macros include their own trailing commas.
+// clang-format off
 static const _NT_parameter kParameters[] = {
     NT_PARAMETER_CV_INPUT("Clock", 1, 1)
     NT_PARAMETER_CV_INPUT("Reset", 1, 2)
+    {
+        .name = "Capture",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kCaptureStrings,
+    },
+    {
+        .name = "Record Ch",
+        .min = 0,
+        .max = 16,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kRecordingChannelStrings,
+    },
 };
+// clang-format on
 
 static const uint8_t kInputPageParameters[] = {
     kParameterClock,
     kParameterReset,
+};
+
+static const uint8_t kCapturePageParameters[] = {
+    kParameterCapture,
+    kParameterRecordingChannel,
 };
 
 static const _NT_parameterPage kParameterPageDefinitions[] = {
@@ -65,6 +127,13 @@ static const _NT_parameterPage kParameterPageDefinitions[] = {
         .group = 0,
         .unused = {0, 0},
         .params = kInputPageParameters,
+    },
+    {
+        .name = "Capture",
+        .numParams = ARRAY_SIZE(kCapturePageParameters),
+        .group = 0,
+        .unused = {0, 0},
+        .params = kCapturePageParameters,
     },
 };
 
@@ -96,12 +165,16 @@ int32_t bufferMegabytes(const int32_t* specifications) {
     return value;
 }
 
+uint32_t requestedRecordingBytes(const int32_t* specifications) {
+    return static_cast<uint32_t>(bufferMegabytes(specifications)) *
+           kBytesPerMegabyte;
+}
+
 void calculateRequirements(_NT_algorithmRequirements& requirements,
                            const int32_t* specifications) {
     requirements.numParameters = kNumParameters;
     requirements.sram = sizeof(Algorithm);
-    requirements.dram =
-        static_cast<uint32_t>(bufferMegabytes(specifications)) * kBytesPerMegabyte;
+    requirements.dram = requestedRecordingBytes(specifications);
     requirements.dtc = 0;
     requirements.itc = 0;
 }
@@ -109,15 +182,15 @@ void calculateRequirements(_NT_algorithmRequirements& requirements,
 _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
                          const _NT_algorithmRequirements& requirements,
                          const int32_t* specifications) {
+    const uint32_t recordingBytes = requestedRecordingBytes(specifications);
     if (memory.sram == NULL || memory.dram == NULL ||
         requirements.sram < sizeof(Algorithm) ||
-        requirements.dram < static_cast<uint32_t>(bufferMegabytes(specifications)) *
-                                kBytesPerMegabyte) {
+        requirements.dram < recordingBytes) {
         return NULL;
     }
 
     Algorithm* algorithm =
-        new (memory.sram) Algorithm(memory.dram, requirements.dram);
+        new (memory.sram) Algorithm(memory.dram, recordingBytes);
     algorithm->parameters = kParameters;
     algorithm->parameterPages = &kParameterPages;
     return algorithm;
@@ -125,40 +198,156 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
 
 void parameterChanged(_NT_algorithm* self, int parameter) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
-    if (algorithm != NULL && parameter >= 0 && parameter < kNumParameters) {
-        ++algorithm->state.parameterChanges;
+    if (algorithm == NULL || parameter < 0 || parameter >= kNumParameters) {
+        return;
+    }
+
+    ++algorithm->state.parameterChanges;
+    if (parameter == kParameterCapture && algorithm->v != NULL) {
+        algorithm->captureEnabled = algorithm->v[kParameterCapture] !=
+                                    kParameters[kParameterCapture].min;
+    } else if (parameter == kParameterClock) {
+        // A newly routed input must acquire its own edge rather than inherit
+        // the previous input's gate level.
+        algorithm->clockHigh = false;
+    } else if (parameter == kParameterReset) {
+        algorithm->resetHigh = false;
     }
 }
 
-void scanGate(const float* frames, int numFrames, bool& wasHigh,
-              uint32_t& edgeCount) {
-    for (int frame = 0; frame < numFrames; ++frame) {
-        const bool high = frames[frame] > kGateThresholdVolts;
-        if (high && !wasHigh) {
-            ++edgeCount;
+void clearSelection(Algorithm& algorithm) {
+    algorithm.selectionValid = false;
+    algorithm.selection.startPulse = 0;
+    algorithm.selection.endPulse = 0;
+}
+
+bool pulseInsideSelection(const Algorithm& algorithm, uint64_t pulse) {
+    return algorithm.selectionValid &&
+           pulse >= algorithm.selection.startPulse &&
+           pulse <= algorithm.selection.endPulse;
+}
+
+uint32_t nextRingIndex(uint32_t index, uint32_t capacity) {
+    ++index;
+    return index == capacity ? 0 : index;
+}
+
+void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
+    if (algorithm.eventCapacity == 0) {
+        return;
+    }
+
+    uint32_t writeIndex = 0;
+    if (algorithm.eventCount == algorithm.eventCapacity) {
+        writeIndex = algorithm.eventHead;
+        if (pulseInsideSelection(algorithm,
+                                 algorithm.recordingEvents[writeIndex].pulse)) {
+            clearSelection(algorithm);
         }
-        wasHigh = high;
+        algorithm.eventHead =
+            nextRingIndex(algorithm.eventHead, algorithm.eventCapacity);
+    } else {
+        writeIndex = algorithm.eventHead + algorithm.eventCount;
+        if (writeIndex >= algorithm.eventCapacity) {
+            writeIndex -= algorithm.eventCapacity;
+        }
+        ++algorithm.eventCount;
+    }
+    algorithm.recordingEvents[writeIndex] = event;
+}
+
+void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
+    ++algorithm.state.clockEdges;
+    ++algorithm.currentPulse;
+
+    if (algorithm.clockRunning) {
+        const uint64_t interval = sample - algorithm.lastPulseSample;
+        if (interval != 0) {
+            algorithm.lastClockIntervalSamples = interval;
+        }
+        algorithm.lastPulseSample = sample;
+        return;
+    }
+
+    if (!algorithm.haveAcquisitionPulse) {
+        algorithm.haveAcquisitionPulse = true;
+        algorithm.lastPulseSample = sample;
+        return;
+    }
+
+    const uint64_t interval = sample - algorithm.lastPulseSample;
+    algorithm.lastPulseSample = sample;
+    if (interval != 0) {
+        algorithm.lastClockIntervalSamples = interval;
+        algorithm.clockRunning = true;
+        algorithm.haveAcquisitionPulse = false;
+    }
+}
+
+void detectClockLoss(Algorithm& algorithm, uint64_t sample) {
+    if (!algorithm.clockRunning) {
+        return;
+    }
+
+    const uint64_t maximumInterval = ~static_cast<uint64_t>(0) / 2U;
+    const uint64_t lossDelay =
+        algorithm.lastClockIntervalSamples > maximumInterval
+            ? ~static_cast<uint64_t>(0)
+            : algorithm.lastClockIntervalSamples * 2U;
+    if (sample - algorithm.lastPulseSample >= lossDelay) {
+        algorithm.clockRunning = false;
+        algorithm.haveAcquisitionPulse = false;
+        algorithm.lastClockIntervalSamples = 0;
     }
 }
 
 void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL || algorithm->v == NULL || busFrames == NULL ||
-        numFramesBy4 <= 0) {
+        numFramesBy4 <= 0 || numFramesBy4 > 0x1fffffff) {
         return;
     }
 
     const int numFrames = numFramesBy4 * 4;
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
-    if (clockBus >= 1 && clockBus <= kNT_lastBus) {
-        scanGate(busFrames + (clockBus - 1) * numFrames, numFrames,
-                 algorithm->state.clockHigh, algorithm->state.clockEdges);
+    const float* clockFrames = clockBus >= 1 && clockBus <= kNT_lastBus
+                                   ? busFrames + (clockBus - 1) * numFrames
+                                   : NULL;
+    const float* resetFrames = resetBus >= 1 && resetBus <= kNT_lastBus
+                                   ? busFrames + (resetBus - 1) * numFrames
+                                   : NULL;
+
+    for (int frame = 0; frame < numFrames; ++frame) {
+        const bool clockHigh =
+            clockFrames != NULL && clockFrames[frame] > kGateThresholdVolts;
+        if (clockHigh && !algorithm->clockHigh) {
+            handleClockEdge(*algorithm, algorithm->sampleCursor);
+        } else {
+            detectClockLoss(*algorithm, algorithm->sampleCursor);
+        }
+        algorithm->clockHigh = clockHigh;
+
+        const bool resetHigh =
+            resetFrames != NULL && resetFrames[frame] > kGateThresholdVolts;
+        if (resetHigh && !algorithm->resetHigh) {
+            ++algorithm->state.resetEdges;
+        }
+        algorithm->resetHigh = resetHigh;
+        ++algorithm->sampleCursor;
     }
-    if (resetBus >= 1 && resetBus <= kNT_lastBus) {
-        scanGate(busFrames + (resetBus - 1) * numFrames, numFrames,
-                 algorithm->state.resetHigh, algorithm->state.resetEdges);
-    }
+}
+
+bool eligibleStatus(uint8_t status) {
+    const uint8_t messageType = status & 0xf0U;
+    return messageType == 0x80U || messageType == 0x90U ||
+           messageType == 0xa0U || messageType == 0xb0U ||
+           messageType == 0xd0U || messageType == 0xe0U;
+}
+
+bool excludedController(uint8_t controller) {
+    return controller == 6U || controller == 38U ||
+           (controller >= 96U && controller <= 101U) || controller >= 120U;
 }
 
 void midiRealtime(_NT_algorithm* self, uint8_t byte) {
@@ -180,6 +369,38 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     algorithm->state.lastMidi[0] = byte0;
     algorithm->state.lastMidi[1] = byte1;
     algorithm->state.lastMidi[2] = byte2;
+
+    if (!algorithm->captureEnabled || !algorithm->clockRunning ||
+        !eligibleStatus(byte0)) {
+        return;
+    }
+
+    const uint8_t channel = static_cast<uint8_t>((byte0 & 0x0fU) + 1U);
+    int recordingChannel = 0;
+    if (algorithm->v != NULL) {
+        recordingChannel = algorithm->v[kParameterRecordingChannel];
+    }
+    if (recordingChannel < 0 || recordingChannel > 16) {
+        recordingChannel = 0;
+    }
+    if (recordingChannel != 0 && channel != recordingChannel) {
+        return;
+    }
+    if ((byte0 & 0xf0U) == 0xb0U && excludedController(byte1)) {
+        return;
+    }
+
+    uint64_t offset = algorithm->sampleCursor - algorithm->lastPulseSample;
+    if (offset > 0xffffffffULL) {
+        offset = 0xffffffffULL;
+    }
+    RecordedEvent event = {
+        algorithm->currentPulse,
+        static_cast<uint32_t>(offset),
+        {byte0, byte1, byte2},
+        static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
+    };
+    appendEvent(*algorithm, event);
 }
 
 uint32_t hasCustomUi(_NT_algorithm*) {
@@ -235,11 +456,15 @@ bool draw(_NT_algorithm* self) {
     }
 
     nt_host::drawText(0, 8, "MidiBuffer");
-    drawCounter(18, "Clock: ", algorithm->state.clockEdges);
-    drawCounter(28, "Reset: ", algorithm->state.resetEdges);
-    drawCounter(38, "MIDI: ", algorithm->state.channelMessages);
-    drawCounter(48, "RT: ", algorithm->state.realtimeMessages);
-    drawCounter(58, "UI: ", algorithm->state.uiChanges);
+    nt_host::drawText(0, 18,
+                      algorithm->captureEnabled ? "Capture: Started"
+                                                : "Capture: Stopped");
+    nt_host::drawText(
+        0, 28, algorithm->clockRunning ? "Clock: Running" : "Clock: Acquiring");
+    drawCounter(38, "Events: ", algorithm->eventCount);
+    drawCounter(48, "Capacity: ", algorithm->eventCapacity);
+    nt_host::drawText(
+        0, 58, algorithm->selectionValid ? "Selected: Yes" : "Selected: No");
     return false;
 }
 
@@ -269,13 +494,110 @@ static const _NT_factory kFactory = {
     .parameterString = NULL,
 };
 
-}  // namespace
+const Algorithm* asAlgorithm(const _NT_algorithm* self) {
+    return static_cast<const Algorithm*>(self);
+}
+
+Algorithm* asAlgorithm(_NT_algorithm* self) {
+    return static_cast<Algorithm*>(self);
+}
+
+} // namespace
+
+CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
+    CaptureSnapshot snapshot = {};
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return snapshot;
+    }
+
+    snapshot.recordingAllocationBytes = algorithm->recordingBufferBytes;
+    snapshot.metadataBytes = sizeof(Algorithm);
+    snapshot.eventCapacity = algorithm->eventCapacity;
+    snapshot.eventCount = algorithm->eventCount;
+    snapshot.currentPulse = algorithm->currentPulse;
+    snapshot.lastClockIntervalSamples = algorithm->lastClockIntervalSamples;
+    snapshot.captureEnabled = algorithm->captureEnabled;
+    snapshot.clockRunning = algorithm->clockRunning;
+    snapshot.selectionValid = algorithm->selectionValid;
+    snapshot.selection = algorithm->selection;
+    if (algorithm->eventCount != 0) {
+        snapshot.oldestPulse =
+            algorithm->recordingEvents[algorithm->eventHead].pulse;
+        uint32_t newestIndex =
+            algorithm->eventHead + algorithm->eventCount - 1U;
+        if (newestIndex >= algorithm->eventCapacity) {
+            newestIndex -= algorithm->eventCapacity;
+        }
+        snapshot.newestPulse = algorithm->recordingEvents[newestIndex].pulse;
+    }
+    return snapshot;
+}
+
+bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
+                     RecordedEvent& event) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || oldestFirstIndex >= algorithm->eventCount) {
+        return false;
+    }
+
+    uint32_t ringIndex = algorithm->eventHead + oldestFirstIndex;
+    if (ringIndex >= algorithm->eventCapacity) {
+        ringIndex -= algorithm->eventCapacity;
+    }
+    event = algorithm->recordingEvents[ringIndex];
+    return true;
+}
+
+bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
+                       uint64_t endPulse) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || algorithm->eventCount == 0 ||
+        startPulse >= endPulse) {
+        return false;
+    }
+
+    const uint64_t oldestPulse =
+        algorithm->recordingEvents[algorithm->eventHead].pulse;
+    if (startPulse < oldestPulse || endPulse > algorithm->currentPulse) {
+        return false;
+    }
+
+    algorithm->selection.startPulse = startPulse;
+    algorithm->selection.endPulse = endPulse;
+    algorithm->selectionValid = true;
+    return true;
+}
+
+void clearPulseSelection(_NT_algorithm* self) {
+    Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm != NULL) {
+        clearSelection(*algorithm);
+    }
+}
+
+bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL || !algorithm->selectionValid ||
+        algorithm->eventCount == 0 ||
+        algorithm->selection.startPulse >= algorithm->selection.endPulse) {
+        return false;
+    }
+
+    const uint64_t oldestPulse =
+        algorithm->recordingEvents[algorithm->eventHead].pulse;
+    if (algorithm->selection.startPulse < oldestPulse ||
+        algorithm->selection.endPulse > algorithm->currentPulse) {
+        return false;
+    }
+
+    range = algorithm->selection;
+    return true;
+}
 
 namespace nt_host {
 
-void drawText(int x, int y, const char* text) {
-    NT_drawText(x, y, text);
-}
+void drawText(int x, int y, const char* text) { NT_drawText(x, y, text); }
 
 void sendMidiByte(uint32_t destination, uint8_t byte0) {
     NT_sendMidiByte(destination, byte0);
@@ -290,18 +612,18 @@ void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1,
     NT_sendMidi3ByteMessage(destination, byte0, byte1, byte2);
 }
 
-}  // namespace nt_host
-}  // namespace midibuffer
+} // namespace nt_host
+} // namespace midibuffer
 
 extern "C" uintptr_t pluginEntry(_NT_selector selector, uint32_t data) {
     switch (selector) {
-        case kNT_selector_version:
-            return kNT_apiVersion13;
-        case kNT_selector_numFactories:
-            return 1;
-        case kNT_selector_factoryInfo:
-            return reinterpret_cast<uintptr_t>(data == 0 ? &midibuffer::kFactory
-                                                         : NULL);
+    case kNT_selector_version:
+        return kNT_apiVersion13;
+    case kNT_selector_numFactories:
+        return 1;
+    case kNT_selector_factoryInfo:
+        return reinterpret_cast<uintptr_t>(data == 0 ? &midibuffer::kFactory
+                                                     : NULL);
     }
     return 0;
 }

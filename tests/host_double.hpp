@@ -35,6 +35,8 @@ class HostDouble {
   public:
     HostDouble();
     ~HostDouble();
+    HostDouble(const HostDouble&) = delete;
+    HostDouble& operator=(const HostDouble&) = delete;
 
     bool instantiate(int32_t bufferMegabytes);
     _NT_algorithm* algorithm();

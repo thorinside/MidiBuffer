@@ -1,11 +1,17 @@
 #include "host_double.hpp"
 
+#include "../src/midibuffer_core.hpp"
 #include "../src/nt_host.hpp"
 
 #include <cstdio>
 #include <cstring>
 
 namespace {
+
+const size_t kClockParameter = 0;
+const size_t kResetParameter = 1;
+const size_t kCaptureParameter = 2;
+const size_t kRecordingChannelParameter = 3;
 
 int gFailures = 0;
 
@@ -26,8 +32,49 @@ bool drawContains(const char* expected) {
     return false;
 }
 
+void changeParameter(midibuffer_test::HostDouble& host, size_t parameter,
+                     int16_t value) {
+    host.setParameter(parameter, value);
+    host.factory()->parameterChanged(host.algorithm(),
+                                     static_cast<int>(parameter));
+}
+
+void startCapture(midibuffer_test::HostDouble& host) {
+    changeParameter(host, kCaptureParameter, 1);
+}
+
+void stopCapture(midibuffer_test::HostDouble& host) {
+    changeParameter(host, kCaptureParameter, 0);
+}
+
+void clockPulse(midibuffer_test::HostDouble& host) {
+    host.clearFrames();
+    host.bus(1)[0] = 2.0f;
+    host.step(2);
+}
+
+void noClockBlock(midibuffer_test::HostDouble& host) {
+    host.clearFrames();
+    host.step(2);
+}
+
+void sendMidi(midibuffer_test::HostDouble& host, uint8_t status, uint8_t data1,
+              uint8_t data2) {
+    host.factory()->midiMessage(host.algorithm(), status, data1, data2);
+}
+
+void acquireClock(midibuffer_test::HostDouble& host) {
+    clockPulse(host);
+    clockPulse(host);
+}
+
+midibuffer::CaptureSnapshot snapshot(midibuffer_test::HostDouble& host) {
+    return midibuffer::captureSnapshot(host.algorithm());
+}
+
 void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
-    expect(host.instantiate(3), "instance constructs through pluginEntry factory");
+    expect(host.instantiate(3),
+           "instance constructs through pluginEntry factory");
     expect(host.factory() != NULL, "factory is registered");
     expect(std::strcmp(host.factory()->name, "MidiBuffer") == 0,
            "factory name is MidiBuffer");
@@ -47,17 +94,32 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
     const int32_t aboveMaximum[] = {6};
     host.factory()->calculateRequirements(minimumRequirements, belowMinimum);
     host.factory()->calculateRequirements(maximumRequirements, aboveMaximum);
-    expect(defaultRequirements.dram == 1000000U &&
-               minimumRequirements.dram == 1000000U &&
-               maximumRequirements.dram == 5000000U,
-           "allocation requirements default and clamp to the approved byte range");
-    expect(host.requirements().numParameters == 2,
-           "clock and reset parameters are requested");
+    expect(
+        defaultRequirements.dram == 1000000U &&
+            minimumRequirements.dram == 1000000U &&
+            maximumRequirements.dram == 5000000U,
+        "allocation requirements default and clamp to the approved byte range");
+    expect(host.requirements().numParameters == 4,
+           "clock, reset, capture, and recording-channel parameters are "
+           "requested");
     expect(host.requirements().dram == 3000000U,
-           "selected recording buffer bytes are requested from DRAM");
+           "selected recording bytes are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
                static_cast<uint64_t>(host.requirements().sram) + 3000000U,
-           "host allocation accounting matches all requested memory");
+           "host allocation accounting includes separate metadata and events");
+
+    const midibuffer::CaptureSnapshot initial = snapshot(host);
+    expect(initial.recordingAllocationBytes == 3000000U,
+           "instance fixes the selected recording allocation at construction");
+    expect(initial.metadataBytes == host.requirements().sram,
+           "rolling-history metadata is accounted separately in SRAM");
+    expect(initial.eventCapacity ==
+               3000000U / sizeof(midibuffer::RecordedEvent),
+           "actual event capacity is derived and reported");
+    expect(initial.eventCount == 0 && !initial.captureEnabled &&
+               !initial.clockRunning,
+           "fresh instances start empty, stopped, and without acquired clock");
+
     expect(host.algorithm()->parameters != NULL &&
                host.algorithm()->parameterPages != NULL,
            "constructed instance publishes parameter definitions and pages");
@@ -68,24 +130,34 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                host.factory()->hasCustomUi != NULL &&
                host.factory()->customUi != NULL &&
                host.factory()->setupUi != NULL,
-           "the factory registers every callback adapter in this slice");
-    expect(std::strcmp(host.algorithm()->parameters[0].name, "Clock") == 0 &&
-               std::strcmp(host.algorithm()->parameters[1].name, "Reset") == 0,
-           "clock and reset inputs are registered in stable order");
+           "factory registers every callback adapter");
+    expect(std::strcmp(host.algorithm()->parameters[kClockParameter].name,
+                       "Clock") == 0 &&
+               std::strcmp(host.algorithm()->parameters[kResetParameter].name,
+                           "Reset") == 0 &&
+               host.algorithm()->parameters[kCaptureParameter].def == 0,
+           "inputs and initially stopped capture remain in stable order");
+    expect(host.algorithm()->parameters[kRecordingChannelParameter].min == 0 &&
+               host.algorithm()->parameters[kRecordingChannelParameter].max ==
+                   16 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kRecordingChannelParameter]
+                               .enumStrings[0],
+                           "Omni") == 0,
+           "recording channel offers Omni and channels 1 through 16");
 }
 
-void verifyCallbacks(midibuffer_test::HostDouble& host) {
-    host.setParameter(0, 1);
-    host.setParameter(1, 2);
+void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
+    changeParameter(host, kClockParameter, 1);
+    changeParameter(host, kResetParameter, 2);
     host.clearFrames();
     host.bus(1)[1] = 2.0f;
     host.bus(1)[2] = 2.0f;
     host.bus(2)[5] = 5.0f;
 
     const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
-    host.factory()->parameterChanged(host.algorithm(), 0);
     host.step(2);
-    host.factory()->midiMessage(host.algorithm(), 0x92, 60, 100);
+    sendMidi(host, 0x92, 60, 100);
     host.factory()->midiRealtime(host.algorithm(), 0xF8);
 
     _NT_uiData controls = {};
@@ -104,29 +176,211 @@ void verifyCallbacks(midibuffer_test::HostDouble& host) {
     expect(!host.factory()->draw(host.algorithm()),
            "draw preserves the standard parameter line");
     expect(drawContains("MidiBuffer"), "draw callback identifies the plugin");
-    expect(drawContains("Clock: 1"),
-           "step adapter sees one rising clock edge in controllable frames");
-    expect(drawContains("Reset: 1"),
-           "step adapter sees one rising reset edge in controllable frames");
-    expect(drawContains("MIDI: 1"),
-           "MIDI channel callback reaches instance state");
-    expect(drawContains("RT: 1"),
-           "MIDI realtime callback reaches instance state");
-    expect(drawContains("UI: 1"),
-           "custom UI callback reaches instance state");
-    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
-           "real-time and UI callbacks perform no heap allocation");
+    expect(drawContains("Capture: Stopped"),
+           "draw reports explicit capture state");
+    expect(drawContains("Events: 0"),
+           "MIDI remains unrecorded while capture is stopped");
+    expect(drawContains("Capacity: 187500"),
+           "draw reports actual event capacity for the selected allocation");
+    expect(
+        midibuffer_test::heapAllocationCount() == allocationsBefore,
+        "real-time, MIDI, UI, and draw callbacks perform no heap allocation");
+}
 
-    host.clearFrames();
-    host.step(2);
-    host.clearFrames();
-    host.bus(1)[7] = 2.0f;
-    host.bus(2)[0] = 2.0f;
-    host.step(2);
-    midibuffer_test::resetTrace();
-    host.factory()->draw(host.algorithm());
-    expect(drawContains("Clock: 2") && drawContains("Reset: 2"),
-           "gate state persists across callback blocks deterministically");
+void verifyClockedCaptureAndReacquisition() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "clock/capture trace host constructs");
+    startCapture(host);
+
+    sendMidi(host, 0x90, 48, 100);
+    expect(snapshot(host).eventCount == 0,
+           "enabled capture rejects MIDI before any clock");
+
+    clockPulse(host);
+    sendMidi(host, 0x90, 49, 100);
+    expect(snapshot(host).eventCount == 0,
+           "first acquisition pulse does not admit unknown-tempo MIDI");
+
+    clockPulse(host);
+    sendMidi(host, 0x90, 50, 100);
+    midibuffer::CaptureSnapshot acquired = snapshot(host);
+    expect(acquired.clockRunning && acquired.lastClockIntervalSamples == 8 &&
+               acquired.eventCount == 1,
+           "second pulse measures tempo and begins enabled capture");
+
+    midibuffer::RecordedEvent event = {};
+    expect(midibuffer::recordedEventAt(host.algorithm(), 0, event) &&
+               event.pulse == acquired.currentPulse &&
+               event.offsetSamples == 8 && event.bytes[0] == 0x90 &&
+               event.bytes[1] == 50 && event.size == 3,
+           "captured events retain pulse identity and between-pulse offset");
+
+    noClockBlock(host);
+    noClockBlock(host);
+    expect(!snapshot(host).clockRunning,
+           "two last-measured intervals without a pulse declare clock loss");
+    sendMidi(host, 0x80, 50, 0);
+    expect(snapshot(host).eventCount == 1,
+           "enabled capture rejects MIDI after clock loss");
+
+    clockPulse(host);
+    sendMidi(host, 0x90, 51, 100);
+    expect(!snapshot(host).clockRunning && snapshot(host).eventCount == 1,
+           "first returning pulse does not resume capture");
+    clockPulse(host);
+    sendMidi(host, 0x90, 52, 100);
+    expect(snapshot(host).clockRunning && snapshot(host).eventCount == 2,
+           "second returning pulse freshly measures tempo and resumes capture");
+
+    stopCapture(host);
+    sendMidi(host, 0x90, 53, 100);
+    expect(snapshot(host).eventCount == 2,
+           "Stop Capture rejects MIDI despite a running clock");
+
+    // Clock tracking continues while stopped, so restarting capture does not
+    // require another pair of pulses while the measured interval remains valid.
+    clockPulse(host);
+    startCapture(host);
+    sendMidi(host, 0x90, 54, 100);
+    expect(snapshot(host).eventCount == 3,
+           "Start Capture uses a continuously tracked valid clock immediately");
+}
+
+void verifyChannelAndEventEligibility() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "eligibility trace host constructs");
+    startCapture(host);
+    acquireClock(host);
+
+    for (uint8_t channel = 0; channel < 16; ++channel) {
+        sendMidi(host, static_cast<uint8_t>(0x90U | channel),
+                 static_cast<uint8_t>(48U + channel), 100);
+    }
+    expect(snapshot(host).eventCount == 16,
+           "Omni capture accepts eligible events on all 16 channels");
+
+    bool everySpecificChannelWorked = true;
+    for (uint8_t selectedChannel = 1; selectedChannel <= 16;
+         ++selectedChannel) {
+        changeParameter(host, kRecordingChannelParameter, selectedChannel);
+        const uint32_t beforeChannel = snapshot(host).eventCount;
+        for (uint8_t incomingChannel = 0; incomingChannel < 16;
+             ++incomingChannel) {
+            sendMidi(host, static_cast<uint8_t>(0x80U | incomingChannel), 60,
+                     0);
+        }
+        const midibuffer::CaptureSnapshot afterChannel = snapshot(host);
+        midibuffer::RecordedEvent accepted = {};
+        everySpecificChannelWorked =
+            everySpecificChannelWorked &&
+            afterChannel.eventCount == beforeChannel + 1U &&
+            midibuffer::recordedEventAt(host.algorithm(), beforeChannel,
+                                        accepted) &&
+            (accepted.bytes[0] & 0x0fU) == selectedChannel - 1U;
+    }
+    expect(
+        everySpecificChannelWorked,
+        "each channel-specific setting 1 through 16 accepts only its channel");
+
+    changeParameter(host, kRecordingChannelParameter, 0);
+    const uint32_t beforeEligibleTypes = snapshot(host).eventCount;
+    sendMidi(host, 0x80, 60, 0);
+    sendMidi(host, 0x90, 60, 100);
+    sendMidi(host, 0xA0, 60, 50);
+    sendMidi(host, 0xB0, 1, 64);
+    sendMidi(host, 0xD0, 70, 0);
+    sendMidi(host, 0xE0, 0, 64);
+    expect(snapshot(host).eventCount == beforeEligibleTypes + 6,
+           "notes, CC, pitch bend, and both pressure types are retained");
+
+    const uint32_t beforeExcludedTypes = snapshot(host).eventCount;
+    sendMidi(host, 0xC0, 10, 0);
+    const uint8_t excludedControllers[] = {
+        6, 38, 96, 97, 98, 99, 100, 101, 120, 121, 122, 123, 124, 125, 126, 127,
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(excludedControllers); ++index) {
+        sendMidi(host, 0xB0, excludedControllers[index], 1);
+    }
+    host.factory()->midiRealtime(host.algorithm(), 0xF8);
+    host.factory()->midiRealtime(host.algorithm(), 0xFA);
+    host.factory()->midiRealtime(host.algorithm(), 0xFC);
+    expect(snapshot(host).eventCount == beforeExcludedTypes,
+           "program, realtime transport, Channel Mode, and RPN/NRPN data are "
+           "excluded");
+
+    midibuffer::RecordedEvent channelPressure = {};
+    expect(midibuffer::recordedEventAt(
+               host.algorithm(), beforeEligibleTypes + 4, channelPressure) &&
+               channelPressure.bytes[0] == 0xD0 && channelPressure.size == 2,
+           "two-byte channel pressure retains its MIDI message size");
+}
+
+uint64_t fillHistoryAndMeasureSpan(midibuffer_test::HostDouble& host,
+                                   uint32_t eventsPerPulse,
+                                   uint32_t eventTarget) {
+    uint32_t emitted = 0;
+    while (emitted < eventTarget) {
+        clockPulse(host);
+        for (uint32_t density = 0;
+             density < eventsPerPulse && emitted < eventTarget; ++density) {
+            sendMidi(host, 0x90, static_cast<uint8_t>(36U + (emitted % 48U)),
+                     100);
+            ++emitted;
+        }
+    }
+    const midibuffer::CaptureSnapshot current = snapshot(host);
+    return current.newestPulse - current.oldestPulse;
+}
+
+void verifyRollingHistoryAndSelectionInvalidation() {
+    const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
+    midibuffer_test::HostDouble sparse;
+    expect(sparse.instantiate(1), "sparse rolling-history host constructs");
+    startCapture(sparse);
+    acquireClock(sparse);
+    const uint32_t capacity = snapshot(sparse).eventCapacity;
+    const uint64_t sparseSpan = fillHistoryAndMeasureSpan(sparse, 1, capacity);
+    midibuffer::CaptureSnapshot full = snapshot(sparse);
+    expect(full.eventCount == capacity,
+           "fixed history reaches reported event capacity without resizing");
+
+    expect(midibuffer::setPulseSelection(sparse.algorithm(), full.oldestPulse,
+                                         full.oldestPulse + 1U),
+           "pulse-aligned retained range can be selected");
+    midibuffer::PulseRange playbackRange = {};
+    expect(midibuffer::acquirePlaybackSelection(sparse.algorithm(),
+                                                playbackRange) &&
+               playbackRange.startPulse == full.oldestPulse,
+           "playback-entry contract admits a valid retained selection");
+
+    const uint64_t newestBeforeOverwrite = full.newestPulse;
+    clockPulse(sparse);
+    sendMidi(sparse, 0x90, 84, 100);
+    midibuffer::CaptureSnapshot overwritten = snapshot(sparse);
+    expect(overwritten.eventCount == capacity &&
+               overwritten.newestPulse > newestBeforeOverwrite,
+           "full history replaces its oldest event and capture continues");
+    expect(!overwritten.selectionValid,
+           "overwriting selected history clears the selection");
+    expect(!midibuffer::acquirePlaybackSelection(sparse.algorithm(),
+                                                 playbackRange),
+           "playback-entry contract refuses an invalidated selection");
+
+    clockPulse(sparse);
+    sendMidi(sparse, 0x90, 85, 100);
+    expect(snapshot(sparse).eventCount == capacity &&
+               snapshot(sparse).newestPulse > overwritten.newestPulse,
+           "capture remains active after selection invalidation");
+
+    midibuffer_test::HostDouble dense;
+    expect(dense.instantiate(1), "dense rolling-history host constructs");
+    startCapture(dense);
+    acquireClock(dense);
+    const uint64_t denseSpan = fillHistoryAndMeasureSpan(dense, 4, capacity);
+    expect(denseSpan < sparseSpan,
+           "higher event density retains a shorter pulse-history duration");
+    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
+           "mixed-density capture and ring wrap perform no heap allocation");
 }
 
 void verifyHostOutputTrace() {
@@ -155,21 +409,24 @@ void verifyHostOutputTrace() {
            "three-byte outgoing MIDI trace is deterministic");
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     midibuffer_test::resetTrace();
     midibuffer_test::HostDouble host;
     verifyEntryAndLifecycle(host);
     if (host.algorithm() != NULL) {
-        verifyCallbacks(host);
+        verifyBoundaryCallbacks(host);
     }
+    verifyClockedCaptureAndReacquisition();
+    verifyChannelAndEventEligibility();
+    verifyRollingHistoryAndSelectionInvalidation();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {
         std::fprintf(stderr, "%d callback contract checks failed\n", gFailures);
         return 1;
     }
-    std::printf("PASS: NT adapter callback contract\n");
+    std::printf("PASS: NT adapter and bounded capture-history contract\n");
     return 0;
 }
