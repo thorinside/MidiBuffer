@@ -53,9 +53,11 @@ bool drawContainsSubstring(const char* expected) {
 
 void moveUi(midibuffer_test::HostDouble& host, uint16_t controls,
             float leftPot, float centrePot, float rightPot,
-            int8_t leftEncoder = 0, int8_t rightEncoder = 0) {
+            int8_t leftEncoder = 0, int8_t rightEncoder = 0,
+            uint16_t lastButtons = 0) {
     _NT_uiData data = {};
     data.controls = controls;
+    data.lastButtons = lastButtons;
     data.pots[0] = leftPot;
     data.pots[1] = centrePot;
     data.pots[2] = rightPot;
@@ -381,8 +383,9 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
     const uint32_t customMask = host.factory()->hasCustomUi(host.algorithm());
     expect((customMask & kNT_encoderL) != 0 &&
                (customMask & kNT_encoderR) != 0 &&
-               (customMask & (kNT_encoderButtonL | kNT_encoderButtonR)) == 0,
-           "custom control mask includes rotation but no encoder press actions");
+               (customMask & kNT_encoderButtonL) != 0 &&
+               (customMask & kNT_encoderButtonR) != 0,
+           "custom control mask includes rotation, playback toggle, and panic hold");
 
     midibuffer_test::resetTrace();
     expect(host.factory()->draw(host.algorithm()),
@@ -2132,6 +2135,231 @@ void verifyPendingEndingDiscontinuityCleanup() {
     }
 }
 
+bool panicTraceMatches(uint32_t destination) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    bool matches = current.midiCallCount == 32U;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        const size_t soundOffIndex = static_cast<size_t>(channel) * 2U;
+        const size_t notesOffIndex = soundOffIndex + 1U;
+        if (notesOffIndex >= current.midiCallCount) {
+            matches = false;
+            continue;
+        }
+        const uint8_t status = static_cast<uint8_t>(0xb0U | channel);
+        matches = matches &&
+                  current.midiCalls[soundOffIndex].destination == destination &&
+                  current.midiCalls[soundOffIndex].bytes[0] == status &&
+                  current.midiCalls[soundOffIndex].bytes[1] == 120U &&
+                  current.midiCalls[soundOffIndex].bytes[2] == 0U &&
+                  current.midiCalls[notesOffIndex].destination == destination &&
+                  current.midiCalls[notesOffIndex].bytes[0] == status &&
+                  current.midiCalls[notesOffIndex].bytes[1] == 123U &&
+                  current.midiCalls[notesOffIndex].bytes[2] == 0U;
+    }
+    return matches;
+}
+
+void setEncoderButton(midibuffer_test::HostDouble& host, uint16_t button,
+                      bool heldPreviously) {
+    moveUi(host, button, 0.0f, 0.0f, 0.0f, 0, 0,
+           heldPreviously ? button : 0U);
+}
+
+void releaseEncoderButton(midibuffer_test::HostDouble& host,
+                          uint16_t button) {
+    moveUi(host, 0U, 0.0f, 0.0f, 0.0f, 0, 0, button);
+}
+
+void verifyLiveEmergencySilenceMatrix() {
+    midibuffer_test::HostDouble host;
+    prepareTransportHistory(host);
+    const uint32_t destinations[] = {
+        kNT_destinationBreakout,
+        kNT_destinationUSB,
+        kNT_destinationSelectBus,
+        kNT_destinationInternal,
+        kNT_destinationBreakout | kNT_destinationUSB |
+            kNT_destinationSelectBus | kNT_destinationInternal,
+    };
+
+    bool completeMatrixMatches = true;
+    for (int destinationSetting = 0; destinationSetting < 5;
+         ++destinationSetting) {
+        changeParameter(host, kPlaybackDestinationParameter,
+                        static_cast<int16_t>(destinationSetting));
+        for (uint8_t incomingChannel = 0; incomingChannel < 16U;
+             ++incomingChannel) {
+            const uint8_t controllers[] = {120U, 123U};
+            for (size_t controllerIndex = 0;
+                 controllerIndex < ARRAY_SIZE(controllers);
+                 ++controllerIndex) {
+                completeMatrixMatches =
+                    midibuffer::startPlayback(host.algorithm()) &&
+                    completeMatrixMatches;
+                clockPulse(host);
+                completeMatrixMatches = snapshot(host).playbackActive &&
+                                        completeMatrixMatches;
+                const uint64_t savedPulse = snapshot(host).playbackPulse;
+
+                midibuffer_test::resetTrace();
+                sendMidi(host,
+                         static_cast<uint8_t>(0xb0U | incomingChannel),
+                         controllers[controllerIndex], 99U);
+                completeMatrixMatches =
+                    panicTraceMatches(destinations[destinationSetting]) &&
+                    !snapshot(host).playbackArmed &&
+                    !snapshot(host).playbackActive &&
+                    !snapshot(host).playbackClockLossPaused &&
+                    !snapshot(host).captureEnabled &&
+                    snapshot(host).playbackPulse == savedPulse &&
+                    completeMatrixMatches;
+
+                midibuffer_test::resetTrace();
+                clockPulse(host);
+                clockPulse(host);
+                completeMatrixMatches =
+                    midibuffer_test::trace().midiCallCount == 0U &&
+                    !snapshot(host).playbackActive && completeMatrixMatches;
+            }
+        }
+    }
+    expect(completeMatrixMatches,
+           "incoming CC120/123 on every channel panic all 16 channels only on each selected destination, preserve position, and stay stopped across later clocks");
+
+    midibuffer_test::HostDouble stopHost;
+    TransportFixture stopFixture = prepareTransportHistory(stopHost);
+    beginTransportOnHeldFirstBeat(stopHost, stopFixture);
+    midibuffer_test::resetTrace();
+    stopHost.factory()->midiRealtime(stopHost.algorithm(), 0xFCU);
+    expect(snapshot(stopHost).playbackActive &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "incoming MIDI Stop neither panics nor stops patched-clock playback");
+    const uint64_t pulseBeforeStopMessage = snapshot(stopHost).playbackPulse;
+    clockPulse(stopHost);
+    bool noPanicMessages = true;
+    for (size_t index = 0;
+         index < midibuffer_test::trace().midiCallCount; ++index) {
+        const uint8_t controller =
+            midibuffer_test::trace().midiCalls[index].bytes[1];
+        noPanicMessages = noPanicMessages && controller != 120U &&
+                          controller != 123U;
+    }
+    expect(snapshot(stopHost).playbackActive &&
+               snapshot(stopHost).playbackPulse != pulseBeforeStopMessage &&
+               noPanicMessages,
+           "playback advances without panic on the pulse after ignored MIDI Stop");
+}
+
+void verifyTimelinePlaybackToggle() {
+    midibuffer_test::HostDouble invalid;
+    expect(invalid.instantiate(1), "invalid-selection toggle host constructs");
+    startCapture(invalid);
+    acquireClock(invalid);
+    sendMidi(invalid, 0x90U, 48U, 100U);
+    const uint32_t eventCountBefore = snapshot(invalid).eventCount;
+    setEncoderButton(invalid, kNT_encoderButtonL, false);
+    expect(!snapshot(invalid).playbackArmed &&
+               !snapshot(invalid).playbackActive &&
+               snapshot(invalid).captureEnabled &&
+               snapshot(invalid).eventCount == eventCountBefore,
+           "left encoder refuses an invalid selection without stopping capture");
+    releaseEncoderButton(invalid, kNT_encoderButtonL);
+
+    midibuffer_test::HostDouble host;
+    prepareTransportHistory(host);
+    setEncoderButton(host, kNT_encoderButtonL, false);
+    expect(snapshot(host).playbackArmed && !snapshot(host).captureEnabled,
+           "left encoder arms a valid selection through normal playback entry");
+    releaseEncoderButton(host, kNT_encoderButtonL);
+    clockPulse(host);
+    expect(snapshot(host).playbackActive,
+           "left-encoder playback waits for and starts on the next valid clock pulse");
+
+    const uint64_t savedPulse = snapshot(host).playbackPulse;
+    midibuffer_test::resetTrace();
+    setEncoderButton(host, kNT_encoderButtonL, false);
+    expect(!snapshot(host).playbackActive &&
+               snapshot(host).playbackPulse == savedPulse &&
+               !snapshot(host).captureEnabled &&
+               midibuffer_test::trace().midiCallCount == 2U,
+           "left encoder stops with normal held-note/sustain cleanup, saved position, and paused capture");
+    releaseEncoderButton(host, kNT_encoderButtonL);
+
+    midibuffer_test::resetTrace();
+    clockPulse(host);
+    expect(midibuffer_test::trace().midiCallCount == 0U,
+           "left-encoder stop stays silent until another explicit toggle");
+    setEncoderButton(host, kNT_encoderButtonL, false);
+    expect(snapshot(host).playbackArmed,
+           "a later left-encoder press explicitly rearms the saved position");
+}
+
+void verifyTimedRightEncoderPanic() {
+    const uint32_t destinations[] = {
+        kNT_destinationBreakout,
+        kNT_destinationUSB,
+        kNT_destinationSelectBus,
+        kNT_destinationInternal,
+        kNT_destinationBreakout | kNT_destinationUSB |
+            kNT_destinationSelectBus | kNT_destinationInternal,
+    };
+
+    bool allDestinationsMatch = true;
+    for (int destinationSetting = 0; destinationSetting < 5;
+         ++destinationSetting) {
+        midibuffer_test::HostDouble host;
+        TransportFixture fixture = prepareTransportHistory(host);
+        changeParameter(host, kPlaybackDestinationParameter,
+                        static_cast<int16_t>(destinationSetting));
+        beginTransportOnHeldFirstBeat(host, fixture);
+
+        setEncoderButton(host, kNT_encoderButtonR, false);
+        const uint64_t deadline = host.elapsedSamples() + 48000U;
+        uint32_t block = 0U;
+        while (host.elapsedSamples() + 8U < deadline) {
+            if ((block++ & 1U) == 0U) {
+                clockPulse(host);
+            } else {
+                noClockBlock(host);
+            }
+        }
+        midibuffer_test::resetTrace();
+        setEncoderButton(host, kNT_encoderButtonR, true);
+        allDestinationsMatch =
+            midibuffer_test::trace().midiCallCount == 0U &&
+            snapshot(host).playbackActive && allDestinationsMatch;
+
+        if ((block & 1U) == 0U) {
+            clockPulse(host);
+        } else {
+            noClockBlock(host);
+        }
+        const uint64_t savedPulse = snapshot(host).playbackPulse;
+        midibuffer_test::resetTrace();
+        setEncoderButton(host, kNT_encoderButtonR, true);
+        allDestinationsMatch =
+            host.elapsedSamples() == deadline &&
+            panicTraceMatches(destinations[destinationSetting]) &&
+            !snapshot(host).playbackActive &&
+            !snapshot(host).captureEnabled &&
+            snapshot(host).playbackPulse == savedPulse &&
+            allDestinationsMatch;
+
+        setEncoderButton(host, kNT_encoderButtonR, true);
+        allDestinationsMatch =
+            midibuffer_test::trace().midiCallCount == 32U &&
+            allDestinationsMatch;
+        releaseEncoderButton(host, kNT_encoderButtonR);
+        midibuffer_test::resetTrace();
+        clockPulse(host);
+        allDestinationsMatch =
+            midibuffer_test::trace().midiCallCount == 0U &&
+            !snapshot(host).playbackActive && allDestinationsMatch;
+    }
+    expect(allDestinationsMatch,
+           "right-encoder hold is silent before one second, panics once at exactly one second on every selected destination, and stays stopped");
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -2185,6 +2413,9 @@ int main() {
     verifyOverriddenChannelSustainReleaseOwnership();
     verifyOverriddenChannelRetriggerOwnership();
     verifyPendingEndingDiscontinuityCleanup();
+    verifyLiveEmergencySilenceMatrix();
+    verifyTimelinePlaybackToggle();
+    verifyTimedRightEncoderPanic();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {

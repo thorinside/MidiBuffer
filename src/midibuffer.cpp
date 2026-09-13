@@ -118,7 +118,8 @@ struct Algorithm : public _NT_algorithm {
           rangeTransitionPending(false), playbackPositionValid(false),
           playbackIntervalOpen(false), playbackNextEventScheduled(false),
           pendingNextEndingScheduled(false), lastMovedBoundaryIsStart(false),
-          pendingNextEndingSample(0) {}
+          rightEncoderHoldActive(false), rightEncoderPanicFired(false),
+          pendingNextEndingSample(0), rightEncoderHoldStartSample(0) {}
 
     RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
@@ -163,7 +164,10 @@ struct Algorithm : public _NT_algorithm {
     bool playbackNextEventScheduled;
     bool pendingNextEndingScheduled;
     bool lastMovedBoundaryIsStart;
+    bool rightEncoderHoldActive;
+    bool rightEncoderPanicFired;
     uint64_t pendingNextEndingSample;
+    uint64_t rightEncoderHoldStartSample;
 };
 
 static const char* const kCaptureStrings[] = {
@@ -1579,6 +1583,30 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
 }
 
+void emergencySilence(Algorithm& algorithm) {
+    // Manual panic can be reached while capture is active; use the established
+    // finite capture-stop path so emergency silence always leaves it paused.
+    finalizeCapture(algorithm);
+
+    const uint32_t destination = playbackDestinationMask(algorithm);
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        const uint8_t status = static_cast<uint8_t>(0xb0U | channel);
+        nt_host::sendMidi3(destination, status, 120U, 0U,
+                           algorithm.sampleCursor);
+        nt_host::sendMidi3(destination, status, 123U, 0U,
+                           algorithm.sampleCursor);
+    }
+
+    // Panic is a transport stop, not a reset. Discard output ownership and
+    // scheduled work while preserving the saved loop position for an explicit
+    // restart through the ordinary playback-entry path.
+    algorithm.playbackOutputState = PlaybackOutputState();
+    clearPendingPlaybackEndings(algorithm);
+    algorithm.transportState = kTransportStopped;
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+}
+
 void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL) {
@@ -1598,6 +1626,14 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     algorithm->state.lastMidi[0] = byte0;
     algorithm->state.lastMidi[1] = byte1;
     algorithm->state.lastMidi[2] = byte2;
+
+    const bool emergencyController =
+        (byte0 & 0xf0U) == 0xb0U && (byte1 == 120U || byte1 == 123U);
+    if (emergencyController &&
+        algorithm->transportState != kTransportStopped) {
+        emergencySilence(*algorithm);
+        return;
+    }
 
     if (!algorithm->captureEnabled || !algorithm->clockRunning) {
         return;
@@ -1836,7 +1872,44 @@ void scrollTimeline(Algorithm& algorithm, int delta) {
 }
 
 uint32_t hasCustomUi(_NT_algorithm*) {
-    return kNT_potL | kNT_potC | kNT_potR | kNT_encoderL | kNT_encoderR;
+    return kNT_potL | kNT_potC | kNT_potR | kNT_encoderL | kNT_encoderR |
+           kNT_encoderButtonL | kNT_encoderButtonR;
+}
+
+void updateRightEncoderPanic(Algorithm& algorithm, const _NT_uiData& data) {
+    const bool held = (data.controls & kNT_encoderButtonR) != 0U;
+    const bool wasHeld = (data.lastButtons & kNT_encoderButtonR) != 0U;
+    if (!held) {
+        algorithm.rightEncoderHoldActive = false;
+        algorithm.rightEncoderPanicFired = false;
+        return;
+    }
+    if (!wasHeld || !algorithm.rightEncoderHoldActive) {
+        algorithm.rightEncoderHoldActive = true;
+        algorithm.rightEncoderPanicFired = false;
+        algorithm.rightEncoderHoldStartSample = algorithm.sampleCursor;
+        return;
+    }
+    if (!algorithm.rightEncoderPanicFired && NT_globals.sampleRate != 0U &&
+        algorithm.sampleCursor - algorithm.rightEncoderHoldStartSample >=
+            NT_globals.sampleRate) {
+        emergencySilence(algorithm);
+        algorithm.rightEncoderPanicFired = true;
+    }
+}
+
+void toggleTimelinePlayback(_NT_algorithm* self, Algorithm& algorithm) {
+    if (algorithm.transportState != kTransportStopped) {
+        stopPlayback(self);
+        return;
+    }
+
+    // Refuse the gesture before startPlayback's capture-finalization path so
+    // an invalid selection makes the button a true no-op.
+    PulseRange range = {};
+    if (acquirePlaybackSelection(self, range)) {
+        startPlayback(self);
+    }
 }
 
 void customUi(_NT_algorithm* self, const _NT_uiData& data) {
@@ -1847,6 +1920,14 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
     if (data.controls != 0 || data.encoders[0] != 0 || data.encoders[1] != 0) {
         ++algorithm->state.uiChanges;
     }
+
+    const bool leftEncoderPressed =
+        (data.controls & kNT_encoderButtonL) != 0U &&
+        (data.lastButtons & kNT_encoderButtonL) == 0U;
+    if (leftEncoderPressed) {
+        toggleTimelinePlayback(self, *algorithm);
+    }
+    updateRightEncoderPanic(*algorithm, data);
 
     if ((data.controls & kNT_potL) != 0U &&
         ensureTimelineSelection(self, *algorithm)) {
