@@ -24,7 +24,7 @@ struct MidiCall {
 struct Trace {
     DrawCall drawCalls[16];
     size_t drawCallCount;
-    MidiCall midiCalls[32];
+    MidiCall midiCalls[128];
     size_t midiCallCount;
 };
 

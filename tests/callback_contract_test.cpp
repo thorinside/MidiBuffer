@@ -132,12 +132,20 @@ bool sameHistory(const HistoryImage& expected,
             actual.sourceIntervalSamples !=
                 expected.events[index].sourceIntervalSamples ||
             actual.size != expected.events[index].size ||
+            actual.flags != expected.events[index].flags ||
             std::memcmp(actual.bytes, expected.events[index].bytes,
                         sizeof(actual.bytes)) != 0) {
             return false;
         }
     }
     return true;
+}
+
+bool eventBytesMatch(const midibuffer::RecordedEvent& event, uint8_t status,
+                     uint8_t data1, uint8_t data2, uint8_t size = 3U) {
+    return event.size == size && event.bytes[0] == status &&
+           event.bytes[1] == data1 &&
+           (size == 2U || event.bytes[2] == data2);
 }
 
 void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
@@ -371,15 +379,15 @@ void verifyClockedCaptureAndReacquisition() {
 
     stopCapture(host);
     sendMidi(host, 0x90, 53, 100);
-    expect(snapshot(host).eventCount == 2,
-           "Stop Capture rejects MIDI despite a running clock");
+    expect(snapshot(host).eventCount == 4,
+           "Stop Capture stores outstanding endings and rejects later MIDI");
 
     // Clock tracking continues while stopped, so restarting capture does not
     // require another pair of pulses while the measured interval remains valid.
     clockPulse(host);
     startCapture(host);
     sendMidi(host, 0x90, 54, 100);
-    expect(snapshot(host).eventCount == 3,
+    expect(snapshot(host).eventCount == 5,
            "Start Capture uses a continuously tracked valid clock immediately");
 }
 
@@ -450,6 +458,203 @@ void verifyChannelAndEventEligibility() {
                host.algorithm(), beforeEligibleTypes + 4, channelPressure) &&
                channelPressure.bytes[0] == 0xD0 && channelPressure.size == 2,
            "two-byte channel pressure retains its MIDI message size");
+}
+
+void verifyCaptureStopEndings() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "capture-ending trace host constructs");
+    startCapture(host);
+    acquireClock(host);
+
+    sendMidi(host, 0x90, 60, 100);
+    sendMidi(host, 0x90, 60, 110);
+    sendMidi(host, 0x80, 60, 0);
+    sendMidi(host, 0x91, 61, 100);
+    sendMidi(host, 0xB0, 64, 127);
+    sendMidi(host, 0xB1, 64, 127);
+    sendMidi(host, 0xB1, 64, 0);
+    sendMidi(host, 0xB2, 65, 127);
+    sendMidi(host, 0xB2, 66, 127);
+    sendMidi(host, 0xB2, 67, 127);
+    sendMidi(host, 0xB2, 68, 127);
+    sendMidi(host, 0xB2, 69, 127);
+    sendMidi(host, 0xBB, 66, 127);
+    sendMidi(host, 0xBB, 66, 0);
+    sendMidi(host, 0xB3, 1, 20);
+    sendMidi(host, 0xB3, 33, 5);
+    sendMidi(host, 0xBC, 33, 5);
+    sendMidi(host, 0xBC, 33, 0);
+    sendMidi(host, 0xB4, 11, 50);
+    sendMidi(host, 0xB4, 43, 50);
+    sendMidi(host, 0xBD, 43, 50);
+    sendMidi(host, 0xBD, 43, 127);
+    sendMidi(host, 0xE5, 1, 65);
+    sendMidi(host, 0xE6, 0, 64);
+    sendMidi(host, 0xD7, 80, 0);
+    sendMidi(host, 0xD8, 80, 0);
+    sendMidi(host, 0xD8, 0, 0);
+    sendMidi(host, 0xA9, 70, 40);
+    sendMidi(host, 0xA9, 71, 40);
+    sendMidi(host, 0xA9, 71, 0);
+
+    // These retained settings have no universally safe capture-stop reset.
+    sendMidi(host, 0xBA, 7, 50);
+    sendMidi(host, 0xBA, 10, 20);
+    sendMidi(host, 0xBA, 74, 30);
+    sendMidi(host, 0xBA, 91, 40);
+    const uint32_t retainedBeforeStop = snapshot(host).eventCount;
+    sendMidi(host, 0xB0, 6, 99);
+    sendMidi(host, 0xB0, 98, 99);
+    sendMidi(host, 0xB0, 120, 99);
+    expect(snapshot(host).eventCount == retainedBeforeStop,
+           "excluded RPN/NRPN and Channel Mode events never enter state");
+
+    const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
+    midibuffer_test::resetTrace();
+    stopCapture(host);
+    const midibuffer::CaptureSnapshot stopped = snapshot(host);
+    expect(!stopped.captureEnabled &&
+               stopped.eventCount == retainedBeforeStop + 15U,
+           "manual stop appends exactly the targeted finite endings");
+    expect(midibuffer_test::trace().midiCallCount == 0,
+           "capture stop stores endings without sending live MIDI");
+
+    const uint8_t expectedEndings[][4] = {
+        {0x80, 60, 0, 3},   {0x81, 61, 0, 3},  {0xB0, 64, 0, 3},
+        {0xB2, 65, 0, 3},   {0xB2, 66, 0, 3},  {0xB2, 67, 0, 3},
+        {0xB2, 68, 0, 3},   {0xB2, 69, 0, 3},  {0xB3, 1, 0, 3},
+        {0xB3, 33, 0, 3},   {0xB4, 11, 127, 3},
+        {0xB4, 43, 127, 3}, {0xE5, 0, 64, 3},  {0xD7, 0, 0, 2},
+        {0xA9, 70, 0, 3},
+    };
+    midibuffer::RecordedEvent firstEnding = {};
+    bool storedEndingsMatch = midibuffer::recordedEventAt(
+        host.algorithm(), retainedBeforeStop, firstEnding);
+    for (uint32_t index = 0; index < ARRAY_SIZE(expectedEndings); ++index) {
+        midibuffer::RecordedEvent event = {};
+        storedEndingsMatch =
+            midibuffer::recordedEventAt(host.algorithm(),
+                                        retainedBeforeStop + index, event) &&
+            event.pulse == firstEnding.pulse &&
+            event.offsetSamples == firstEnding.offsetSamples &&
+            event.sourceIntervalSamples ==
+                firstEnding.sourceIntervalSamples &&
+            eventBytesMatch(event, expectedEndings[index][0],
+                            expectedEndings[index][1],
+                            expectedEndings[index][2],
+                            expectedEndings[index][3]) &&
+            storedEndingsMatch;
+    }
+    expect(storedEndingsMatch && firstEnding.pulse == stopped.currentPulse &&
+               firstEnding.flags != 0U,
+           "notes and only non-neutral pedal, modulation, expression, bend, "
+           "and pressure state end at one final timestamp");
+
+    expect(midibuffer::setPulseSelection(host.algorithm(),
+                                         stopped.currentPulse,
+                                         stopped.currentPulse + 1U),
+           "the finalized current pulse is immediately selectable");
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "final capture interval arms through the production scheduler");
+    clockPulse(host);
+    clockPulse(host);
+    const midibuffer_test::Trace& replay = midibuffer_test::trace();
+    bool replayedEndingsMatch =
+        replay.midiCallCount == retainedBeforeStop + 15U;
+    for (size_t index = 0; index < ARRAY_SIZE(expectedEndings); ++index) {
+        const size_t callIndex = retainedBeforeStop + index;
+        if (callIndex >= replay.midiCallCount) {
+            replayedEndingsMatch = false;
+            continue;
+        }
+        replayedEndingsMatch =
+            replay.midiCalls[callIndex].bytes[0] ==
+                expectedEndings[index][0] &&
+            replay.midiCalls[callIndex].bytes[1] ==
+                expectedEndings[index][1] &&
+            replay.midiCalls[callIndex].size == expectedEndings[index][3] &&
+            (replay.midiCalls[callIndex].size == 2U ||
+             replay.midiCalls[callIndex].bytes[2] ==
+                 expectedEndings[index][2]) &&
+            replay.midiCalls[callIndex].dispatchSample ==
+                replay.midiCalls[retainedBeforeStop].dispatchSample &&
+            replayedEndingsMatch;
+    }
+    expect(replayedEndingsMatch,
+           "stored endings replay together through the completed scheduler");
+
+    midibuffer::stopPlayback(host.algorithm());
+    changeParameter(host, kFilterControlChangeParameter, 1);
+    changeParameter(host, kFilterPitchBendParameter, 1);
+    changeParameter(host, kFilterAftertouchParameter, 1);
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "capture endings remain schedulable with expression filtered");
+    clockPulse(host);
+    clockPulse(host);
+    const midibuffer_test::Trace& filteredReplay = midibuffer_test::trace();
+    bool filteredEndingsMatch = filteredReplay.midiCallCount == 19U;
+    for (size_t index = 0; index < ARRAY_SIZE(expectedEndings); ++index) {
+        const size_t callIndex = 4U + index;
+        if (callIndex >= filteredReplay.midiCallCount) {
+            filteredEndingsMatch = false;
+            continue;
+        }
+        filteredEndingsMatch =
+            filteredReplay.midiCalls[callIndex].bytes[0] ==
+                expectedEndings[index][0] &&
+            filteredReplay.midiCalls[callIndex].bytes[1] ==
+                expectedEndings[index][1] &&
+            filteredReplay.midiCalls[callIndex].size ==
+                expectedEndings[index][3] &&
+            (filteredReplay.midiCalls[callIndex].size == 2U ||
+             filteredReplay.midiCalls[callIndex].bytes[2] ==
+                 expectedEndings[index][2]) &&
+            filteredEndingsMatch;
+    }
+    expect(filteredEndingsMatch,
+           "playback filters cannot suppress stored performance endings");
+    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
+           "state finalization and ending replay perform no heap allocation");
+
+    midibuffer_test::HostDouble automatic;
+    expect(automatic.instantiate(1), "automatic capture-stop host constructs");
+    startCapture(automatic);
+    acquireClock(automatic);
+    const uint64_t notePulse = snapshot(automatic).currentPulse;
+    sendMidi(automatic, 0x92, 72, 100);
+    clockPulse(automatic);
+    expect(midibuffer::setPulseSelection(automatic.algorithm(), notePulse,
+                                         notePulse + 1U),
+           "active capture history can be selected before playback");
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(automatic.algorithm()) &&
+               !snapshot(automatic).captureEnabled &&
+               snapshot(automatic).eventCount == 2U,
+           "playback start finalizes active capture through the same path");
+    expect(midibuffer_test::trace().midiCallCount == 0,
+           "automatic capture stop also emits no immediate live cleanup");
+
+    midibuffer_test::HostDouble full;
+    expect(full.instantiate(1), "full-buffer ending host constructs");
+    startCapture(full);
+    acquireClock(full);
+    const uint32_t capacity = snapshot(full).eventCapacity;
+    for (uint32_t index = 0; index < capacity; ++index) {
+        sendMidi(full, 0xB0, 7, static_cast<uint8_t>(index & 0x7fU));
+    }
+    sendMidi(full, 0x94, 84, 100);
+    midibuffer_test::resetTrace();
+    stopCapture(full);
+    midibuffer::RecordedEvent finalEvent = {};
+    expect(snapshot(full).eventCount == capacity &&
+               midibuffer::recordedEventAt(full.algorithm(), capacity - 1U,
+                                           finalEvent) &&
+               eventBytesMatch(finalEvent, 0x84, 84, 0),
+           "a full rolling buffer retains its final note ending in budget");
+    expect(midibuffer_test::trace().midiCallCount == 0,
+           "full-buffer finalization remains storage-only");
 }
 
 uint64_t fillHistoryAndMeasureSpan(midibuffer_test::HostDouble& host,
@@ -624,8 +829,8 @@ void verifyRecoverableExpressionFiltering() {
     acquireClock(host);
 
     const uint8_t recordedMessages[][3] = {
-        {0x90, 60, 100}, {0x80, 60, 0}, {0xB1, 1, 23}, {0xB2, 64, 127},
-        {0xE3, 1, 65},   {0xA4, 60, 42}, {0xD5, 77, 0},
+        {0x90, 60, 100}, {0x80, 60, 0}, {0xB1, 1, 0}, {0xB2, 64, 0},
+        {0xE3, 0, 64},   {0xA4, 60, 0}, {0xD5, 0, 0},
     };
     const uint8_t messageSizes[] = {3, 3, 3, 3, 3, 3, 2};
     for (size_t index = 0; index < ARRAY_SIZE(recordedMessages); ++index) {
@@ -1015,6 +1220,7 @@ int main() {
     }
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
+    verifyCaptureStopEndings();
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();
     verifyRecoverableExpressionFiltering();

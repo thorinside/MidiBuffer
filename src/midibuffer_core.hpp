@@ -16,6 +16,7 @@ struct RecordedEvent {
     uint32_t sourceIntervalSamples;
     uint8_t bytes[3];
     uint8_t size;
+    uint8_t flags;
 };
 
 struct PulseRange {

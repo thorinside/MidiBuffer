@@ -14,6 +14,7 @@ const uint32_t kBytesPerMegabyte = 1000000U;
 const int32_t kDefaultBufferMegabytes = 1;
 const float kGateThresholdVolts = 1.0f;
 const uint32_t kClockAverageWindow = 8U;
+const uint8_t kRecordedEventFlagCaptureEnding = 0x01U;
 
 static_assert(sizeof(RecordedEvent) == 24,
               "recording event size is part of capacity accounting");
@@ -52,6 +53,17 @@ struct CallbackState {
     uint8_t lastRealtime;
 };
 
+struct RecordedState {
+    uint32_t heldNoteCounts[16][128];
+    uint32_t heldNoteTotal;
+    uint32_t polyPressureMasks[16][4];
+    uint16_t pitchBendMask;
+    uint16_t channelPressureMask;
+    uint8_t pedalMasks[16];
+    uint8_t modulationMasks[16];
+    uint8_t expressionMasks[16];
+};
+
 struct Algorithm : public _NT_algorithm {
     Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
         : _NT_algorithm(),
@@ -59,12 +71,12 @@ struct Algorithm : public _NT_algorithm {
           recordingBufferBytes(recordingBufferBytesValue),
           eventCapacity(recordingBufferBytesValue / sizeof(RecordedEvent)),
           eventHead(0), eventCount(0), sampleCursor(0), currentPulse(0),
-          lastPulseSample(0), lastClockIntervalSamples(0), clockIntervalSum(0),
-          playbackPulse(0), playbackIntervalStartSample(0),
-          playbackNextEventSample(0), playbackEventIndex(0),
-          clockIntervalWriteIndex(0),
+          historyEndPulseExclusive(0), lastPulseSample(0),
+          lastClockIntervalSamples(0), clockIntervalSum(0), playbackPulse(0),
+          playbackIntervalStartSample(0), playbackNextEventSample(0),
+          playbackEventIndex(0), clockIntervalWriteIndex(0),
           clockIntervalCount(0), clockIntervals(), selection(), state(),
-          captureEnabled(false), clockRunning(false),
+          recordedState(), captureEnabled(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), playbackArmed(false), playbackActive(false),
           playbackIntervalOpen(false), playbackNextEventScheduled(false) {}
@@ -77,6 +89,7 @@ struct Algorithm : public _NT_algorithm {
 
     uint64_t sampleCursor;
     uint64_t currentPulse;
+    uint64_t historyEndPulseExclusive;
     uint64_t lastPulseSample;
     uint64_t lastClockIntervalSamples;
     uint32_t clockIntervalSum;
@@ -89,6 +102,7 @@ struct Algorithm : public _NT_algorithm {
     uint32_t clockIntervals[kClockAverageWindow];
     PulseRange selection;
     CallbackState state;
+    RecordedState recordedState;
 
     bool captureEnabled;
     bool clockRunning;
@@ -298,6 +312,8 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
     return algorithm;
 }
 
+void finalizeCapture(Algorithm& algorithm);
+
 void parameterChanged(_NT_algorithm* self, int parameter) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL || parameter < 0 || parameter >= kNumParameters) {
@@ -306,8 +322,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
 
     ++algorithm->state.parameterChanges;
     if (parameter == kParameterCapture && algorithm->v != NULL) {
-        algorithm->captureEnabled = algorithm->v[kParameterCapture] !=
-                                    kParameters[kParameterCapture].min;
+        const bool requested = algorithm->v[kParameterCapture] !=
+                               kParameters[kParameterCapture].min;
+        if (!requested) {
+            finalizeCapture(*algorithm);
+        } else if (!algorithm->captureEnabled) {
+            algorithm->recordedState = RecordedState();
+            algorithm->captureEnabled = true;
+        }
     } else if (parameter == kParameterClock) {
         // A newly routed input must acquire its own edge rather than inherit
         // the previous input's gate level.
@@ -362,6 +384,185 @@ void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
         ++algorithm.eventCount;
     }
     algorithm.recordingEvents[writeIndex] = event;
+    const uint64_t maximum = ~static_cast<uint64_t>(0);
+    const uint64_t eventEnd = event.pulse == maximum ? maximum
+                                                      : event.pulse + 1U;
+    if (eventEnd > algorithm.historyEndPulseExclusive) {
+        algorithm.historyEndPulseExclusive = eventEnd;
+    }
+}
+
+void setMaskBit(uint32_t& mask, uint8_t bit, bool set) {
+    const uint32_t value = static_cast<uint32_t>(1U) << bit;
+    mask = set ? mask | value : mask & ~value;
+}
+
+uint32_t boundedInterval(uint64_t interval);
+
+void trackRecordedState(Algorithm& algorithm, const RecordedEvent& event) {
+    const uint8_t type = event.bytes[0] & 0xf0U;
+    const uint8_t channel = event.bytes[0] & 0x0fU;
+    RecordedState& state = algorithm.recordedState;
+
+    if (type == 0x80U || type == 0x90U) {
+        const uint8_t note = event.bytes[1] & 0x7fU;
+        uint32_t& count = state.heldNoteCounts[channel][note];
+        const bool noteOn = type == 0x90U && event.bytes[2] != 0U;
+        if (noteOn && state.heldNoteTotal < algorithm.eventCapacity) {
+            ++count;
+            ++state.heldNoteTotal;
+        } else if (!noteOn && count != 0U) {
+            --count;
+            --state.heldNoteTotal;
+        }
+        return;
+    }
+
+    if (type == 0xa0U) {
+        const uint8_t note = event.bytes[1] & 0x7fU;
+        setMaskBit(state.polyPressureMasks[channel][note / 32U],
+                   note % 32U, event.bytes[2] != 0U);
+        return;
+    }
+
+    if (type == 0xb0U) {
+        const uint8_t controller = event.bytes[1];
+        if (controller >= 64U && controller <= 69U) {
+            const uint8_t bit = controller - 64U;
+            const uint8_t value = static_cast<uint8_t>(1U << bit);
+            state.pedalMasks[channel] =
+                event.bytes[2] >= 64U
+                    ? static_cast<uint8_t>(state.pedalMasks[channel] | value)
+                    : static_cast<uint8_t>(state.pedalMasks[channel] & ~value);
+        } else if (controller == 1U || controller == 33U) {
+            const uint8_t value = static_cast<uint8_t>(
+                1U << static_cast<uint8_t>(controller == 33U));
+            state.modulationMasks[channel] =
+                event.bytes[2] != 0U
+                    ? static_cast<uint8_t>(state.modulationMasks[channel] |
+                                           value)
+                    : static_cast<uint8_t>(state.modulationMasks[channel] &
+                                           ~value);
+        } else if (controller == 11U || controller == 43U) {
+            const uint8_t value = static_cast<uint8_t>(
+                1U << static_cast<uint8_t>(controller == 43U));
+            state.expressionMasks[channel] =
+                event.bytes[2] != 127U
+                    ? static_cast<uint8_t>(state.expressionMasks[channel] |
+                                           value)
+                    : static_cast<uint8_t>(state.expressionMasks[channel] &
+                                           ~value);
+        }
+        return;
+    }
+
+    if (type == 0xd0U) {
+        const uint16_t value = static_cast<uint16_t>(1U << channel);
+        state.channelPressureMask =
+            event.bytes[1] != 0U
+                ? static_cast<uint16_t>(state.channelPressureMask | value)
+                : static_cast<uint16_t>(state.channelPressureMask & ~value);
+    } else if (type == 0xe0U) {
+        const uint16_t value = static_cast<uint16_t>(1U << channel);
+        const uint16_t bend = static_cast<uint16_t>(event.bytes[1] & 0x7fU) |
+                              static_cast<uint16_t>(
+                                  (event.bytes[2] & 0x7fU) << 7U);
+        state.pitchBendMask =
+            bend != 8192U
+                ? static_cast<uint16_t>(state.pitchBendMask | value)
+                : static_cast<uint16_t>(state.pitchBendMask & ~value);
+    }
+}
+
+RecordedEvent captureEndingTemplate(const Algorithm& algorithm) {
+    uint64_t offset = algorithm.sampleCursor - algorithm.lastPulseSample;
+    if (offset > 0xffffffffULL) {
+        offset = 0xffffffffULL;
+    }
+    return RecordedEvent{
+        algorithm.currentPulse,
+        offset <= 1U ? 0U : static_cast<uint32_t>(offset),
+        boundedInterval(algorithm.lastClockIntervalSamples),
+        {0, 0, 0},
+        3,
+        kRecordedEventFlagCaptureEnding,
+    };
+}
+
+void appendEnding(Algorithm& algorithm, const RecordedEvent& endingTemplate,
+                  uint8_t status, uint8_t data1, uint8_t data2,
+                  uint8_t size = 3U) {
+    RecordedEvent event = endingTemplate;
+    event.bytes[0] = status;
+    event.bytes[1] = data1;
+    event.bytes[2] = data2;
+    event.size = size;
+    appendEvent(algorithm, event);
+}
+
+void finalizeCapture(Algorithm& algorithm) {
+    if (!algorithm.captureEnabled) {
+        return;
+    }
+
+    const RecordedEvent ending = captureEndingTemplate(algorithm);
+    const RecordedState& state = algorithm.recordedState;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t note = 0; note < 128U; ++note) {
+            for (uint32_t occurrence = 0;
+                 occurrence < state.heldNoteCounts[channel][note];
+                 ++occurrence) {
+                appendEnding(algorithm, ending,
+                             static_cast<uint8_t>(0x80U | channel), note, 0);
+            }
+        }
+    }
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        for (uint8_t controller = 64U; controller <= 69U; ++controller) {
+            if ((state.pedalMasks[channel] &
+                 static_cast<uint8_t>(1U << (controller - 64U))) != 0U) {
+                appendEnding(algorithm, ending,
+                             static_cast<uint8_t>(0xb0U | channel),
+                             controller, 0);
+            }
+        }
+        const uint8_t modulationControllers[] = {1U, 33U};
+        const uint8_t expressionControllers[] = {11U, 43U};
+        for (uint8_t index = 0; index < 2U; ++index) {
+            if ((state.modulationMasks[channel] & (1U << index)) != 0U) {
+                appendEnding(algorithm, ending,
+                             static_cast<uint8_t>(0xb0U | channel),
+                             modulationControllers[index], 0);
+            }
+            if ((state.expressionMasks[channel] & (1U << index)) != 0U) {
+                appendEnding(algorithm, ending,
+                             static_cast<uint8_t>(0xb0U | channel),
+                             expressionControllers[index], 127);
+            }
+        }
+        if ((state.pitchBendMask & (1U << channel)) != 0U) {
+            appendEnding(algorithm, ending,
+                         static_cast<uint8_t>(0xe0U | channel), 0, 64);
+        }
+        if ((state.channelPressureMask & (1U << channel)) != 0U) {
+            appendEnding(algorithm, ending,
+                         static_cast<uint8_t>(0xd0U | channel), 0, 0, 2);
+        }
+        for (uint8_t word = 0; word < 4U; ++word) {
+            uint32_t mask = state.polyPressureMasks[channel][word];
+            for (uint8_t bit = 0; bit < 32U; ++bit) {
+                if ((mask & (static_cast<uint32_t>(1U) << bit)) != 0U) {
+                    appendEnding(
+                        algorithm, ending,
+                        static_cast<uint8_t>(0xa0U | channel),
+                        static_cast<uint8_t>(word * 32U + bit), 0);
+                }
+            }
+        }
+    }
+
+    algorithm.recordedState = RecordedState();
+    algorithm.captureEnabled = false;
 }
 
 uint32_t playbackDestinationMask(const Algorithm& algorithm) {
@@ -426,6 +627,11 @@ bool recordedEventPassesPlaybackFilters(const Algorithm& algorithm,
                                         const RecordedEvent& event) {
     if (!eligiblePerformanceEvent(event)) {
         return false;
+    }
+    // Synthetic endings are performance-safety boundaries, not optional
+    // expression. They remain effective if filters change after capture.
+    if ((event.flags & kRecordedEventFlagCaptureEnding) != 0U) {
+        return true;
     }
 
     switch (event.bytes[0] & 0xf0U) {
@@ -766,6 +972,7 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
         boundedInterval(algorithm->lastClockIntervalSamples),
         {byte0, byte1, byte2},
         static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
+        0,
     };
     if (!eligiblePerformanceEvent(event)) {
         return;
@@ -793,6 +1000,7 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     event.offsetSamples =
         offset <= 1U ? 0U : static_cast<uint32_t>(offset);
     appendEvent(*algorithm, event);
+    trackRecordedState(*algorithm, event);
 }
 
 uint32_t hasCustomUi(_NT_algorithm*) {
@@ -957,7 +1165,8 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
 
     const uint64_t oldestPulse =
         algorithm->recordingEvents[algorithm->eventHead].pulse;
-    if (startPulse < oldestPulse || endPulse > algorithm->currentPulse) {
+    if (startPulse < oldestPulse ||
+        endPulse > algorithm->historyEndPulseExclusive) {
         return false;
     }
 
@@ -985,7 +1194,8 @@ bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range) {
     const uint64_t oldestPulse =
         algorithm->recordingEvents[algorithm->eventHead].pulse;
     if (algorithm->selection.startPulse < oldestPulse ||
-        algorithm->selection.endPulse > algorithm->currentPulse) {
+        algorithm->selection.endPulse >
+            algorithm->historyEndPulseExclusive) {
         return false;
     }
 
@@ -995,8 +1205,15 @@ bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range) {
 
 bool startPlayback(_NT_algorithm* self) {
     Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    // Playback is a capture-stop path: freeze a finite performance before
+    // validating its retained selection, without transmitting live cleanup.
+    finalizeCapture(*algorithm);
+
     PulseRange range = {};
-    if (algorithm == NULL || !acquirePlaybackSelection(self, range)) {
+    if (!acquirePlaybackSelection(self, range)) {
         return false;
     }
 
