@@ -1,9 +1,13 @@
 #include "host_double.hpp"
 
+#include <distingnt/serialisation.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -73,7 +77,309 @@ void recordMidi(uint32_t destination, uint8_t size, uint8_t byte0,
     call.bytes[2] = byte2;
 }
 
+enum JsonNodeType {
+    kJsonObject,
+    kJsonArray,
+    kJsonInt,
+    kJsonFloat,
+    kJsonString,
+    kJsonBoolean,
+    kJsonNull,
+};
+
+struct JsonNode {
+    JsonNodeType type;
+    std::string name;
+    int intValue;
+    float floatValue;
+    bool boolValue;
+    std::string stringValue;
+    std::vector<JsonNode> children;
+
+    explicit JsonNode(JsonNodeType nodeType = kJsonNull)
+        : type(nodeType), name(), intValue(0), floatValue(0.0f),
+          boolValue(false), stringValue(), children() {}
+};
+
+struct JsonDocument {
+    JsonNode root;
+    uint64_t payloadBytes;
+    int16_t parameters[16];
+    uint32_t parameterCount;
+
+    JsonDocument()
+        : root(kJsonObject), payloadBytes(2U), parameters(),
+          parameterCount(0U) {}
+};
+
+struct JsonStreamState {
+    JsonDocument* document;
+    std::vector<JsonNode*> stack;
+    std::string pendingName;
+};
+
+struct JsonParseFrame {
+    const JsonNode* node;
+    size_t next;
+};
+
+struct JsonParseState {
+    const JsonNode* current;
+    std::vector<JsonParseFrame> stack;
+};
+
+JsonNode* appendStreamNode(JsonStreamState& state, JsonNodeType type) {
+    JsonNode node(type);
+    node.name = state.pendingName;
+    state.pendingName.clear();
+    JsonNode* parent = state.stack.back();
+    parent->children.push_back(node);
+    return &parent->children.back();
+}
+
+void finishParseFrames(JsonParseState& state) {
+    while (!state.stack.empty() &&
+           state.stack.back().next >= state.stack.back().node->children.size()) {
+        state.stack.pop_back();
+    }
+}
+
+const JsonNode* selectParseValue(JsonParseState& state) {
+    if (state.current != NULL) {
+        const JsonNode* selected = state.current;
+        state.current = NULL;
+        return selected;
+    }
+    finishParseFrames(state);
+    if (state.stack.empty()) {
+        return NULL;
+    }
+    JsonParseFrame& frame = state.stack.back();
+    if (frame.node->type != kJsonArray ||
+        frame.next >= frame.node->children.size()) {
+        return NULL;
+    }
+    return &frame.node->children[frame.next++];
+}
+
+uint64_t jsonValueCount(const JsonNode& node) {
+    uint64_t count = 1U;
+    for (size_t index = 0; index < node.children.size(); ++index) {
+        count += jsonValueCount(node.children[index]);
+    }
+    return count;
+}
+
+bool sameJsonNode(const JsonNode& left, const JsonNode& right) {
+    if (left.type != right.type || left.name != right.name ||
+        left.intValue != right.intValue ||
+        left.floatValue != right.floatValue ||
+        left.boolValue != right.boolValue ||
+        left.stringValue != right.stringValue ||
+        left.children.size() != right.children.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.children.size(); ++index) {
+        if (!sameJsonNode(left.children[index], right.children[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
+
+_NT_jsonStream::_NT_jsonStream(void* state) : refCon(state) {}
+_NT_jsonStream::~_NT_jsonStream() {}
+
+void _NT_jsonStream::addMemberName(const char* name) {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    state.pendingName = name == NULL ? "" : name;
+    state.document->payloadBytes += state.pendingName.size() + 3U;
+}
+
+void _NT_jsonStream::openArray() {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonArray);
+    state.stack.push_back(node);
+    state.document->payloadBytes += 2U;
+}
+
+void _NT_jsonStream::closeArray() {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    if (state.stack.size() > 1U) {
+        state.stack.pop_back();
+    }
+}
+
+void _NT_jsonStream::openObject() {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonObject);
+    state.stack.push_back(node);
+    state.document->payloadBytes += 2U;
+}
+
+void _NT_jsonStream::closeObject() {
+    closeArray();
+}
+
+void _NT_jsonStream::addNumber(int value) {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonInt);
+    node->intValue = value;
+    state.document->payloadBytes += 12U;
+}
+
+void _NT_jsonStream::addNumber(float value) {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonFloat);
+    node->floatValue = value;
+    state.document->payloadBytes += 16U;
+}
+
+void _NT_jsonStream::addString(const char* value) {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonString);
+    node->stringValue = value == NULL ? "" : value;
+    state.document->payloadBytes += node->stringValue.size() + 3U;
+}
+
+void _NT_jsonStream::addFourCC(uint32_t value) {
+    char text[5] = {
+        static_cast<char>((value >> 24U) & 0xffU),
+        static_cast<char>((value >> 16U) & 0xffU),
+        static_cast<char>((value >> 8U) & 0xffU),
+        static_cast<char>(value & 0xffU),
+        '\0',
+    };
+    addString(text);
+}
+
+void _NT_jsonStream::addBoolean(bool value) {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    JsonNode* node = appendStreamNode(state, kJsonBoolean);
+    node->boolValue = value;
+    state.document->payloadBytes += value ? 5U : 6U;
+}
+
+void _NT_jsonStream::addNull() {
+    JsonStreamState& state = *static_cast<JsonStreamState*>(refCon);
+    appendStreamNode(state, kJsonNull);
+    state.document->payloadBytes += 5U;
+}
+
+_NT_jsonParse::_NT_jsonParse(void* state, int index)
+    : refCon(state), i(index) {}
+_NT_jsonParse::~_NT_jsonParse() {}
+
+bool _NT_jsonParse::numberOfArrayElements(int& num) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonArray ||
+        node->children.size() > static_cast<size_t>(0x7fffffff)) {
+        return false;
+    }
+    num = static_cast<int>(node->children.size());
+    state.stack.push_back(JsonParseFrame{node, 0U});
+    return true;
+}
+
+bool _NT_jsonParse::numberOfObjectMembers(int& num) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonObject ||
+        node->children.size() > static_cast<size_t>(0x7fffffff)) {
+        return false;
+    }
+    num = static_cast<int>(node->children.size());
+    state.stack.push_back(JsonParseFrame{node, 0U});
+    return true;
+}
+
+bool _NT_jsonParse::matchName(const char* name) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    finishParseFrames(state);
+    if (state.stack.empty()) {
+        return false;
+    }
+    JsonParseFrame& frame = state.stack.back();
+    if (frame.node->type != kJsonObject ||
+        frame.next >= frame.node->children.size()) {
+        return false;
+    }
+    const JsonNode* child = &frame.node->children[frame.next];
+    if (child->name != (name == NULL ? "" : name)) {
+        return false;
+    }
+    ++frame.next;
+    state.current = child;
+    return true;
+}
+
+bool _NT_jsonParse::skipMember() {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    if (state.current != NULL) {
+        state.current = NULL;
+        return true;
+    }
+    finishParseFrames(state);
+    if (state.stack.empty()) {
+        return false;
+    }
+    JsonParseFrame& frame = state.stack.back();
+    if (frame.node->type != kJsonObject ||
+        frame.next >= frame.node->children.size()) {
+        return false;
+    }
+    ++frame.next;
+    return true;
+}
+
+bool _NT_jsonParse::number(int& value) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonInt) {
+        return false;
+    }
+    value = node->intValue;
+    return true;
+}
+
+bool _NT_jsonParse::number(float& value) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonFloat) {
+        return false;
+    }
+    value = node->floatValue;
+    return true;
+}
+
+bool _NT_jsonParse::string(const char*& value) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonString) {
+        return false;
+    }
+    value = node->stringValue.c_str();
+    return true;
+}
+
+bool _NT_jsonParse::boolean(bool& value) {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    if (node == NULL || node->type != kJsonBoolean) {
+        return false;
+    }
+    value = node->boolValue;
+    return true;
+}
+
+bool _NT_jsonParse::null() {
+    JsonParseState& state = *static_cast<JsonParseState*>(refCon);
+    const JsonNode* node = selectParseValue(state);
+    return node != NULL && node->type == kJsonNull;
+}
 
 void* operator new(size_t size) {
     ++gHeapAllocationCount;
@@ -210,6 +516,30 @@ uint64_t heapAllocationCount() {
     return gHeapAllocationCount;
 }
 
+PresetImage::PresetImage() : document_(new JsonDocument()) {}
+
+PresetImage::~PresetImage() {
+    delete static_cast<JsonDocument*>(document_);
+}
+
+uint64_t PresetImage::payloadBytes() const {
+    return static_cast<const JsonDocument*>(document_)->payloadBytes;
+}
+
+uint64_t PresetImage::valueCount() const {
+    return jsonValueCount(static_cast<const JsonDocument*>(document_)->root);
+}
+
+bool PresetImage::equals(const PresetImage& other) const {
+    const JsonDocument* left = static_cast<const JsonDocument*>(document_);
+    const JsonDocument* right =
+        static_cast<const JsonDocument*>(other.document_);
+    return left->parameterCount == right->parameterCount &&
+           std::memcmp(left->parameters, right->parameters,
+                       sizeof(left->parameters)) == 0 &&
+           sameJsonNode(left->root, right->root);
+}
+
 HostDouble::HostDouble()
     : factory_(NULL),
       requirements_(),
@@ -298,6 +628,61 @@ void HostDouble::setParameter(size_t index, int16_t value) {
     if (index < ARRAY_SIZE(values_)) {
         values_[index] = value;
     }
+}
+
+int16_t HostDouble::parameter(size_t index) const {
+    return index < ARRAY_SIZE(values_) ? values_[index] : 0;
+}
+
+bool HostDouble::savePreset(PresetImage& image) {
+    if (algorithm_ == NULL || factory_ == NULL || factory_->serialise == NULL) {
+        return false;
+    }
+    JsonDocument* document = static_cast<JsonDocument*>(image.document_);
+    *document = JsonDocument();
+    document->parameterCount = requirements_.numParameters;
+    if (document->parameterCount > ARRAY_SIZE(document->parameters)) {
+        return false;
+    }
+    for (uint32_t index = 0; index < document->parameterCount; ++index) {
+        document->parameters[index] = values_[index];
+    }
+    JsonStreamState state = {document, std::vector<JsonNode*>(), std::string()};
+    state.stack.push_back(&document->root);
+    _NT_jsonStream stream(&state);
+    factory_->serialise(algorithm_, stream);
+    return state.stack.size() == 1U && state.pendingName.empty();
+}
+
+bool HostDouble::loadPreset(const PresetImage& image,
+                            bool restoreParametersAfterCustomState) {
+    if (algorithm_ == NULL || factory_ == NULL || factory_->deserialise == NULL) {
+        return false;
+    }
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(image.document_);
+    if (document->parameterCount != requirements_.numParameters ||
+        document->parameterCount > ARRAY_SIZE(values_)) {
+        return false;
+    }
+    if (!restoreParametersAfterCustomState) {
+        for (uint32_t index = 0; index < document->parameterCount; ++index) {
+            values_[index] = document->parameters[index];
+            factory_->parameterChanged(algorithm_, static_cast<int>(index));
+        }
+    }
+    JsonParseState state = {&document->root, std::vector<JsonParseFrame>()};
+    _NT_jsonParse parse(&state, 0);
+    if (!factory_->deserialise(algorithm_, parse)) {
+        return false;
+    }
+    if (restoreParametersAfterCustomState) {
+        for (uint32_t index = 0; index < document->parameterCount; ++index) {
+            values_[index] = document->parameters[index];
+            factory_->parameterChanged(algorithm_, static_cast<int>(index));
+        }
+    }
+    return true;
 }
 
 void HostDouble::clearFrames() {

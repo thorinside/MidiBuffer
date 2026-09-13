@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 namespace {
 
@@ -246,8 +247,10 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                host.factory()->midiRealtime != NULL &&
                host.factory()->hasCustomUi != NULL &&
                host.factory()->customUi != NULL &&
-               host.factory()->setupUi != NULL,
-           "factory registers every callback adapter");
+               host.factory()->setupUi != NULL &&
+               host.factory()->serialise != NULL &&
+               host.factory()->deserialise != NULL,
+           "factory registers every callback adapter including native preset persistence");
     expect(std::strcmp(host.algorithm()->parameters[kClockParameter].name,
                        "Clock") == 0 &&
                std::strcmp(host.algorithm()->parameters[kResetParameter].name,
@@ -2360,6 +2363,228 @@ void verifyTimedRightEncoderPanic() {
            "right-encoder hold is silent before one second, panics once at exactly one second on every selected destination, and stays stopped");
 }
 
+bool sameMidiTrace(const midibuffer_test::Trace& left,
+                   const midibuffer_test::Trace& right) {
+    if (left.midiCallCount != right.midiCallCount) {
+        return false;
+    }
+    for (size_t index = 0; index < left.midiCallCount; ++index) {
+        if (left.midiCalls[index].destination !=
+                right.midiCalls[index].destination ||
+            left.midiCalls[index].size != right.midiCalls[index].size ||
+            std::memcmp(left.midiCalls[index].bytes,
+                        right.midiCalls[index].bytes,
+                        sizeof(left.midiCalls[index].bytes)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void verifyCompletePresetRoundTripsAndContinuation() {
+    midibuffer_test::HostDouble source;
+    TransportFixture fixture = prepareTransportHistory(source);
+    changeParameter(source, kPlaybackDestinationParameter, 1);
+    changeParameter(source, kPlaybackChannelParameter, 5);
+    changeParameter(source, kFilterPitchBendParameter, 1);
+    changeParameter(source, kPulsesPerDisplayedBeatParameter, 5);
+    beginTransportOnHeldFirstBeat(source, fixture, 16U, 4U);
+    moveUi(source, kNT_potR, 0.0f, 0.0f, 0.0f);
+    moveUi(source, kNT_potL, 0.75f, 0.0f, 0.0f);
+    const midibuffer::CaptureSnapshot saved = snapshot(source);
+    expect(saved.playbackActive && saved.rangeTransitionPending &&
+               saved.pendingNoteEndingCount == 1U &&
+               saved.pendingSustainReleaseCount == 1U &&
+               saved.timelineVisiblePulses == 4U &&
+               saved.lastMovedBoundaryIsStart,
+           "active preset fixture contains pending range, timeline, note, sustain, and scheduler state");
+
+    midibuffer_test::PresetImage image;
+    expect(source.savePreset(image) && image.payloadBytes() != 0U &&
+               image.valueCount() != 0U,
+           "actual NT serialise callback captures the active performance state");
+    const midibuffer::CaptureSnapshot afterPlaybackSave = snapshot(source);
+    expect(afterPlaybackSave.eventCount == saved.eventCount &&
+               afterPlaybackSave.playbackPulse == saved.playbackPulse &&
+               afterPlaybackSave.pendingNoteEndingCount ==
+                   saved.pendingNoteEndingCount &&
+               afterPlaybackSave.pendingSustainReleaseCount ==
+                   saved.pendingSustainReleaseCount &&
+               afterPlaybackSave.playbackActive,
+           "save-time snapshot is coherent and non-mutating during playback");
+
+    midibuffer_test::resetTrace();
+    midibuffer_test::HostDouble restored;
+    expect(restored.instantiate(1) && restored.loadPreset(image),
+           "actual NT deserialise callback reconstructs a fresh instance");
+    const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+    bool allParametersMatch = true;
+    for (size_t index = 0; index <= kPulsesPerDisplayedBeatParameter;
+         ++index) {
+        allParametersMatch = allParametersMatch &&
+                             source.parameter(index) ==
+                                 restored.parameter(index);
+    }
+    expect(allParametersMatch && loaded.eventCount == saved.eventCount &&
+               loaded.currentPulse == saved.currentPulse &&
+               loaded.playbackPulse == saved.playbackPulse &&
+               loaded.selectionValid == saved.selectionValid &&
+               loaded.selection.startPulse == saved.selection.startPulse &&
+               loaded.selection.endPulse == saved.selection.endPulse &&
+               loaded.activeSelectionValid == saved.activeSelectionValid &&
+               loaded.activeSelection.startPulse ==
+                   saved.activeSelection.startPulse &&
+               loaded.activeSelection.endPulse ==
+                   saved.activeSelection.endPulse &&
+               loaded.rangeTransitionPending == saved.rangeTransitionPending &&
+               loaded.pendingNoteEndingCount ==
+                   saved.pendingNoteEndingCount &&
+               loaded.pendingSustainReleaseCount ==
+                   saved.pendingSustainReleaseCount &&
+               loaded.timelineVisiblePulses == saved.timelineVisiblePulses &&
+               loaded.lastMovedBoundaryIsStart ==
+                   saved.lastMovedBoundaryIsStart &&
+               loaded.playbackActive && !loaded.captureEnabled &&
+               !loaded.clockRunning && sameHistory(captureHistory(source), restored),
+           "fresh reconstruction restores events/timing, ranges, cursor, transport intent, parameters, routing, filters, timeline, and pending ownership while gating on live clock");
+    expect(midibuffer_test::trace().midiCallCount == 0U,
+           "preset load does not pretend to restore or transmit external instrument state");
+
+    midibuffer_test::PresetImage reconstructedImage;
+    expect(restored.savePreset(reconstructedImage) &&
+               image.equals(reconstructedImage),
+           "exhaustive canonical saved-state equality has no silently omitted category");
+
+    midibuffer_test::HostDouble parametersAfter;
+    expect(parametersAfter.instantiate(1) &&
+               parametersAfter.loadPreset(image, true),
+           "valid custom state loads when generic parameters are restored after deserialise");
+    bool afterOrderMatches = true;
+    for (size_t index = 0; index <= kPulsesPerDisplayedBeatParameter;
+         ++index) {
+        afterOrderMatches = afterOrderMatches &&
+                            source.parameter(index) ==
+                                parametersAfter.parameter(index);
+    }
+    midibuffer_test::PresetImage afterOrderImage;
+    expect(afterOrderMatches && parametersAfter.savePreset(afterOrderImage) &&
+               image.equals(afterOrderImage),
+           "parameter-before and parameter-after callback orders reconstruct the same saved state");
+
+    midibuffer_test::resetTrace();
+    fixture.lastClockSample += 16U;
+    expect(clockPulseAt(source, fixture.lastClockSample),
+           "original active state receives its next continuation clock");
+    stepThrough(source, fixture.lastClockSample + 8U);
+    const midibuffer_test::Trace originalContinuation =
+        midibuffer_test::trace();
+
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(restored, 0U) &&
+               midibuffer_test::trace().midiCallCount == 0U &&
+               !snapshot(restored).clockRunning,
+           "restored playback emits nothing on the first external acquisition pulse");
+    expect(clockPulseAt(restored, 16U),
+           "restored playback accepts the second external acquisition pulse");
+    stepThrough(restored, 24U);
+    const midibuffer_test::Trace restoredContinuation =
+        midibuffer_test::trace();
+    expect(snapshot(restored).clockRunning &&
+               sameMidiTrace(originalContinuation, restoredContinuation),
+           "after external-clock reacquisition, subsequent output bytes and routing equal uninterrupted continuation");
+
+    midibuffer_test::HostDouble captureSource;
+    expect(captureSource.instantiate(1),
+           "capture-enabled preset source constructs");
+    startCapture(captureSource);
+    acquireClock(captureSource);
+    sendMidi(captureSource, 0x93U, 72U, 100U);
+    const uint32_t captureSavedCount = snapshot(captureSource).eventCount;
+    midibuffer_test::PresetImage captureImage;
+    expect(captureSource.savePreset(captureImage),
+           "capture-enabled state saves without finalizing or mutating history");
+    expect(snapshot(captureSource).captureEnabled &&
+               snapshot(captureSource).eventCount == captureSavedCount,
+           "save-time snapshot is coherent and non-mutating during capture");
+
+    midibuffer_test::HostDouble captureRestored;
+    expect(captureRestored.instantiate(1) &&
+               captureRestored.loadPreset(captureImage, true) &&
+               snapshot(captureRestored).captureEnabled &&
+               !snapshot(captureRestored).clockRunning,
+           "saved capture-enabled state restores under parameter-after ordering with live-clock gating");
+    sendMidi(captureRestored, 0x94U, 73U, 100U);
+    expect(snapshot(captureRestored).eventCount == captureSavedCount,
+           "restored capture rejects input before a fresh external clock");
+    clockPulse(captureRestored);
+    sendMidi(captureRestored, 0x94U, 73U, 100U);
+    expect(snapshot(captureRestored).eventCount == captureSavedCount,
+           "first fresh clock pulse still gates restored capture");
+    clockPulse(captureRestored);
+    sendMidi(captureRestored, 0x94U, 73U, 100U);
+    expect(snapshot(captureRestored).eventCount == captureSavedCount + 1U,
+           "second fresh clock pulse resumes the restored capture state");
+    stopCapture(captureRestored);
+    expect(snapshot(captureRestored).eventCount == captureSavedCount + 3U,
+           "restored recorded-note ownership contributes its ending alongside subsequent input");
+}
+
+void verifyPresetSupportedBufferRangeAndCost() {
+    for (int32_t megabytes = 1; megabytes <= 5; ++megabytes) {
+        midibuffer_test::HostDouble source;
+        expect(source.instantiate(megabytes),
+               "supported-range preset source constructs");
+        startCapture(source);
+        acquireClock(source);
+        sendMidi(source, 0xB0U, 7U,
+                 static_cast<uint8_t>(megabytes * 10));
+        midibuffer_test::PresetImage image;
+        midibuffer_test::HostDouble restored;
+        expect(source.savePreset(image) && restored.instantiate(megabytes) &&
+                   restored.loadPreset(image),
+               "valid preset round-trips at each supported buffer specification");
+        midibuffer_test::PresetImage secondImage;
+        expect(restored.savePreset(secondImage) && image.equals(secondImage),
+               "each supported buffer specification has exhaustive saved-state equality");
+    }
+
+    midibuffer_test::HostDouble maximum;
+    expect(maximum.instantiate(5),
+           "maximum-size preset cost fixture constructs");
+    startCapture(maximum);
+    acquireClock(maximum);
+    const uint32_t capacity = snapshot(maximum).eventCapacity;
+    for (uint32_t index = 0; index < capacity; ++index) {
+        sendMidi(maximum, 0xB0U, 7U,
+                 static_cast<uint8_t>(index & 0x7fU));
+    }
+    midibuffer_test::PresetImage maximumImage;
+    const std::clock_t saveStart = std::clock();
+    expect(maximum.savePreset(maximumImage),
+           "full 5 MB retained history serializes through the production callback");
+    const std::clock_t saveEnd = std::clock();
+    midibuffer_test::HostDouble restored;
+    expect(restored.instantiate(5),
+           "full 5 MB fresh restore instance constructs");
+    const std::clock_t loadStart = std::clock();
+    expect(restored.loadPreset(maximumImage),
+           "full 5 MB retained history deserializes through the production callback");
+    const std::clock_t loadEnd = std::clock();
+    midibuffer_test::PresetImage maximumRoundTrip;
+    expect(snapshot(restored).eventCount == capacity &&
+               restored.savePreset(maximumRoundTrip) &&
+               maximumImage.equals(maximumRoundTrip),
+           "full supported payload preserves every retained event and all saved state");
+    const double saveMilliseconds =
+        1000.0 * static_cast<double>(saveEnd - saveStart) / CLOCKS_PER_SEC;
+    const double loadMilliseconds =
+        1000.0 * static_cast<double>(loadEnd - loadStart) / CLOCKS_PER_SEC;
+    std::printf(
+        "MEASURE: native full-5MB preset payload ~= %llu bytes, save %.2f ms, load %.2f ms (host-double JSON overhead; no firmware budget published)\n",
+        static_cast<unsigned long long>(maximumImage.payloadBytes()),
+        saveMilliseconds, loadMilliseconds);
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
@@ -2416,6 +2641,8 @@ int main() {
     verifyLiveEmergencySilenceMatrix();
     verifyTimelinePlaybackToggle();
     verifyTimedRightEncoderPanic();
+    verifyCompletePresetRoundTripsAndContinuation();
+    verifyPresetSupportedBufferRangeAndCost();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {

@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <distingnt/api.h>
+#include <distingnt/serialisation.h>
 
 #include <new>
 #include <stdint.h>
@@ -1480,6 +1481,7 @@ void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
         algorithm.clockRunning = true;
         algorithm.haveAcquisitionPulse = false;
         if (algorithm.transportState == kTransportArmed ||
+            algorithm.transportState == kTransportPlaying ||
             algorithm.transportState == kTransportClockLossPaused) {
             activatePendingPlayback(algorithm, sample);
         }
@@ -2146,6 +2148,487 @@ bool draw(_NT_algorithm* self) {
     return true;
 }
 
+const uint32_t kPresetVersion = 1U;
+const uint32_t kPresetHexChunkBytes = 512U;
+
+char hexDigit(uint8_t value) {
+    return static_cast<char>(value < 10U ? '0' + value
+                                        : 'a' + value - 10U);
+}
+
+int hexValue(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+void serialiseBytes(_NT_jsonStream& stream, const char* name,
+                    const void* bytes, uint32_t byteCount) {
+    const uint8_t* source = static_cast<const uint8_t*>(bytes);
+    char encoded[kPresetHexChunkBytes * 2U + 1U];
+    stream.addMemberName(name);
+    stream.openArray();
+    for (uint32_t offset = 0; offset < byteCount;) {
+        const uint32_t remaining = byteCount - offset;
+        const uint32_t chunk = remaining < kPresetHexChunkBytes
+                                   ? remaining
+                                   : kPresetHexChunkBytes;
+        for (uint32_t index = 0; index < chunk; ++index) {
+            const uint8_t value = source[offset + index];
+            encoded[index * 2U] = hexDigit(value >> 4U);
+            encoded[index * 2U + 1U] = hexDigit(value & 0x0fU);
+        }
+        encoded[chunk * 2U] = '\0';
+        stream.addString(encoded);
+        offset += chunk;
+    }
+    stream.closeArray();
+}
+
+bool deserialiseBytes(_NT_jsonParse& parse, void* bytes,
+                      uint32_t byteCount) {
+    uint8_t* destination = static_cast<uint8_t*>(bytes);
+    int chunks = 0;
+    if (!parse.numberOfArrayElements(chunks) || chunks < 0) {
+        return false;
+    }
+    uint32_t offset = 0;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const char* encoded = NULL;
+        if (!parse.string(encoded) || encoded == NULL) {
+            return false;
+        }
+        uint32_t index = 0;
+        while (encoded[index] != '\0') {
+            if (encoded[index + 1U] == '\0' || offset >= byteCount) {
+                return false;
+            }
+            const int high = hexValue(encoded[index]);
+            const int low = hexValue(encoded[index + 1U]);
+            if (high < 0 || low < 0) {
+                return false;
+            }
+            destination[offset++] =
+                static_cast<uint8_t>((high << 4U) | low);
+            index += 2U;
+        }
+    }
+    return offset == byteCount;
+}
+
+void addUnsigned32(_NT_jsonStream& stream, uint32_t value) {
+    stream.addNumber(static_cast<int>(value & 0xffffU));
+    stream.addNumber(static_cast<int>(value >> 16U));
+}
+
+void addUnsigned64(_NT_jsonStream& stream, uint64_t value) {
+    for (uint32_t shift = 0; shift < 64U; shift += 16U) {
+        stream.addNumber(static_cast<int>((value >> shift) & 0xffffU));
+    }
+}
+
+bool parseUnsigned32(_NT_jsonParse& parse, uint32_t& value) {
+    int low = 0;
+    int high = 0;
+    if (!parse.number(low) || !parse.number(high) || low < 0 || low > 65535 ||
+        high < 0 || high > 65535) {
+        return false;
+    }
+    value = static_cast<uint32_t>(low) |
+            (static_cast<uint32_t>(high) << 16U);
+    return true;
+}
+
+bool parseUnsigned64(_NT_jsonParse& parse, uint64_t& value) {
+    value = 0;
+    for (uint32_t shift = 0; shift < 64U; shift += 16U) {
+        int part = 0;
+        if (!parse.number(part) || part < 0 || part > 65535) {
+            return false;
+        }
+        value |= static_cast<uint64_t>(static_cast<uint32_t>(part)) << shift;
+    }
+    return true;
+}
+
+const RecordedEvent& serialisedEventAt(const Algorithm& algorithm,
+                                       uint32_t oldestFirstIndex) {
+    uint32_t ringIndex = algorithm.eventHead + oldestFirstIndex;
+    if (ringIndex >= algorithm.eventCapacity) {
+        ringIndex -= algorithm.eventCapacity;
+    }
+    return algorithm.recordingEvents[ringIndex];
+}
+
+void serialiseEvents(_NT_jsonStream& stream, const Algorithm& algorithm) {
+    char encoded[kPresetHexChunkBytes * 2U + 1U];
+    const uint64_t byteCount =
+        static_cast<uint64_t>(algorithm.eventCount) * sizeof(RecordedEvent);
+    stream.addMemberName("events");
+    stream.openArray();
+    uint32_t eventIndex = 0U;
+    uint32_t eventByte = 0U;
+    for (uint64_t offset = 0; offset < byteCount;) {
+        const uint64_t remaining = byteCount - offset;
+        const uint32_t chunk = remaining < kPresetHexChunkBytes
+                                   ? static_cast<uint32_t>(remaining)
+                                   : kPresetHexChunkBytes;
+        for (uint32_t index = 0; index < chunk; ++index) {
+            const uint8_t value = reinterpret_cast<const uint8_t*>(
+                &serialisedEventAt(algorithm, eventIndex))[eventByte];
+            encoded[index * 2U] = hexDigit(value >> 4U);
+            encoded[index * 2U + 1U] = hexDigit(value & 0x0fU);
+            if (++eventByte == sizeof(RecordedEvent)) {
+                eventByte = 0U;
+                ++eventIndex;
+            }
+        }
+        encoded[chunk * 2U] = '\0';
+        stream.addString(encoded);
+        offset += chunk;
+    }
+    stream.closeArray();
+}
+
+bool deserialiseEvents(_NT_jsonParse& parse, Algorithm& algorithm) {
+    int chunks = 0;
+    if (!parse.numberOfArrayElements(chunks) || chunks < 0) {
+        return false;
+    }
+    const uint64_t byteCount =
+        static_cast<uint64_t>(algorithm.eventCount) * sizeof(RecordedEvent);
+    uint64_t offset = 0;
+    uint32_t eventIndex = 0U;
+    uint32_t eventByte = 0U;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const char* encoded = NULL;
+        if (!parse.string(encoded) || encoded == NULL) {
+            return false;
+        }
+        uint32_t index = 0;
+        while (encoded[index] != '\0') {
+            if (encoded[index + 1U] == '\0' || offset >= byteCount) {
+                return false;
+            }
+            const int high = hexValue(encoded[index]);
+            const int low = hexValue(encoded[index + 1U]);
+            if (high < 0 || low < 0) {
+                return false;
+            }
+            uint32_t ringIndex = algorithm.eventHead + eventIndex;
+            if (ringIndex >= algorithm.eventCapacity) {
+                ringIndex -= algorithm.eventCapacity;
+            }
+            reinterpret_cast<uint8_t*>(
+                &algorithm.recordingEvents[ringIndex])[eventByte] =
+                    static_cast<uint8_t>((high << 4U) | low);
+            if (++eventByte == sizeof(RecordedEvent)) {
+                eventByte = 0U;
+                ++eventIndex;
+            }
+            ++offset;
+            index += 2U;
+        }
+    }
+    return offset == byteCount;
+}
+
+void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
+    const Algorithm* algorithm = static_cast<const Algorithm*>(self);
+    if (algorithm == NULL) {
+        return;
+    }
+
+    // NT invokes this synchronously inside one algorithm JSON object. The
+    // callback never mutates live state, so every field and retained event is
+    // read from the same callback-order boundary during capture or playback.
+    stream.addMemberName("midibufferState");
+    stream.openObject();
+    stream.addMemberName("version");
+    stream.addNumber(static_cast<int>(kPresetVersion));
+
+    stream.addMemberName("u64");
+    stream.openArray();
+    addUnsigned64(stream, algorithm->sampleCursor);
+    addUnsigned64(stream, algorithm->currentPulse);
+    addUnsigned64(stream, algorithm->historyEndPulseExclusive);
+    addUnsigned64(stream, algorithm->lastPulseSample);
+    addUnsigned64(stream, algorithm->lastClockIntervalSamples);
+    addUnsigned64(stream, algorithm->playbackPulse);
+    addUnsigned64(stream, algorithm->playbackIntervalStartSample);
+    addUnsigned64(stream, algorithm->playbackNextEventSample);
+    addUnsigned64(stream, algorithm->playbackIntervalOrdinal);
+    addUnsigned64(stream, algorithm->timelineScrollPulses);
+    addUnsigned64(stream, algorithm->pendingNextEndingSample);
+    addUnsigned64(stream, algorithm->rightEncoderHoldStartSample);
+    addUnsigned64(stream, algorithm->selection.startPulse);
+    addUnsigned64(stream, algorithm->selection.endPulse);
+    addUnsigned64(stream, algorithm->activeSelection.startPulse);
+    addUnsigned64(stream, algorithm->activeSelection.endPulse);
+    stream.closeArray();
+
+    stream.addMemberName("u32");
+    stream.openArray();
+    addUnsigned32(stream, algorithm->recordingBufferBytes);
+    addUnsigned32(stream, algorithm->eventCapacity);
+    addUnsigned32(stream, algorithm->eventHead);
+    addUnsigned32(stream, algorithm->eventCount);
+    addUnsigned32(stream, algorithm->clockIntervalSum);
+    addUnsigned32(stream, algorithm->playbackEventIndex);
+    addUnsigned32(stream, algorithm->clockIntervalWriteIndex);
+    addUnsigned32(stream, algorithm->clockIntervalCount);
+    addUnsigned32(stream, algorithm->timelineVisiblePulses);
+    stream.closeArray();
+
+    stream.addMemberName("flags");
+    stream.openArray();
+    stream.addBoolean(algorithm->captureEnabled);
+    stream.addBoolean(false);  // live external clock presence is not a preset
+    stream.addBoolean(false);  // clock acquisition edge is physical input
+    stream.addBoolean(false);  // current clock gate level is physical input
+    stream.addBoolean(false);  // current reset gate level is physical input
+    stream.addBoolean(algorithm->selectionValid);
+    stream.addBoolean(algorithm->activeSelectionValid);
+    stream.addBoolean(algorithm->rangeTransitionPending);
+    stream.addBoolean(algorithm->playbackPositionValid);
+    stream.addBoolean(false);  // reopen scheduling after clock acquisition
+    stream.addBoolean(false);
+    stream.addBoolean(false);
+    stream.addBoolean(algorithm->lastMovedBoundaryIsStart);
+    stream.addBoolean(false);  // encoder button state is physical input
+    stream.addBoolean(false);
+    stream.addNumber(static_cast<int>(algorithm->transportState));
+    stream.closeArray();
+
+    serialiseBytes(stream, "recorded", &algorithm->recordedState,
+                   sizeof(algorithm->recordedState));
+    serialiseBytes(stream, "output", &algorithm->playbackOutputState,
+                   sizeof(algorithm->playbackOutputState));
+    serialiseBytes(stream, "pending", &algorithm->pendingEndings,
+                   sizeof(algorithm->pendingEndings));
+    serialiseBytes(stream, "clockIntervals", algorithm->clockIntervals,
+                   sizeof(algorithm->clockIntervals));
+    serialiseEvents(stream, *algorithm);
+    stream.closeObject();
+}
+
+bool parseU64State(_NT_jsonParse& parse, Algorithm& algorithm) {
+    int count = 0;
+    uint64_t value[16] = {};
+    if (!parse.numberOfArrayElements(count) || count != 64) {
+        return false;
+    }
+    for (uint32_t index = 0; index < ARRAY_SIZE(value); ++index) {
+        if (!parseUnsigned64(parse, value[index])) {
+            return false;
+        }
+    }
+    algorithm.sampleCursor = value[0];
+    algorithm.currentPulse = value[1];
+    algorithm.historyEndPulseExclusive = value[2];
+    algorithm.lastPulseSample = value[3];
+    algorithm.lastClockIntervalSamples = value[4];
+    algorithm.playbackPulse = value[5];
+    algorithm.playbackIntervalStartSample = value[6];
+    algorithm.playbackNextEventSample = value[7];
+    algorithm.playbackIntervalOrdinal = value[8];
+    algorithm.timelineScrollPulses = value[9];
+    algorithm.pendingNextEndingSample = value[10];
+    algorithm.rightEncoderHoldStartSample = value[11];
+    algorithm.selection.startPulse = value[12];
+    algorithm.selection.endPulse = value[13];
+    algorithm.activeSelection.startPulse = value[14];
+    algorithm.activeSelection.endPulse = value[15];
+    return true;
+}
+
+bool parseU32State(_NT_jsonParse& parse, Algorithm& algorithm) {
+    int count = 0;
+    uint32_t value[9] = {};
+    if (!parse.numberOfArrayElements(count) || count != 18) {
+        return false;
+    }
+    for (uint32_t index = 0; index < ARRAY_SIZE(value); ++index) {
+        if (!parseUnsigned32(parse, value[index])) {
+            return false;
+        }
+    }
+    if (value[0] != algorithm.recordingBufferBytes ||
+        value[1] != algorithm.eventCapacity || value[3] > value[1] ||
+        (value[1] != 0U && value[2] >= value[1]) ||
+        value[6] >= kClockAverageWindow || value[7] > kClockAverageWindow ||
+        value[5] > value[3] || value[8] < kTimelineMinimumVisiblePulses ||
+        value[8] > kTimelineMaximumVisiblePulses) {
+        return false;
+    }
+    algorithm.eventHead = value[2];
+    algorithm.eventCount = value[3];
+    algorithm.clockIntervalSum = value[4];
+    algorithm.playbackEventIndex = value[5];
+    algorithm.clockIntervalWriteIndex = value[6];
+    algorithm.clockIntervalCount = value[7];
+    algorithm.timelineVisiblePulses = value[8];
+    return true;
+}
+
+bool parseFlags(_NT_jsonParse& parse, Algorithm& algorithm) {
+    int count = 0;
+    bool value[15] = {};
+    if (!parse.numberOfArrayElements(count) || count != 16) {
+        return false;
+    }
+    for (uint32_t index = 0; index < ARRAY_SIZE(value); ++index) {
+        if (!parse.boolean(value[index])) {
+            return false;
+        }
+    }
+    int transport = 0;
+    if (!parse.number(transport) || transport < kTransportStopped ||
+        transport > kTransportClockLossPaused) {
+        return false;
+    }
+    algorithm.captureEnabled = value[0];
+    algorithm.clockRunning = value[1];
+    algorithm.haveAcquisitionPulse = value[2];
+    algorithm.clockHigh = value[3];
+    algorithm.resetHigh = value[4];
+    algorithm.selectionValid = value[5];
+    algorithm.activeSelectionValid = value[6];
+    algorithm.rangeTransitionPending = value[7];
+    algorithm.playbackPositionValid = value[8];
+    algorithm.playbackIntervalOpen = value[9];
+    algorithm.playbackNextEventScheduled = value[10];
+    algorithm.pendingNextEndingScheduled = value[11];
+    algorithm.lastMovedBoundaryIsStart = value[12];
+    algorithm.rightEncoderHoldActive = value[13];
+    algorithm.rightEncoderPanicFired = value[14];
+    algorithm.transportState = static_cast<TransportState>(transport);
+    return true;
+}
+
+bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
+    int members = 0;
+    bool versionSeen = false;
+    bool u64Seen = false;
+    bool u32Seen = false;
+    bool flagsSeen = false;
+    bool recordedSeen = false;
+    bool outputSeen = false;
+    bool pendingSeen = false;
+    bool intervalsSeen = false;
+    bool eventsSeen = false;
+    if (!parse.numberOfObjectMembers(members)) {
+        return false;
+    }
+    for (int member = 0; member < members; ++member) {
+        if (parse.matchName("version")) {
+            int version = 0;
+            if (!parse.number(version) ||
+                version != static_cast<int>(kPresetVersion)) {
+                return false;
+            }
+            versionSeen = true;
+        } else if (parse.matchName("u64")) {
+            if (!parseU64State(parse, algorithm)) {
+                return false;
+            }
+            u64Seen = true;
+        } else if (parse.matchName("u32")) {
+            if (!parseU32State(parse, algorithm)) {
+                return false;
+            }
+            u32Seen = true;
+        } else if (parse.matchName("flags")) {
+            if (!parseFlags(parse, algorithm)) {
+                return false;
+            }
+            flagsSeen = true;
+        } else if (parse.matchName("recorded")) {
+            if (!deserialiseBytes(parse, &algorithm.recordedState,
+                                  sizeof(algorithm.recordedState))) {
+                return false;
+            }
+            recordedSeen = true;
+        } else if (parse.matchName("output")) {
+            if (!deserialiseBytes(parse, &algorithm.playbackOutputState,
+                                  sizeof(algorithm.playbackOutputState))) {
+                return false;
+            }
+            outputSeen = true;
+        } else if (parse.matchName("pending")) {
+            if (!deserialiseBytes(parse, &algorithm.pendingEndings,
+                                  sizeof(algorithm.pendingEndings))) {
+                return false;
+            }
+            pendingSeen = true;
+        } else if (parse.matchName("clockIntervals")) {
+            if (!deserialiseBytes(parse, algorithm.clockIntervals,
+                                  sizeof(algorithm.clockIntervals))) {
+                return false;
+            }
+            intervalsSeen = true;
+        } else if (parse.matchName("events")) {
+            if (!u32Seen || !deserialiseEvents(parse, algorithm)) {
+                return false;
+            }
+            eventsSeen = true;
+        } else if (!parse.skipMember()) {
+            return false;
+        }
+    }
+    return versionSeen && u64Seen && u32Seen && flagsSeen && recordedSeen &&
+           outputSeen && pendingSeen && intervalsSeen && eventsSeen;
+}
+
+bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
+    Algorithm* algorithm = static_cast<Algorithm*>(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    int members = 0;
+    bool restored = false;
+    if (!parse.numberOfObjectMembers(members)) {
+        return false;
+    }
+    for (int member = 0; member < members; ++member) {
+        if (parse.matchName("midibufferState")) {
+            if (!parsePresetState(parse, *algorithm)) {
+                return false;
+            }
+            restored = true;
+        } else if (!parse.skipMember()) {
+            return false;
+        }
+    }
+    if (!restored) {
+        return false;
+    }
+
+    // Clock/reset levels and instrument state belong to the live patch, not
+    // the preset. Retain all internal timing, cursor, ownership, and transport
+    // intent, but require two fresh physical clock edges before capture or
+    // resumed playback can emit anything. Closed scheduling is reconstructed
+    // from the saved cursor and pending ownership on that acquired interval.
+    algorithm->clockRunning = false;
+    algorithm->haveAcquisitionPulse = false;
+    algorithm->clockHigh = false;
+    algorithm->resetHigh = false;
+    algorithm->playbackIntervalOpen = false;
+    algorithm->playbackNextEventScheduled = false;
+    algorithm->pendingNextEndingScheduled = false;
+    algorithm->rightEncoderHoldActive = false;
+    algorithm->rightEncoderPanicFired = false;
+    return !algorithm->captureEnabled ||
+           algorithm->transportState == kTransportStopped;
+}
+
 static const _NT_factory kFactory = {
     .guid = NT_MULTICHAR('M', 'd', 'B', 'f'),
     .name = "MidiBuffer",
@@ -2165,8 +2648,8 @@ static const _NT_factory kFactory = {
     .hasCustomUi = hasCustomUi,
     .customUi = customUi,
     .setupUi = setupUi,
-    .serialise = NULL,
-    .deserialise = NULL,
+    .serialise = serialise,
+    .deserialise = deserialise,
     .midiSysEx = NULL,
     .parameterUiPrefix = NULL,
     .parameterString = NULL,

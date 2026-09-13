@@ -45,6 +45,22 @@ uint8_t framebufferPixel(int x, int y);
 size_t litFramebufferPixelCount();
 uint64_t heapAllocationCount();
 
+class PresetImage {
+  public:
+    PresetImage();
+    ~PresetImage();
+    PresetImage(const PresetImage&) = delete;
+    PresetImage& operator=(const PresetImage&) = delete;
+
+    uint64_t payloadBytes() const;
+    uint64_t valueCount() const;
+    bool equals(const PresetImage& other) const;
+
+  private:
+    friend class HostDouble;
+    void* document_;
+};
+
 class HostDouble {
   public:
     HostDouble();
@@ -60,6 +76,10 @@ class HostDouble {
     uint64_t elapsedSamples() const;
 
     void setParameter(size_t index, int16_t value);
+    int16_t parameter(size_t index) const;
+    bool savePreset(PresetImage& image);
+    bool loadPreset(const PresetImage& image,
+                    bool restoreParametersAfterCustomState = false);
     void clearFrames();
     float* bus(size_t oneBasedBus);
     void step(int numFramesBy4);

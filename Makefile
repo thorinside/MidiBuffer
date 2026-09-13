@@ -11,7 +11,7 @@ ARM_NM ?= arm-none-eabi-nm
 
 COMMON_WARNINGS := -Wall -Wextra -Werror
 COMMON_FLAGS := -std=gnu++11 $(COMMON_WARNINGS) -fno-exceptions -fno-rtti -I$(API_INCLUDE) -Isrc
-NATIVE_FLAGS := $(COMMON_FLAGS) -O2 -DMIDIBUFFER_NATIVE_TEST=1
+NATIVE_FLAGS := $(COMMON_FLAGS) -O2 -DMIDIBUFFER_NATIVE_TEST=1 -D_DISTINGNT_SERIALISATION_INTERNAL=1
 ARM_FLAGS := $(COMMON_FLAGS) -Os -fPIC -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb \
 	-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
 
@@ -30,7 +30,7 @@ inspect: $(ARM_OBJECT)
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Type:[[:space:]]+REL \(Relocatable file\)'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Machine:[[:space:]]+ARM'
 	@$(ARM_NM) --defined-only $(ARM_OBJECT) | grep -Eq '[[:space:]]T[[:space:]]pluginEntry$$'
-	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|NT_drawShapeI|NT_drawText|NT_globals|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset)$$' || true )"; \
+	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|NT_drawShapeI|NT_drawText|NT_globals|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset|_ZN13_NT_jsonParse.*|_ZN14_NT_jsonStream.*)$$' || true )"; \
 		test -z "$$unexpected" || { echo "Unexpected undefined symbols:"; echo "$$unexpected"; exit 1; }
 	@echo "PASS: valid ARM relocatable object exports pluginEntry; undefined symbols match the host/libc allowlist"
 
