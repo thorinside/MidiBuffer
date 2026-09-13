@@ -13,8 +13,9 @@ namespace {
 const uint32_t kBytesPerMegabyte = 1000000U;
 const int32_t kDefaultBufferMegabytes = 1;
 const float kGateThresholdVolts = 1.0f;
+const uint32_t kClockAverageWindow = 8U;
 
-static_assert(sizeof(RecordedEvent) == 16,
+static_assert(sizeof(RecordedEvent) == 24,
               "recording event size is part of capacity accounting");
 static_assert(kNT_destinationBreakout == 0x01 &&
                   kNT_destinationSelectBus == 0x02 &&
@@ -58,10 +59,15 @@ struct Algorithm : public _NT_algorithm {
           recordingBufferBytes(recordingBufferBytesValue),
           eventCapacity(recordingBufferBytesValue / sizeof(RecordedEvent)),
           eventHead(0), eventCount(0), sampleCursor(0), currentPulse(0),
-          lastPulseSample(0), lastClockIntervalSamples(0), playbackPulse(0),
-          playbackEventIndex(0), selection(), state(), captureEnabled(false),
-          clockRunning(false), haveAcquisitionPulse(false), clockHigh(false),
-          resetHigh(false), selectionValid(false), playbackActive(false) {}
+          lastPulseSample(0), lastClockIntervalSamples(0), clockIntervalSum(0),
+          playbackPulse(0), playbackIntervalStartSample(0),
+          playbackNextEventSample(0), playbackEventIndex(0),
+          clockIntervalWriteIndex(0),
+          clockIntervalCount(0), clockIntervals(), selection(), state(),
+          captureEnabled(false), clockRunning(false),
+          haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
+          selectionValid(false), playbackArmed(false), playbackActive(false),
+          playbackIntervalOpen(false), playbackNextEventScheduled(false) {}
 
     RecordedEvent* recordingEvents;
     uint32_t recordingBufferBytes;
@@ -73,8 +79,14 @@ struct Algorithm : public _NT_algorithm {
     uint64_t currentPulse;
     uint64_t lastPulseSample;
     uint64_t lastClockIntervalSamples;
+    uint32_t clockIntervalSum;
     uint64_t playbackPulse;
+    uint64_t playbackIntervalStartSample;
+    uint64_t playbackNextEventSample;
     uint32_t playbackEventIndex;
+    uint32_t clockIntervalWriteIndex;
+    uint32_t clockIntervalCount;
+    uint32_t clockIntervals[kClockAverageWindow];
     PulseRange selection;
     CallbackState state;
 
@@ -84,7 +96,10 @@ struct Algorithm : public _NT_algorithm {
     bool clockHigh;
     bool resetHigh;
     bool selectionValid;
+    bool playbackArmed;
     bool playbackActive;
+    bool playbackIntervalOpen;
+    bool playbackNextEventScheduled;
 };
 
 static const char* const kCaptureStrings[] = {
@@ -304,7 +319,10 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
 
 void clearSelection(Algorithm& algorithm) {
     algorithm.selectionValid = false;
+    algorithm.playbackArmed = false;
     algorithm.playbackActive = false;
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
     algorithm.playbackPulse = 0;
     algorithm.playbackEventIndex = 0;
     algorithm.selection.startPulse = 0;
@@ -423,7 +441,8 @@ bool recordedEventPassesPlaybackFilters(const Algorithm& algorithm,
     }
 }
 
-void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event) {
+void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event,
+                       uint64_t dispatchSample) {
     if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
         return;
     }
@@ -431,9 +450,11 @@ void emitRecordedEvent(const Algorithm& algorithm, const RecordedEvent& event) {
     const uint32_t destination = playbackDestinationMask(algorithm);
     const uint8_t status = playbackStatus(algorithm, event.bytes[0]);
     if (event.size == 2U) {
-        nt_host::sendMidi2(destination, status, event.bytes[1]);
+        nt_host::sendMidi2(destination, status, event.bytes[1],
+                           dispatchSample);
     } else {
-        nt_host::sendMidi3(destination, status, event.bytes[1], event.bytes[2]);
+        nt_host::sendMidi3(destination, status, event.bytes[1], event.bytes[2],
+                           dispatchSample);
     }
 }
 
@@ -450,28 +471,141 @@ uint32_t findPlaybackEventIndex(const Algorithm& algorithm, uint64_t pulse) {
     return algorithm.eventCount;
 }
 
-void replayCurrentPulse(Algorithm& algorithm) {
-    if (!algorithm.playbackActive || !algorithm.selectionValid) {
+const RecordedEvent* nextPlaybackEvent(const Algorithm& algorithm) {
+    if (algorithm.playbackEventIndex >= algorithm.eventCount) {
+        return NULL;
+    }
+    uint32_t ringIndex = algorithm.eventHead + algorithm.playbackEventIndex;
+    if (ringIndex >= algorithm.eventCapacity) {
+        ringIndex -= algorithm.eventCapacity;
+    }
+    return &algorithm.recordingEvents[ringIndex];
+}
+
+void clearClockAverage(Algorithm& algorithm) {
+    algorithm.clockIntervalSum = 0;
+    algorithm.clockIntervalWriteIndex = 0;
+    algorithm.clockIntervalCount = 0;
+    for (uint32_t index = 0; index < kClockAverageWindow; ++index) {
+        algorithm.clockIntervals[index] = 0;
+    }
+}
+
+uint32_t boundedInterval(uint64_t interval) {
+    // Eight capped values fit exactly in the 32-bit running sum. The cap is
+    // over three hours at 48 kHz, far beyond a practical musical clock.
+    const uint32_t maximumAveragedInterval = 0x1fffffffU;
+    return interval > maximumAveragedInterval
+               ? maximumAveragedInterval
+               : static_cast<uint32_t>(interval);
+}
+
+void addClockInterval(Algorithm& algorithm, uint64_t measuredInterval) {
+    const uint32_t interval = boundedInterval(measuredInterval);
+    if (algorithm.clockIntervalCount == kClockAverageWindow) {
+        algorithm.clockIntervalSum -=
+            static_cast<uint32_t>(algorithm.clockIntervals[
+                algorithm.clockIntervalWriteIndex]);
+    } else {
+        ++algorithm.clockIntervalCount;
+    }
+
+    algorithm.clockIntervals[algorithm.clockIntervalWriteIndex] = interval;
+    algorithm.clockIntervalSum += interval;
+    algorithm.clockIntervalWriteIndex =
+        (algorithm.clockIntervalWriteIndex + 1U) &
+        (kClockAverageWindow - 1U);
+}
+
+uint64_t predictedClockInterval(const Algorithm& algorithm) {
+    if (algorithm.clockIntervalCount == 0) {
+        return 0;
+    }
+    const uint32_t quotient =
+        algorithm.clockIntervalSum / algorithm.clockIntervalCount;
+    const uint32_t remainder =
+        algorithm.clockIntervalSum % algorithm.clockIntervalCount;
+    return quotient +
+           (remainder * 2U >= algorithm.clockIntervalCount ? 1U : 0U);
+}
+
+uint64_t multiplyDivideRounded(uint32_t left, uint32_t right,
+                               uint32_t divisor) {
+    if (divisor == 0U) {
+        return 0;
+    }
+
+    const uint64_t product = static_cast<uint64_t>(left) * right;
+    uint64_t quotient = 0;
+    uint64_t remainder = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        remainder = (remainder << 1U) | ((product >> bit) & 1U);
+        if (remainder >= divisor) {
+            remainder -= divisor;
+            quotient |= static_cast<uint64_t>(1) << bit;
+        }
+    }
+    if (remainder * 2U >= divisor) {
+        ++quotient;
+    }
+    return quotient;
+}
+
+uint64_t eventDispatchSample(const Algorithm& algorithm,
+                             const RecordedEvent& event) {
+    const uint32_t prediction = boundedInterval(
+        predictedClockInterval(algorithm));
+    const uint64_t scaledOffset = multiplyDivideRounded(
+        event.offsetSamples, prediction, event.sourceIntervalSamples);
+    const uint64_t maximum = ~static_cast<uint64_t>(0);
+    return scaledOffset > maximum - algorithm.playbackIntervalStartSample
+               ? maximum
+               : algorithm.playbackIntervalStartSample + scaledOffset;
+}
+
+void scheduleNextPlaybackEvent(Algorithm& algorithm) {
+    const RecordedEvent* event = nextPlaybackEvent(algorithm);
+    algorithm.playbackNextEventScheduled =
+        event != NULL && event->pulse == algorithm.playbackPulse &&
+        event->pulse < algorithm.selection.endPulse;
+    if (algorithm.playbackNextEventScheduled) {
+        algorithm.playbackNextEventSample =
+            eventDispatchSample(algorithm, *event);
+    }
+}
+
+void dispatchDuePlaybackEvents(Algorithm& algorithm, uint64_t sample) {
+    if (!algorithm.playbackActive || !algorithm.playbackIntervalOpen ||
+        !algorithm.selectionValid) {
         return;
     }
 
-    while (algorithm.playbackEventIndex < algorithm.eventCount) {
-        uint32_t ringIndex =
-            algorithm.eventHead + algorithm.playbackEventIndex;
-        if (ringIndex >= algorithm.eventCapacity) {
-            ringIndex -= algorithm.eventCapacity;
-        }
-        const RecordedEvent& event = algorithm.recordingEvents[ringIndex];
-        if (event.pulse > algorithm.playbackPulse) {
-            break;
-        }
+    while (algorithm.playbackNextEventScheduled &&
+           algorithm.playbackNextEventSample <= sample) {
+        const RecordedEvent* event = nextPlaybackEvent(algorithm);
         ++algorithm.playbackEventIndex;
-        if (event.pulse == algorithm.playbackPulse &&
-            event.pulse < algorithm.selection.endPulse) {
-            emitRecordedEvent(algorithm, event);
-        }
+        emitRecordedEvent(algorithm, *event, sample);
+        scheduleNextPlaybackEvent(algorithm);
+    }
+}
+
+void flushPendingPlaybackEvents(Algorithm& algorithm, uint64_t sample) {
+    if (!algorithm.playbackActive || !algorithm.playbackIntervalOpen) {
+        return;
     }
 
+    const RecordedEvent* event = nextPlaybackEvent(algorithm);
+    while (event != NULL && event->pulse == algorithm.playbackPulse &&
+           event->pulse < algorithm.selection.endPulse) {
+        ++algorithm.playbackEventIndex;
+        emitRecordedEvent(algorithm, *event, sample);
+        event = nextPlaybackEvent(algorithm);
+    }
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+}
+
+void advancePlaybackPulse(Algorithm& algorithm) {
     ++algorithm.playbackPulse;
     if (algorithm.playbackPulse >= algorithm.selection.endPulse) {
         algorithm.playbackPulse = algorithm.selection.startPulse;
@@ -480,17 +614,44 @@ void replayCurrentPulse(Algorithm& algorithm) {
     }
 }
 
+void beginPlaybackInterval(Algorithm& algorithm, uint64_t sample) {
+    algorithm.playbackIntervalStartSample = sample;
+    algorithm.playbackIntervalOpen = true;
+    scheduleNextPlaybackEvent(algorithm);
+    dispatchDuePlaybackEvents(algorithm, sample);
+}
+
+void activateArmedPlayback(Algorithm& algorithm, uint64_t sample) {
+    algorithm.playbackArmed = false;
+    algorithm.playbackActive = true;
+    algorithm.playbackPulse = algorithm.selection.startPulse;
+    algorithm.playbackEventIndex =
+        findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+    beginPlaybackInterval(algorithm, sample);
+}
+
+void beginOrAdvancePlayback(Algorithm& algorithm, uint64_t sample) {
+    if (algorithm.playbackArmed) {
+        activateArmedPlayback(algorithm, sample);
+    } else if (algorithm.playbackActive) {
+        advancePlaybackPulse(algorithm);
+        beginPlaybackInterval(algorithm, sample);
+    }
+}
+
 void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
     ++algorithm.state.clockEdges;
     ++algorithm.currentPulse;
 
     if (algorithm.clockRunning) {
+        flushPendingPlaybackEvents(algorithm, sample);
         const uint64_t interval = sample - algorithm.lastPulseSample;
         if (interval != 0) {
             algorithm.lastClockIntervalSamples = interval;
+            addClockInterval(algorithm, interval);
         }
         algorithm.lastPulseSample = sample;
-        replayCurrentPulse(algorithm);
+        beginOrAdvancePlayback(algorithm, sample);
         return;
     }
 
@@ -504,9 +665,14 @@ void handleClockEdge(Algorithm& algorithm, uint64_t sample) {
     algorithm.lastPulseSample = sample;
     if (interval != 0) {
         algorithm.lastClockIntervalSamples = interval;
+        addClockInterval(algorithm, interval);
         algorithm.clockRunning = true;
         algorithm.haveAcquisitionPulse = false;
-        replayCurrentPulse(algorithm);
+        if (algorithm.playbackArmed) {
+            activateArmedPlayback(algorithm, sample);
+        } else if (algorithm.playbackActive) {
+            beginPlaybackInterval(algorithm, sample);
+        }
     }
 }
 
@@ -524,6 +690,9 @@ void detectClockLoss(Algorithm& algorithm, uint64_t sample) {
         algorithm.clockRunning = false;
         algorithm.haveAcquisitionPulse = false;
         algorithm.lastClockIntervalSamples = 0;
+        algorithm.playbackIntervalOpen = false;
+        algorithm.playbackNextEventScheduled = false;
+        clearClockAverage(algorithm);
     }
 }
 
@@ -553,6 +722,9 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             detectClockLoss(*algorithm, algorithm->sampleCursor);
         }
         algorithm->clockHigh = clockHigh;
+        if (algorithm->clockRunning) {
+            dispatchDuePlaybackEvents(*algorithm, algorithm->sampleCursor);
+        }
 
         const bool resetHigh =
             resetFrames != NULL && resetFrames[frame] > kGateThresholdVolts;
@@ -591,6 +763,7 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     RecordedEvent event = {
         algorithm->currentPulse,
         0,
+        boundedInterval(algorithm->lastClockIntervalSamples),
         {byte0, byte1, byte2},
         static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
     };
@@ -614,7 +787,11 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     if (offset > 0xffffffffULL) {
         offset = 0xffffffffULL;
     }
-    event.offsetSamples = static_cast<uint32_t>(offset);
+    // The MIDI callback carries no arrival timestamp. A callback at the first
+    // sample boundary after a scanned pulse is the finest observable
+    // pulse-aligned case; normalize that one-sample ambiguity to phase zero.
+    event.offsetSamples =
+        offset <= 1U ? 0U : static_cast<uint32_t>(offset);
     appendEvent(*algorithm, event);
 }
 
@@ -732,9 +909,14 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.eventCount = algorithm->eventCount;
     snapshot.currentPulse = algorithm->currentPulse;
     snapshot.lastClockIntervalSamples = algorithm->lastClockIntervalSamples;
+    snapshot.predictedClockIntervalSamples =
+        predictedClockInterval(*algorithm);
+    snapshot.playbackPulse = algorithm->playbackPulse;
+    snapshot.clockAverageIntervalCount = algorithm->clockIntervalCount;
     snapshot.captureEnabled = algorithm->captureEnabled;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
+    snapshot.playbackArmed = algorithm->playbackArmed;
     snapshot.playbackActive = algorithm->playbackActive;
     snapshot.selection = algorithm->selection;
     if (algorithm->eventCount != 0) {
@@ -821,14 +1003,20 @@ bool startPlayback(_NT_algorithm* self) {
     algorithm->playbackPulse = range.startPulse;
     algorithm->playbackEventIndex =
         findPlaybackEventIndex(*algorithm, algorithm->playbackPulse);
-    algorithm->playbackActive = true;
+    algorithm->playbackIntervalOpen = false;
+    algorithm->playbackNextEventScheduled = false;
+    algorithm->playbackActive = false;
+    algorithm->playbackArmed = true;
     return true;
 }
 
 void stopPlayback(_NT_algorithm* self) {
     Algorithm* algorithm = asAlgorithm(self);
     if (algorithm != NULL) {
+        algorithm->playbackArmed = false;
         algorithm->playbackActive = false;
+        algorithm->playbackIntervalOpen = false;
+        algorithm->playbackNextEventScheduled = false;
     }
 }
 
@@ -850,16 +1038,33 @@ namespace nt_host {
 
 void drawText(int x, int y, const char* text) { NT_drawText(x, y, text); }
 
-void sendMidiByte(uint32_t destination, uint8_t byte0) {
+#if defined(MIDIBUFFER_NATIVE_TEST)
+extern "C" void midibufferTestSetDispatchSample(uint64_t sample);
+#endif
+
+void traceDispatchSample(uint64_t sample) {
+#if defined(MIDIBUFFER_NATIVE_TEST)
+    midibufferTestSetDispatchSample(sample);
+#else
+    (void)sample;
+#endif
+}
+
+void sendMidiByte(uint32_t destination, uint8_t byte0,
+                  uint64_t dispatchSample) {
+    traceDispatchSample(dispatchSample);
     NT_sendMidiByte(destination, byte0);
 }
 
-void sendMidi2(uint32_t destination, uint8_t byte0, uint8_t byte1) {
+void sendMidi2(uint32_t destination, uint8_t byte0, uint8_t byte1,
+               uint64_t dispatchSample) {
+    traceDispatchSample(dispatchSample);
     NT_sendMidi2ByteMessage(destination, byte0, byte1);
 }
 
 void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1,
-               uint8_t byte2) {
+               uint8_t byte2, uint64_t dispatchSample) {
+    traceDispatchSample(dispatchSample);
     NT_sendMidi3ByteMessage(destination, byte0, byte1, byte2);
 }
 

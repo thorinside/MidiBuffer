@@ -13,6 +13,7 @@ namespace midibuffer {
 struct RecordedEvent {
     uint64_t pulse;
     uint32_t offsetSamples;
+    uint32_t sourceIntervalSamples;
     uint8_t bytes[3];
     uint8_t size;
 };
@@ -31,9 +32,13 @@ struct CaptureSnapshot {
     uint64_t oldestPulse;
     uint64_t newestPulse;
     uint64_t lastClockIntervalSamples;
+    uint64_t predictedClockIntervalSamples;
+    uint64_t playbackPulse;
+    uint32_t clockAverageIntervalCount;
     bool captureEnabled;
     bool clockRunning;
     bool selectionValid;
+    bool playbackArmed;
     bool playbackActive;
     PulseRange selection;
 };
@@ -50,9 +55,9 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
 void clearPulseSelection(_NT_algorithm* self);
 bool acquirePlaybackSelection(const _NT_algorithm* self, PulseRange& range);
 
-// Minimal transport seam for the clock-driven replay path. The timeline
-// controls will own this contract; starting is refused without a valid retained
-// selection.
+// Transport seam for pulse-boundary arming and proportional between-pulse
+// replay. Timeline controls will own this contract; starting is refused without
+// a valid retained selection.
 bool startPlayback(_NT_algorithm* self);
 void stopPlayback(_NT_algorithm* self);
 

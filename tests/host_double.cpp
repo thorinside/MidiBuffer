@@ -8,6 +8,7 @@
 namespace {
 
 uint64_t gHeapAllocationCount = 0;
+uint64_t gPendingDispatchSample = 0;
 midibuffer_test::Trace gTrace;
 
 void copyText(char* destination, size_t capacity, const char* source) {
@@ -29,6 +30,7 @@ void recordMidi(uint32_t destination, uint8_t size, uint8_t byte0,
     }
     midibuffer_test::MidiCall& call =
         gTrace.midiCalls[gTrace.midiCallCount++];
+    call.dispatchSample = gPendingDispatchSample;
     call.destination = destination;
     call.size = size;
     call.bytes[0] = byte0;
@@ -60,6 +62,10 @@ void operator delete[](void* memory) noexcept {
 }
 
 extern "C" {
+
+void midibufferTestSetDispatchSample(uint64_t sample) {
+    gPendingDispatchSample = sample;
+}
 
 const _NT_globals NT_globals = {
     48000,
@@ -104,6 +110,7 @@ namespace midibuffer_test {
 
 void resetTrace() {
     std::memset(&gTrace, 0, sizeof(gTrace));
+    gPendingDispatchSample = 0;
 }
 
 const Trace& trace() {
@@ -122,7 +129,8 @@ HostDouble::HostDouble()
       dram_(NULL),
       values_(),
       frames_(),
-      hostAllocatedBytes_(0) {}
+      hostAllocatedBytes_(0),
+      elapsedSamples_(0) {}
 
 HostDouble::~HostDouble() {
     std::free(sram_);
@@ -193,6 +201,10 @@ uint64_t HostDouble::hostAllocatedBytes() const {
     return hostAllocatedBytes_;
 }
 
+uint64_t HostDouble::elapsedSamples() const {
+    return elapsedSamples_;
+}
+
 void HostDouble::setParameter(size_t index, int16_t value) {
     if (index < ARRAY_SIZE(values_)) {
         values_[index] = value;
@@ -212,6 +224,9 @@ float* HostDouble::bus(size_t oneBasedBus) {
 
 void HostDouble::step(int numFramesBy4) {
     factory_->step(algorithm_, frames_, numFramesBy4);
+    if (numFramesBy4 > 0) {
+        elapsedSamples_ += static_cast<uint64_t>(numFramesBy4) * 4U;
+    }
 }
 
 }  // namespace midibuffer_test

@@ -63,6 +63,29 @@ void noClockBlock(midibuffer_test::HostDouble& host) {
     host.step(2);
 }
 
+bool clockPulseAt(midibuffer_test::HostDouble& host, uint64_t sample) {
+    if (sample < host.elapsedSamples()) {
+        return false;
+    }
+    while (host.elapsedSamples() + 8U <= sample) {
+        noClockBlock(host);
+    }
+    const uint64_t frame = sample - host.elapsedSamples();
+    if (frame >= 8U) {
+        return false;
+    }
+    host.clearFrames();
+    host.bus(1)[frame] = 2.0f;
+    host.step(2);
+    return true;
+}
+
+void stepThrough(midibuffer_test::HostDouble& host, uint64_t sample) {
+    while (host.elapsedSamples() <= sample) {
+        noClockBlock(host);
+    }
+}
+
 void sendMidi(midibuffer_test::HostDouble& host, uint8_t status, uint8_t data1,
               uint8_t data2) {
     host.factory()->midiMessage(host.algorithm(), status, data1, data2);
@@ -106,6 +129,8 @@ bool sameHistory(const HistoryImage& expected,
         if (!midibuffer::recordedEventAt(host.algorithm(), index, actual) ||
             actual.pulse != expected.events[index].pulse ||
             actual.offsetSamples != expected.events[index].offsetSamples ||
+            actual.sourceIntervalSamples !=
+                expected.events[index].sourceIntervalSamples ||
             actual.size != expected.events[index].size ||
             std::memcmp(actual.bytes, expected.events[index].bytes,
                         sizeof(actual.bytes)) != 0) {
@@ -292,7 +317,7 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
            "draw reports explicit capture state");
     expect(drawContains("Events: 0"),
            "MIDI remains unrecorded while capture is stopped");
-    expect(drawContains("Capacity: 187500"),
+    expect(drawContains("Capacity: 125000"),
            "draw reports actual event capacity for the selected allocation");
     expect(
         midibuffer_test::heapAllocationCount() == allocationsBefore,
@@ -542,6 +567,7 @@ void verifyRetainedReplayRoutingMatrix() {
                 midibuffer::startPlayback(host.algorithm()) &&
                 completeMatrixMatches;
             clockPulse(host);
+            clockPulse(host);
             midibuffer::stopPlayback(host.algorithm());
 
             const midibuffer_test::Trace& current = midibuffer_test::trace();
@@ -648,6 +674,7 @@ void verifyRecoverableExpressionFiltering() {
             midibuffer::startPlayback(host.algorithm()) &&
             allFilterCombinationsMatch;
         clockPulse(host);
+        clockPulse(host);
         midibuffer::stopPlayback(host.algorithm());
 
         size_t emittedIndex = 0;
@@ -714,6 +741,7 @@ void verifyRecoverableExpressionFiltering() {
     midibuffer_test::resetTrace();
     const bool restarted = midibuffer::startPlayback(host.algorithm());
     clockPulse(host);
+    clockPulse(host);
     midibuffer::stopPlayback(host.algorithm());
     const midibuffer_test::Trace& restored = midibuffer_test::trace();
     bool restoredBytesMatch = restarted &&
@@ -732,6 +760,222 @@ void verifyRecoverableExpressionFiltering() {
     expect(restoredBytesMatch && sameHistory(recordedHistory, host),
            "turning every filter back off restores exact expression output "
            "from the unchanged recorded bytes");
+}
+
+struct TimingFixture {
+    uint64_t lastPulseSample;
+};
+
+TimingFixture prepareTimingHistory(midibuffer_test::HostDouble& host) {
+    TimingFixture fixture = {};
+    expect(host.instantiate(1), "timing trace host constructs");
+    startCapture(host);
+
+    expect(clockPulseAt(host, 0), "timing capture receives first pulse");
+    expect(clockPulseAt(host, 32),
+           "timing capture acquires a 32-sample source interval");
+    sendMidi(host, 0x90, 60, 100);
+    noClockBlock(host);
+    sendMidi(host, 0x80, 60, 0);
+
+    expect(clockPulseAt(host, 63),
+           "timing capture receives a near-block-boundary pulse");
+    sendMidi(host, 0x90, 67, 100);
+    expect(clockPulseAt(host, 95),
+           "timing capture closes the selected source range on a pulse");
+    stopCapture(host);
+
+    midibuffer::RecordedEvent quarter = {};
+    midibuffer::RecordedEvent halfway = {};
+    midibuffer::RecordedEvent aligned = {};
+    expect(midibuffer::recordedEventAt(host.algorithm(), 0, quarter) &&
+               quarter.pulse == 2 && quarter.offsetSamples == 8 &&
+               quarter.sourceIntervalSamples == 32,
+           "quarter-position input retains its source interval and offset");
+    expect(midibuffer::recordedEventAt(host.algorithm(), 1, halfway) &&
+               halfway.pulse == 2 && halfway.offsetSamples == 16 &&
+               halfway.sourceIntervalSamples == 32,
+           "halfway input retains its fractional source timing");
+    expect(midibuffer::recordedEventAt(host.algorithm(), 2, aligned) &&
+               aligned.pulse == 3 && aligned.offsetSamples == 0,
+           "finest observable post-pulse callback is retained as aligned");
+    expect(midibuffer::setPulseSelection(host.algorithm(), 2, 4),
+           "timing selection uses pulse-aligned inclusive/exclusive bounds");
+    fixture.lastPulseSample = 95;
+    return fixture;
+}
+
+void primeSteadyClock(midibuffer_test::HostDouble& host,
+                      TimingFixture& fixture, uint32_t interval) {
+    for (uint32_t index = 0; index < 8U; ++index) {
+        fixture.lastPulseSample += interval;
+        expect(clockPulseAt(host, fixture.lastPulseSample),
+               "steady clock priming pulse is delivered");
+    }
+    const midibuffer::CaptureSnapshot current = snapshot(host);
+    expect(current.clockAverageIntervalCount == 8U &&
+               current.predictedClockIntervalSamples == interval,
+           "eight-interval running window converges to the steady tempo");
+}
+
+uint64_t absoluteError(uint64_t actual, uint64_t expected) {
+    return actual >= expected ? actual - expected : expected - actual;
+}
+
+uint64_t verifyProportionalTrace(uint32_t interval) {
+    midibuffer_test::HostDouble host;
+    TimingFixture fixture = prepareTimingHistory(host);
+    primeSteadyClock(host, fixture, interval);
+
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "valid timing selection arms playback");
+    expect(snapshot(host).playbackArmed && !snapshot(host).playbackActive,
+           "known-tempo playback remains armed until the next received pulse");
+
+    const uint64_t startPulse = fixture.lastPulseSample + interval;
+    expect(clockPulseAt(host, startPulse),
+           "known-tempo playback starts on the next actual pulse");
+    expect(snapshot(host).playbackActive &&
+               snapshot(host).playbackPulse == 2,
+           "selection start is active on its pulse-aligned boundary");
+    stepThrough(host, startPulse + interval / 2U);
+    expect(clockPulseAt(host, startPulse + interval),
+           "second selected source pulse follows the next actual pulse");
+
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    const uint64_t expectedSamples[] = {
+        startPulse + interval / 4U,
+        startPulse + interval / 2U,
+        startPulse + interval,
+    };
+    const uint8_t expectedStatuses[] = {0x90, 0x80, 0x90};
+    bool traceMatches = current.midiCallCount == 3U;
+    uint64_t maximumError = 0;
+    for (size_t index = 0; index < 3U && index < current.midiCallCount;
+         ++index) {
+        const uint64_t error = absoluteError(
+            current.midiCalls[index].dispatchSample, expectedSamples[index]);
+        if (error > maximumError) {
+            maximumError = error;
+        }
+        traceMatches =
+            current.midiCalls[index].dispatchSample == expectedSamples[index] &&
+            current.midiCalls[index].bytes[0] == expectedStatuses[index] &&
+            traceMatches;
+    }
+    expect(traceMatches,
+           "quarter, halfway, and aligned events retain proportional positions "
+           "through the timestamped NT output adapter");
+
+    expect(clockPulseAt(host, startPulse + 2U * interval),
+           "selection end arrives on an actual pulse");
+    expect(snapshot(host).playbackPulse == 2,
+           "pulse-aligned selection end wraps exactly to its start boundary");
+    midibuffer::stopPlayback(host.algorithm());
+    return maximumError;
+}
+
+void verifyRunningAverageAndProportionalScheduling() {
+    midibuffer_test::HostDouble averaging;
+    expect(averaging.instantiate(1), "clock-average trace host constructs");
+    expect(clockPulseAt(averaging, 0) && clockPulseAt(averaging, 16) &&
+               clockPulseAt(averaging, 40),
+           "clock-average trace receives 16- and 24-sample intervals");
+    const midibuffer::CaptureSnapshot mixed = snapshot(averaging);
+    expect(mixed.lastClockIntervalSamples == 24 &&
+               mixed.predictedClockIntervalSamples == 20 &&
+               mixed.clockAverageIntervalCount == 2,
+           "prediction is the rounded running average, not the latest interval");
+    while (snapshot(averaging).clockRunning) {
+        noClockBlock(averaging);
+    }
+    expect(snapshot(averaging).predictedClockIntervalSamples == 0 &&
+               snapshot(averaging).clockAverageIntervalCount == 0,
+           "clock loss discards the complete averaging window");
+
+    const uint64_t errorAt16 = verifyProportionalTrace(16);
+    const uint64_t errorAt24 = verifyProportionalTrace(24);
+    const uint64_t maximumError =
+        errorAt16 > errorAt24 ? errorAt16 : errorAt24;
+    expect(maximumError == 0,
+           "native 48 kHz scheduler measurements match modeled due samples");
+    std::printf("MEASURE: deterministic native NT-adapter scheduler max error "
+                "= %llu samples across 16- and 24-sample steady intervals "
+                "(not physical-hardware latency)\n",
+                static_cast<unsigned long long>(maximumError));
+}
+
+void verifyEarlyPulseCatchUpOrder() {
+    midibuffer_test::HostDouble host;
+    TimingFixture fixture = prepareTimingHistory(host);
+    primeSteadyClock(host, fixture, 32);
+    noClockBlock(host);
+
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "early-pulse trace arms playback");
+    const uint64_t firstPulse = host.elapsedSamples();
+    host.clearFrames();
+    host.bus(1)[0] = 2.0f;
+    host.bus(1)[4] = 2.0f;
+    host.step(2);
+
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    expect(current.midiCallCount == 3 &&
+               current.midiCalls[0].dispatchSample == firstPulse + 4U &&
+               current.midiCalls[0].bytes[0] == 0x90 &&
+               current.midiCalls[0].bytes[1] == 60 &&
+               current.midiCalls[1].dispatchSample == firstPulse + 4U &&
+               current.midiCalls[1].bytes[0] == 0x80 &&
+               current.midiCalls[1].bytes[1] == 60 &&
+               current.midiCalls[2].dispatchSample == firstPulse + 4U &&
+               current.midiCalls[2].bytes[0] == 0x90 &&
+               current.midiCalls[2].bytes[1] == 67,
+           "early pulse catches up pending note-on/note-off in recorded order "
+           "before the next pulse-aligned event");
+}
+
+void verifyPlaybackClockAcquisition() {
+    midibuffer_test::HostDouble known;
+    TimingFixture knownFixture = prepareTimingHistory(known);
+    primeSteadyClock(known, knownFixture, 16);
+    expect(midibuffer::setPulseSelection(known.algorithm(), 3, 4),
+           "known-tempo acquisition selects an aligned event");
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(known.algorithm()),
+           "known-tempo aligned playback arms");
+    const uint64_t knownStart = knownFixture.lastPulseSample + 16U;
+    expect(clockPulseAt(known, knownStart) &&
+               midibuffer_test::trace().midiCallCount == 1 &&
+               midibuffer_test::trace().midiCalls[0].dispatchSample ==
+                   knownStart,
+           "valid tracked tempo starts armed playback on the next pulse");
+
+    midibuffer_test::HostDouble unknown;
+    TimingFixture unknownFixture = prepareTimingHistory(unknown);
+    primeSteadyClock(unknown, unknownFixture, 16);
+    expect(midibuffer::setPulseSelection(unknown.algorithm(), 3, 4),
+           "unknown-tempo acquisition selects an aligned event");
+    while (snapshot(unknown).clockRunning) {
+        noClockBlock(unknown);
+    }
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(unknown.algorithm()) &&
+               snapshot(unknown).playbackArmed,
+           "lost-tempo playback remains armed without emitting");
+    const uint64_t firstReturn = unknown.elapsedSamples();
+    expect(clockPulseAt(unknown, firstReturn) &&
+               midibuffer_test::trace().midiCallCount == 0 &&
+               snapshot(unknown).playbackArmed,
+           "first acquisition pulse emits no unknown-tempo playback");
+    const uint64_t secondReturn = firstReturn + 16U;
+    expect(clockPulseAt(unknown, secondReturn) &&
+               midibuffer_test::trace().midiCallCount == 1 &&
+               midibuffer_test::trace().midiCalls[0].dispatchSample ==
+                   secondReturn &&
+               snapshot(unknown).playbackActive,
+           "second acquisition pulse measures tempo and starts playback there");
 }
 
 void verifyHostOutputTrace() {
@@ -774,6 +1018,9 @@ int main() {
     verifyRollingHistoryAndSelectionInvalidation();
     verifyRetainedReplayRoutingMatrix();
     verifyRecoverableExpressionFiltering();
+    verifyRunningAverageAndProportionalScheduling();
+    verifyEarlyPulseCatchUpOrder();
+    verifyPlaybackClockAcquisition();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {

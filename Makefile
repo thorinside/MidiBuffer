@@ -11,7 +11,7 @@ ARM_NM ?= arm-none-eabi-nm
 
 COMMON_WARNINGS := -Wall -Wextra -Werror
 COMMON_FLAGS := -std=gnu++11 $(COMMON_WARNINGS) -fno-exceptions -fno-rtti -I$(API_INCLUDE) -Isrc
-NATIVE_FLAGS := $(COMMON_FLAGS) -O2
+NATIVE_FLAGS := $(COMMON_FLAGS) -O2 -DMIDIBUFFER_NATIVE_TEST=1
 ARM_FLAGS := $(COMMON_FLAGS) -Os -fPIC -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb \
 	-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
 

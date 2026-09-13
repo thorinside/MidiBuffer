@@ -7,9 +7,12 @@ namespace midibuffer {
 namespace nt_host {
 
 void drawText(int x, int y, const char* text);
-void sendMidiByte(uint32_t destination, uint8_t byte0);
-void sendMidi2(uint32_t destination, uint8_t byte0, uint8_t byte1);
-void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1, uint8_t byte2);
+void sendMidiByte(uint32_t destination, uint8_t byte0,
+                  uint64_t dispatchSample = 0);
+void sendMidi2(uint32_t destination, uint8_t byte0, uint8_t byte1,
+               uint64_t dispatchSample = 0);
+void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1,
+               uint8_t byte2, uint64_t dispatchSample = 0);
 
 }  // namespace nt_host
 }  // namespace midibuffer

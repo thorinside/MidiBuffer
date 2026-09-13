@@ -15,6 +15,7 @@ struct DrawCall {
 };
 
 struct MidiCall {
+    uint64_t dispatchSample;
     uint32_t destination;
     uint8_t bytes[3];
     uint8_t size;
@@ -43,6 +44,7 @@ class HostDouble {
     const _NT_factory* factory() const;
     const _NT_algorithmRequirements& requirements() const;
     uint64_t hostAllocatedBytes() const;
+    uint64_t elapsedSamples() const;
 
     void setParameter(size_t index, int16_t value);
     void clearFrames();
@@ -58,6 +60,7 @@ class HostDouble {
     int16_t values_[16];
     float frames_[kNT_lastBus * 8];
     uint64_t hostAllocatedBytes_;
+    uint64_t elapsedSamples_;
 };
 
 }  // namespace midibuffer_test
