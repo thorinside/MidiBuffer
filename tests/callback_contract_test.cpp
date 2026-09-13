@@ -1264,6 +1264,111 @@ void beginTransportOnHeldFirstBeat(midibuffer_test::HostDouble& host,
            "first selected beat leaves one playback note and sustain held");
 }
 
+void verifyAtomicRangeTransitionAtWrap() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "range-transition trace host constructs");
+    startCapture(host);
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "range-transition history acquires its source clock");
+    const uint64_t originalStart = snapshot(host).currentPulse;
+    sendMidi(host, 0x92, 60, 100);
+    sendMidi(host, 0xB2, 64, 127);
+    expect(clockPulseAt(host, 32U) && clockPulseAt(host, 47U),
+           "original range records a complete two-pulse phrase");
+    const uint64_t replacementStart = snapshot(host).currentPulse;
+    sendMidi(host, 0x93, 70, 100);
+    expect(clockPulseAt(host, 63U),
+           "replacement range advances to its release pulse");
+    sendMidi(host, 0x83, 70, 0);
+    expect(clockPulseAt(host, 79U),
+           "range-transition history closes both selectable phrases");
+    stopCapture(host);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), originalStart,
+                                         originalStart + 2U),
+           "original playing range is selected");
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "range-transition playback arms without stopping later edits");
+    expect(clockPulseAt(host, 95U),
+           "original range starts on the next clock pulse");
+    stepThrough(host, 103U);
+    const midibuffer::CaptureSnapshot playingOriginal = snapshot(host);
+    expect(playingOriginal.playbackActive &&
+               playingOriginal.activeSelectionValid &&
+               playingOriginal.activeSelection.startPulse == originalStart &&
+               playingOriginal.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 2U,
+           "active range emits its held note and sustain before any edit");
+
+    midibuffer_test::resetTrace();
+    expect(midibuffer::setPulseSelection(host.algorithm(),
+                                         originalStart + 1U,
+                                         originalStart + 3U) &&
+               midibuffer::setPulseSelection(host.algorithm(),
+                                             replacementStart,
+                                             replacementStart + 2U),
+           "repeated in-phrase edits accept complete boundary pairs");
+    midibuffer::CaptureSnapshot pending = snapshot(host);
+    expect(pending.playbackActive && pending.rangeTransitionPending &&
+               pending.playbackPulse == originalStart &&
+               pending.selection.startPulse == replacementStart &&
+               pending.selection.endPulse == replacementStart + 2U &&
+               pending.activeSelection.startPulse == originalStart &&
+               pending.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "latest selected pair remains pending while the active pair keeps "
+           "playing");
+
+    expect(clockPulseAt(host, 111U),
+           "original range reaches its final pulse after the edits");
+    pending = snapshot(host);
+    expect(pending.playbackActive && pending.rangeTransitionPending &&
+               pending.playbackPulse == originalStart + 1U &&
+               pending.activeSelection.startPulse == originalStart &&
+               pending.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "pending edits cause no mid-phrase jump or output");
+
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(host, 127U),
+           "current range reaches the wrap that adopts the edit");
+    const midibuffer_test::Trace& transition = midibuffer_test::trace();
+    const midibuffer::CaptureSnapshot adopted = snapshot(host);
+    expect(transition.midiCallCount == 3U &&
+               transition.midiCalls[0].dispatchSample == 127U &&
+               transition.midiCalls[0].bytes[0] == 0x82U &&
+               transition.midiCalls[0].bytes[1] == 60U &&
+               transition.midiCalls[1].dispatchSample == 127U &&
+               transition.midiCalls[1].bytes[0] == 0xB2U &&
+               transition.midiCalls[1].bytes[1] == 64U &&
+               transition.midiCalls[1].bytes[2] == 0U &&
+               transition.midiCalls[2].dispatchSample == 127U &&
+               transition.midiCalls[2].bytes[0] == 0x93U &&
+               transition.midiCalls[2].bytes[1] == 70U,
+           "changed wrap orders old note-off and sustain-off before the latest "
+           "range's first attack");
+    expect(adopted.playbackActive && !adopted.rangeTransitionPending &&
+               adopted.playbackPulse == replacementStart &&
+               adopted.activeSelection.startPulse == replacementStart &&
+               adopted.activeSelection.endPulse == replacementStart + 2U,
+           "latest boundary pair becomes active atomically without restart");
+
+    expect(clockPulseAt(host, 143U),
+           "replacement range reaches its recorded note-off");
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(host, 159U),
+           "unchanged replacement range reaches its ordinary wrap");
+    const midibuffer_test::Trace& unchanged = midibuffer_test::trace();
+    expect(unchanged.midiCallCount == 1U &&
+               unchanged.midiCalls[0].bytes[0] == 0x93U &&
+               unchanged.midiCalls[0].bytes[1] == 70U &&
+               snapshot(host).activeSelection.startPulse == replacementStart &&
+               !snapshot(host).rangeTransitionPending,
+           "unchanged wrap follows ordinary playback without transition "
+           "cleanup");
+}
+
 void verifyPlaybackCaptureExclusionAndManualStop() {
     midibuffer_test::HostDouble captureHost;
     expect(captureHost.instantiate(1),
@@ -1533,6 +1638,7 @@ int main() {
     verifyRunningAverageAndProportionalScheduling();
     verifyEarlyPulseCatchUpOrder();
     verifyPlaybackClockAcquisition();
+    verifyAtomicRangeTransitionAtWrap();
     verifyPlaybackCaptureExclusionAndManualStop();
     verifyResetCleanupAndCoincidence();
     verifyClockLossCleanupAndContinuation();

@@ -42,7 +42,10 @@ struct CaptureSnapshot {
     bool playbackArmed;
     bool playbackActive;
     bool playbackClockLossPaused;
+    bool activeSelectionValid;
+    bool rangeTransitionPending;
     PulseRange selection;
+    PulseRange activeSelection;
 };
 
 // Read-only seams used by the timeline/playback layers and native host tests.
@@ -52,6 +55,8 @@ bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
 
 // Timeline selection is pulse-identity based. Playback callers must acquire a
 // range through this contract; it refuses absent, malformed, or stale ranges.
+// While transport is running, selection edits remain pending and the latest
+// complete range replaces the active range atomically at its next loop wrap.
 bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
                        uint64_t endPulse);
 void clearPulseSelection(_NT_algorithm* self);
