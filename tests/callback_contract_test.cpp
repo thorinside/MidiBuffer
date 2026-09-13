@@ -2276,6 +2276,139 @@ void verifyAtomicRangeTransitionAtWrap() {
            "cleanup");
 }
 
+void verifyCallbackRangeEditsAtWrap() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1),
+           "callback range-transition trace host constructs");
+    startCapture(host);
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "callback range history acquires its source clock");
+    const uint64_t originalStart = snapshot(host).currentPulse;
+    sendMidi(host, 0x92U, 60U, 100U);
+    sendMidi(host, 0xB2U, 64U, 127U);
+    expect(clockPulseAt(host, 32U) && clockPulseAt(host, 47U),
+           "callback range history records the original held phrase");
+    const uint64_t replacementStart = snapshot(host).currentPulse;
+    sendMidi(host, 0x93U, 70U, 100U);
+    expect(clockPulseAt(host, 63U),
+           "callback range history advances to the replacement release");
+    sendMidi(host, 0x83U, 70U, 0U);
+    expect(clockPulseAt(host, 79U),
+           "callback range history closes its retained envelope");
+    stopCapture(host);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), originalStart,
+                                         originalStart + 2U),
+           "callback range fixture selects the original pair");
+    seedRightPot(host, 0.0f);
+    moveRightPot(host, 0.34f);
+    const midibuffer::CaptureSnapshot stoppedMoved = snapshot(host);
+    expect(stoppedMoved.selection.startPulse == originalStart + 1U &&
+               stoppedMoved.selection.endPulse == originalStart + 3U &&
+               stoppedMoved.selectionFineTarget ==
+                   midibuffer::kSelectionFineTargetRange &&
+               !stoppedMoved.activeSelectionValid &&
+               !stoppedMoved.rangeTransitionPending,
+           "stopped pot-3 Range motion publishes immediately without a pending transport transition");
+    moveUi(host, 0U, 0.0f, 0.0f, 0.34f, 0, -1);
+    const midibuffer::CaptureSnapshot stoppedRestored = snapshot(host);
+    expect(stoppedRestored.selection.startPulse == originalStart &&
+               stoppedRestored.selection.endPulse == originalStart + 2U &&
+               !stoppedRestored.rangeTransitionPending &&
+               !stoppedRestored.playbackArmed &&
+               !stoppedRestored.playbackActive,
+           "stopped Range nudge updates the selected pair directly and retains stopped handling");
+
+    midibuffer_test::resetTrace();
+    expect(midibuffer::startPlayback(host.algorithm()),
+           "callback range fixture arms through the production transport seam");
+    expect(clockPulseAt(host, 95U),
+           "callback range fixture starts the original pass");
+    stepThrough(host, 103U);
+    const midibuffer::CaptureSnapshot beforeEdits = snapshot(host);
+    expect(beforeEdits.playbackActive &&
+               beforeEdits.playbackPulse == originalStart &&
+               beforeEdits.activeSelection.startPulse == originalStart &&
+               beforeEdits.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 2U,
+           "callback range fixture opens with note and sustain held");
+
+    midibuffer_test::resetTrace();
+    moveRightPot(host, 0.70f);
+    const midibuffer::CaptureSnapshot potPending = snapshot(host);
+    expect(potPending.selection.startPulse == replacementStart &&
+               potPending.selection.endPulse == replacementStart + 2U &&
+               potPending.rangeTransitionPending &&
+               potPending.playbackPulse == beforeEdits.playbackPulse &&
+               potPending.playbackEventIndex == beforeEdits.playbackEventIndex &&
+               potPending.activeSelection.startPulse == originalStart &&
+               potPending.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "running pot-3 Range motion changes only the latest pending pair mid-pass");
+
+    moveUi(host, 0U, 0.0f, 0.0f, 0.70f, 0, -2);
+    const midibuffer::CaptureSnapshot canceled = snapshot(host);
+    expect(canceled.selection.startPulse == originalStart &&
+               canceled.selection.endPulse == originalStart + 2U &&
+               !canceled.rangeTransitionPending &&
+               canceled.playbackPulse == beforeEdits.playbackPulse &&
+               canceled.activeSelection.startPulse == originalStart &&
+               canceled.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "returning through the Range control to the active pair cancels the pending transition");
+
+    moveUi(host, 0U, 0.0f, 0.0f, 0.70f, 0, 1);
+    const midibuffer::CaptureSnapshot firstReplacement = snapshot(host);
+    moveUi(host, 0U, 0.0f, 0.0f, 0.70f, 0, 1);
+    const midibuffer::CaptureSnapshot latestReplacement = snapshot(host);
+    expect(firstReplacement.selection.startPulse == originalStart + 1U &&
+               firstReplacement.rangeTransitionPending &&
+               latestReplacement.selection.startPulse == replacementStart &&
+               latestReplacement.selection.endPulse == replacementStart + 2U &&
+               latestReplacement.rangeTransitionPending &&
+               latestReplacement.playbackPulse == beforeEdits.playbackPulse &&
+               latestReplacement.activeSelection.startPulse == originalStart &&
+               latestReplacement.activeSelection.endPulse ==
+                   originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "several running Range nudges retain only the latest complete pair without moving the active cursor");
+
+    expect(clockPulseAt(host, 111U),
+           "callback range fixture reaches the final original pulse");
+    const midibuffer::CaptureSnapshot beforeWrap = snapshot(host);
+    expect(beforeWrap.rangeTransitionPending &&
+               beforeWrap.playbackPulse == originalStart + 1U &&
+               beforeWrap.activeSelection.startPulse == originalStart &&
+               beforeWrap.activeSelection.endPulse == originalStart + 2U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "latest callback edit remains pending through the final active pulse");
+
+    midibuffer_test::resetTrace();
+    expect(clockPulseAt(host, 127U),
+           "callback range fixture reaches its publication wrap");
+    const midibuffer_test::Trace& transition = midibuffer_test::trace();
+    const midibuffer::CaptureSnapshot adopted = snapshot(host);
+    expect(transition.midiCallCount == 3U &&
+               transition.midiCalls[0].dispatchSample == 127U &&
+               transition.midiCalls[0].bytes[0] == 0x82U &&
+               transition.midiCalls[0].bytes[1] == 60U &&
+               transition.midiCalls[1].dispatchSample == 127U &&
+               transition.midiCalls[1].bytes[0] == 0xB2U &&
+               transition.midiCalls[1].bytes[1] == 64U &&
+               transition.midiCalls[1].bytes[2] == 0U &&
+               transition.midiCalls[2].dispatchSample == 127U &&
+               transition.midiCalls[2].bytes[0] == 0x93U &&
+               transition.midiCalls[2].bytes[1] == 70U,
+           "callback publication keeps old note-off and sustain-off ahead of the latest range attack at one wrap timestamp");
+    expect(adopted.playbackActive && !adopted.rangeTransitionPending &&
+               adopted.playbackPulse == replacementStart &&
+               adopted.selection.startPulse == replacementStart &&
+               adopted.selection.endPulse == replacementStart + 2U &&
+               adopted.activeSelection.startPulse == replacementStart &&
+               adopted.activeSelection.endPulse == replacementStart + 2U,
+           "the latest callback-selected pair becomes active exactly at wrap");
+}
+
 void verifyPlaybackCaptureExclusionAndManualStop() {
     midibuffer_test::HostDouble captureHost;
     expect(captureHost.instantiate(1),
@@ -2957,18 +3090,35 @@ void verifyTimelinePlaybackToggle() {
     sendMidi(invalid, 0x90U, 48U, 100U);
     const uint32_t eventCountBefore = snapshot(invalid).eventCount;
     setEncoderButton(invalid, kNT_encoderButtonL, false);
+    setEncoderButton(invalid, kNT_encoderButtonL, true);
     expect(!snapshot(invalid).playbackArmed &&
                !snapshot(invalid).playbackActive &&
                snapshot(invalid).captureEnabled &&
                snapshot(invalid).eventCount == eventCountBefore,
-           "left encoder refuses an invalid selection without stopping capture");
+           "left-encoder rising edge and held callback both refuse an invalid selection without stopping capture");
     releaseEncoderButton(invalid, kNT_encoderButtonL);
 
     midibuffer_test::HostDouble host;
     prepareTransportHistory(host);
     setEncoderButton(host, kNT_encoderButtonL, false);
+    setEncoderButton(host, kNT_encoderButtonL, true);
     expect(snapshot(host).playbackArmed && !snapshot(host).captureEnabled,
-           "left encoder arms a valid selection through normal playback entry");
+           "one left-encoder rising edge arms and a held callback does not immediately stop");
+    releaseEncoderButton(host, kNT_encoderButtonL);
+
+    midibuffer_test::resetTrace();
+    setEncoderButton(host, kNT_encoderButtonL, false);
+    setEncoderButton(host, kNT_encoderButtonL, true);
+    expect(!snapshot(host).playbackArmed &&
+               !snapshot(host).playbackActive &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "a new rising edge stops armed playback and its held callback does not rearm");
+    releaseEncoderButton(host, kNT_encoderButtonL);
+
+    setEncoderButton(host, kNT_encoderButtonL, false);
+    setEncoderButton(host, kNT_encoderButtonL, true);
+    expect(snapshot(host).playbackArmed,
+           "a later rising edge rearms after the button release");
     releaseEncoderButton(host, kNT_encoderButtonL);
     clockPulse(host);
     expect(snapshot(host).playbackActive,
@@ -2977,20 +3127,20 @@ void verifyTimelinePlaybackToggle() {
     const uint64_t savedPulse = snapshot(host).playbackPulse;
     midibuffer_test::resetTrace();
     setEncoderButton(host, kNT_encoderButtonL, false);
+    setEncoderButton(host, kNT_encoderButtonL, true);
     expect(!snapshot(host).playbackActive &&
+               !snapshot(host).playbackArmed &&
                snapshot(host).playbackPulse == savedPulse &&
                !snapshot(host).captureEnabled &&
                midibuffer_test::trace().midiCallCount == 2U,
-           "left encoder stops with normal held-note/sustain cleanup, saved position, and paused capture");
+           "one running-stop edge performs normal cleanup while the held callback neither toggles nor repeats cleanup");
     releaseEncoderButton(host, kNT_encoderButtonL);
 
     midibuffer_test::resetTrace();
     clockPulse(host);
-    expect(midibuffer_test::trace().midiCallCount == 0U,
-           "left-encoder stop stays silent until another explicit toggle");
-    setEncoderButton(host, kNT_encoderButtonL, false);
-    expect(snapshot(host).playbackArmed,
-           "a later left-encoder press explicitly rearms the saved position");
+    expect(midibuffer_test::trace().midiCallCount == 0U &&
+               !snapshot(host).playbackActive,
+           "left-encoder stop stays silent until another explicit rising edge");
 }
 
 void verifyTimedRightEncoderPanic() {
@@ -3012,8 +3162,17 @@ void verifyTimedRightEncoderPanic() {
                         static_cast<int16_t>(destinationSetting));
         beginTransportOnHeldFirstBeat(host, fixture);
 
+        midibuffer_test::resetTrace();
         setEncoderButton(host, kNT_encoderButtonR, false);
-        const uint64_t deadline = host.elapsedSamples() + 48000U;
+        releaseEncoderButton(host, kNT_encoderButtonR);
+        allDestinationsMatch =
+            midibuffer_test::trace().midiCallCount == 0U &&
+            snapshot(host).playbackActive && allDestinationsMatch;
+
+        moveUi(host, kNT_encoderButtonR | kNT_potButtonR,
+               0.0f, 0.0f, 0.50f, 1, 1, 0U);
+        const uint64_t deadline =
+            host.elapsedSamples() + NT_globals.sampleRate;
         uint32_t block = 0U;
         while (host.elapsedSamples() + 8U < deadline) {
             if ((block++ & 1U) == 0U) {
@@ -3023,7 +3182,10 @@ void verifyTimedRightEncoderPanic() {
             }
         }
         midibuffer_test::resetTrace();
-        setEncoderButton(host, kNT_encoderButtonR, true);
+        moveUi(host,
+               kNT_encoderButtonR | kNT_potButtonR | kNT_potR,
+               0.0f, 0.0f, 0.25f, -1, 1,
+               kNT_encoderButtonR | kNT_potButtonR);
         allDestinationsMatch =
             midibuffer_test::trace().midiCallCount == 0U &&
             snapshot(host).playbackActive && allDestinationsMatch;
@@ -3035,28 +3197,82 @@ void verifyTimedRightEncoderPanic() {
         }
         const uint64_t savedPulse = snapshot(host).playbackPulse;
         midibuffer_test::resetTrace();
-        setEncoderButton(host, kNT_encoderButtonR, true);
+        moveUi(host,
+               kNT_encoderButtonR | kNT_potButtonR | kNT_potR,
+               0.0f, 0.0f, 0.75f, 1, -1,
+               kNT_encoderButtonR | kNT_potButtonR);
+        bool exactTimestamp = midibuffer_test::trace().midiCallCount == 32U;
+        for (size_t index = 0;
+             index < midibuffer_test::trace().midiCallCount; ++index) {
+            exactTimestamp =
+                midibuffer_test::trace().midiCalls[index].dispatchSample ==
+                    deadline &&
+                exactTimestamp;
+        }
         allDestinationsMatch =
-            host.elapsedSamples() == deadline &&
+            host.elapsedSamples() == deadline && exactTimestamp &&
             panicTraceMatches(destinations[destinationSetting]) &&
             !snapshot(host).playbackActive &&
             !snapshot(host).captureEnabled &&
             snapshot(host).playbackPulse == savedPulse &&
             allDestinationsMatch;
 
-        setEncoderButton(host, kNT_encoderButtonR, true);
+        moveUi(host,
+               kNT_encoderButtonR | kNT_potButtonR | kNT_potR,
+               0.0f, 0.0f, 0.60f, -1, 1,
+               kNT_encoderButtonR | kNT_potButtonR);
         allDestinationsMatch =
             midibuffer_test::trace().midiCallCount == 32U &&
             allDestinationsMatch;
-        releaseEncoderButton(host, kNT_encoderButtonR);
+
+        if (destinationSetting == 0) {
+            const uint64_t stillHeldDeadline =
+                host.elapsedSamples() + NT_globals.sampleRate;
+            while (host.elapsedSamples() < stillHeldDeadline) {
+                noClockBlock(host);
+            }
+            moveUi(host, kNT_encoderButtonR | kNT_potButtonR,
+                   0.0f, 0.0f, 0.60f, 0, 0,
+                   kNT_encoderButtonR | kNT_potButtonR);
+            allDestinationsMatch =
+                midibuffer_test::trace().midiCallCount == 32U &&
+                allDestinationsMatch;
+        }
+
+        moveUi(host, 0U, 0.0f, 0.0f, 0.60f, 0, 0,
+               kNT_encoderButtonR | kNT_potButtonR);
         midibuffer_test::resetTrace();
+        if (destinationSetting == 0) {
+            setEncoderButton(host, kNT_encoderButtonR, false);
+            const uint64_t rearmedDeadline =
+                host.elapsedSamples() + NT_globals.sampleRate;
+            while (host.elapsedSamples() < rearmedDeadline) {
+                noClockBlock(host);
+            }
+            setEncoderButton(host, kNT_encoderButtonR, true);
+            bool rearmedTimestamp =
+                midibuffer_test::trace().midiCallCount == 32U;
+            for (size_t index = 0;
+                 index < midibuffer_test::trace().midiCallCount; ++index) {
+                rearmedTimestamp =
+                    midibuffer_test::trace().midiCalls[index].dispatchSample ==
+                        rearmedDeadline &&
+                    rearmedTimestamp;
+            }
+            allDestinationsMatch =
+                rearmedTimestamp &&
+                panicTraceMatches(destinations[destinationSetting]) &&
+                allDestinationsMatch;
+            releaseEncoderButton(host, kNT_encoderButtonR);
+            midibuffer_test::resetTrace();
+        }
         clockPulse(host);
         allDestinationsMatch =
             midibuffer_test::trace().midiCallCount == 0U &&
             !snapshot(host).playbackActive && allDestinationsMatch;
     }
     expect(allDestinationsMatch,
-           "right-encoder hold is silent before one second, panics once at exactly one second on every selected destination, and stays stopped");
+           "right-encoder short press is inert; held panic stays silent before sampleRate, fires once at the exact sample during rotations and pot-3 hold, and rearms only after release");
 }
 
 bool sameMidiTrace(const midibuffer_test::Trace& left,
@@ -3497,6 +3713,7 @@ int main() {
     verifyEarlyPulseCatchUpOrder();
     verifyPlaybackClockAcquisition();
     verifyAtomicRangeTransitionAtWrap();
+    verifyCallbackRangeEditsAtWrap();
     verifyPlaybackCaptureExclusionAndManualStop();
     verifyResetCleanupAndCoincidence();
     verifyClockLossCleanupAndContinuation();
