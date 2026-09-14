@@ -120,6 +120,17 @@ size_t matchingShapeCount(int x0, int y0, int x1, int y1, int colour) {
     return count;
 }
 
+size_t directionalEdgeHandleLineCount(bool older, bool start) {
+    const int edgeX = older ? 4 : 251;
+    const int innerX = older ? 8 : 247;
+    const int top = start ? 16 : 48;
+    const int middle = top + 4;
+    const int bottom = top + 8;
+    return matchingShapeCount(innerX, top, edgeX, middle, 15) +
+           matchingShapeCount(edgeX, middle, innerX, bottom, 15) +
+           matchingShapeCount(innerX, top, innerX, bottom, 15);
+}
+
 size_t shapeColourCount(int colour) {
     const midibuffer_test::Trace& current = midibuffer_test::trace();
     size_t count = 0U;
@@ -1442,6 +1453,151 @@ void verifyTimelineSelectionDisplayAndControls() {
            "playing timeline remains rendered through draw traces and framebuffer");
 }
 
+void verifyDirectionalBoundaryHandles() {
+    struct DrawCase {
+        uint64_t selectionStart;
+        uint64_t selectionEnd;
+        bool startOlder;
+        bool startNewer;
+        bool endOlder;
+        bool endNewer;
+        const char* description;
+    };
+    const DrawCase cases[] = {
+        {150U, 170U, false, false, false, false,
+         "visible boundaries retain full selection brackets"},
+        {120U, 170U, true, false, false, false,
+         "an older offscreen Start gets the upper left-pointing handle"},
+        {150U, 200U, false, false, false, true,
+         "a newer offscreen End gets the lower right-pointing handle"},
+        {120U, 200U, true, false, false, true,
+         "simultaneous offscreen boundaries get opposite directional handles"},
+        {100U, 120U, true, false, true, false,
+         "offscreen Start and End remain distinct on the older edge"},
+        {200U, 240U, false, true, false, true,
+         "offscreen Start and End remain distinct on the newer edge"},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(cases); ++index) {
+        midibuffer_test::HostDouble host;
+        expect(installRangeFixture(host, 100U, 300U,
+                                   cases[index].selectionStart,
+                                   cases[index].selectionEnd) &&
+                   midibuffer::setTimelineNavigationFixture(
+                       host.algorithm(), false, 40U, 120U,
+                       midibuffer::kSelectionFineTargetEnd),
+               "directional boundary draw fixture installs");
+        const midibuffer::CaptureSnapshot before = snapshot(host);
+        midibuffer_test::resetTrace();
+        const bool drew = host.factory()->draw(host.algorithm());
+        const midibuffer::CaptureSnapshot after = snapshot(host);
+        const size_t startOlderLines =
+            directionalEdgeHandleLineCount(true, true);
+        const size_t startNewerLines =
+            directionalEdgeHandleLineCount(false, true);
+        const size_t endOlderLines =
+            directionalEdgeHandleLineCount(true, false);
+        const size_t endNewerLines =
+            directionalEdgeHandleLineCount(false, false);
+        const bool expectedHandles =
+            startOlderLines == (cases[index].startOlder ? 3U : 0U) &&
+            startNewerLines == (cases[index].startNewer ? 3U : 0U) &&
+            endOlderLines == (cases[index].endOlder ? 3U : 0U) &&
+            endNewerLines == (cases[index].endNewer ? 3U : 0U);
+        const bool visibleStart = cases[index].selectionStart >= 140U &&
+                                  cases[index].selectionStart <= 180U;
+        const bool visibleEnd = cases[index].selectionEnd >= 140U &&
+                                cases[index].selectionEnd <= 180U;
+        const int startX = visibleStart
+                               ? 4 + static_cast<int>(
+                                         (cases[index].selectionStart - 140U) *
+                                         247U / 40U)
+                               : -1;
+        const int endX = visibleEnd
+                             ? 4 + static_cast<int>(
+                                       (cases[index].selectionEnd - 140U) *
+                                       247U / 40U)
+                             : -1;
+        const bool expectedBrackets =
+            (!visibleStart ||
+             matchingShapeCount(startX, 16, startX, 56, 15) == 1U) &&
+            (!visibleEnd ||
+             matchingShapeCount(endX, 16, endX, 56, 15) == 1U);
+        const bool framebufferEvidence =
+            (!cases[index].startOlder ||
+             midibuffer_test::framebufferPixel(4, 20) == 15U) &&
+            (!cases[index].startNewer ||
+             midibuffer_test::framebufferPixel(251, 20) == 15U) &&
+            (!cases[index].endOlder ||
+             midibuffer_test::framebufferPixel(4, 52) == 15U) &&
+            (!cases[index].endNewer ||
+             midibuffer_test::framebufferPixel(251, 52) == 15U);
+        expect(drew && expectedHandles && expectedBrackets &&
+                   framebufferEvidence &&
+                   after.timelineViewStartPulse == before.timelineViewStartPulse &&
+                   after.timelineViewEndPulse == before.timelineViewEndPulse &&
+                   after.timelineVisiblePulses == before.timelineVisiblePulses &&
+                   after.timelineScrollPulses == before.timelineScrollPulses &&
+                   after.timelineShowAll == before.timelineShowAll &&
+                   sameSelectionAndTransport(before, after),
+               cases[index].description);
+    }
+
+    struct RetrievalCase {
+        bool startBoundary;
+        uint64_t selectionStart;
+        uint64_t selectionEnd;
+        bool older;
+        uint64_t expectedBoundary;
+    };
+    const RetrievalCase retrievals[] = {
+        {true, 120U, 170U, true, 140U},
+        {false, 150U, 200U, false, 180U},
+        {true, 200U, 240U, false, 180U},
+        {false, 100U, 120U, true, 140U},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(retrievals); ++index) {
+        midibuffer_test::HostDouble host;
+        expect(installRangeFixture(host, 100U, 300U,
+                                   retrievals[index].selectionStart,
+                                   retrievals[index].selectionEnd) &&
+                   midibuffer::setTimelineNavigationFixture(
+                       host.algorithm(), false, 40U, 120U,
+                       midibuffer::kSelectionFineTargetEnd),
+               "boundary handle retrieval fixture installs");
+        seedBoundaryPots(host, 0.4f, 0.6f);
+        midibuffer_test::resetTrace();
+        host.factory()->draw(host.algorithm());
+        expect(directionalEdgeHandleLineCount(retrievals[index].older,
+                                              retrievals[index].startBoundary) ==
+                   3U,
+               "offscreen boundary handle is present before its associated gesture");
+        const midibuffer::CaptureSnapshot beforeGesture = snapshot(host);
+        moveUi(host, retrievals[index].startBoundary ? kNT_potL : kNT_potC,
+               retrievals[index].startBoundary ? 0.41f : 0.4f,
+               retrievals[index].startBoundary ? 0.6f : 0.61f, 0.0f);
+        const midibuffer::CaptureSnapshot retrieved = snapshot(host);
+        midibuffer_test::resetTrace();
+        host.factory()->draw(host.algorithm());
+        const uint64_t actualBoundary = retrievals[index].startBoundary
+                                            ? retrieved.selection.startPulse
+                                            : retrieved.selection.endPulse;
+        const int edgeX = retrievals[index].older ? 4 : 251;
+        expect(actualBoundary == retrievals[index].expectedBoundary &&
+                   retrieved.selection.startPulse < retrieved.selection.endPulse &&
+                   retrieved.timelineViewStartPulse ==
+                       beforeGesture.timelineViewStartPulse &&
+                   retrieved.timelineViewEndPulse ==
+                       beforeGesture.timelineViewEndPulse &&
+                   retrieved.timelineScrollPulses ==
+                       beforeGesture.timelineScrollPulses &&
+                   directionalEdgeHandleLineCount(
+                       retrievals[index].older,
+                       retrievals[index].startBoundary) == 0U &&
+                   matchingShapeCount(edgeX, 16, edgeX, 56, 15) == 1U,
+               "the associated boundary pot retrieves its indicated boundary to the nearest valid visible edge without scrolling");
+    }
+}
+
 void preparePlaybackHeadHistory(midibuffer_test::HostDouble& host,
                                 uint64_t startPulse, uint64_t endPulse) {
     expect(host.instantiate(1), "playback-head callback host constructs");
@@ -1666,8 +1822,11 @@ void verifyPlaybackHeadObservationAndWideMapping() {
            "playback pulse 99 is excluded rather than pinned or marked with an arrow");
     clockPulse(clipped);
     expect(snapshot(clipped).playbackPulse == 100U &&
-               drawHasHeadAt(clipped, 4),
-           "the same fixed view includes pulse 100 at x4");
+               drawHasHeadAt(clipped, 4) &&
+               playbackHeadLineCount() == 1U &&
+               directionalEdgeHandleLineCount(true, true) == 3U &&
+               directionalEdgeHandleLineCount(false, false) == 3U,
+           "the same fixed view includes one unchanged pulse-100 head with simultaneous offscreen boundary handles layered afterward");
     for (uint32_t pulse = 0U; pulse < 8U; ++pulse) {
         clockPulse(clipped);
     }
@@ -5567,6 +5726,7 @@ int main() {
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();
+    verifyDirectionalBoundaryHandles();
     verifyPlaybackHeadObservationAndWideMapping();
     verifyShowAllAndRelativeTimelineNavigation();
     verifyZoomAwareBoundaryEditing();

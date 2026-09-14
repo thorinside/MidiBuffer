@@ -2626,6 +2626,18 @@ TimelineDrawSnapshot observeTimelineDraw(const Algorithm& algorithm) {
 void drawSelectionBracket(uint64_t pulse, uint64_t viewStart,
                           uint64_t viewEnd, bool start) {
     if (pulse < viewStart || pulse > viewEnd) {
+        // Match the approved retrieval prototype with a handle that points
+        // toward the actual boundary. Start owns the upper handle and End the
+        // lower one, so both remain identifiable when they share an edge.
+        const bool older = pulse < viewStart;
+        const int edgeX = older ? 4 : 251;
+        const int innerX = older ? 8 : 247;
+        const int top = start ? 16 : 48;
+        const int middle = top + 4;
+        const int bottom = top + 8;
+        nt_host::drawShape(kNT_line, innerX, top, edgeX, middle, 15);
+        nt_host::drawShape(kNT_line, edgeX, middle, innerX, bottom, 15);
+        nt_host::drawShape(kNT_line, innerX, top, innerX, bottom, 15);
         return;
     }
     const int x = pulseTimelineX(pulse, viewStart, viewEnd);
