@@ -49,7 +49,9 @@ struct Trace {
     size_t drawCallCount;
     ShapeCall shapeCalls[512];
     size_t shapeCallCount;
-    MidiCall midiCalls[128];
+    // Large enough to observe the complete fixed playback-ownership cleanup:
+    // 16 channels * 128 notes, followed by sustain-off on all 16 channels.
+    MidiCall midiCalls[4096];
     size_t midiCallCount;
     ParameterSetCall parameterSetCalls[64];
     size_t parameterSetCallCount;

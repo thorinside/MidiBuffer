@@ -1019,6 +1019,12 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
     host.step(2);
     sendMidi(host, 0x92, 60, 100);
     host.factory()->midiRealtime(host.algorithm(), 0xF8);
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 4);
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 0);
+    changeParameter(host, kPlaybackParameter, 1);
+    changeParameter(host, kPlaybackParameter, 0);
+    changeParameter(host, kClearRecordingParameter, 1);
+    changeParameter(host, kClearRecordingParameter, 0);
 
     _NT_uiData controls = {};
     controls.controls = kNT_potL;
@@ -4414,14 +4420,18 @@ void verifySharedPlaybackParameter() {
            "unavailable emergency host constructs");
     changeParameter(silentEmergency, kPlaybackParameter, 1);
     midibuffer_test::resetTrace();
+    const uint64_t allocationsBeforeEmergency =
+        midibuffer_test::heapAllocationCount();
     sendMidi(silentEmergency, 0xB5U, 120U, 99U);
     expect(silentEmergency.parameter(kPlaybackParameter) == 0 &&
                !snapshot(silentEmergency).playbackArmed &&
                midibuffer_test::trace().midiCallCount == 0U &&
                midibuffer_test::trace().parameterSetCallCount == 1U &&
                midibuffer_test::trace().parameterSetCalls[0].source ==
-                   midibuffer_test::kParameterSetFromAudio,
-           "incoming emergency control clears unavailable Playback On without producing output");
+                   midibuffer_test::kParameterSetFromAudio &&
+               midibuffer_test::heapAllocationCount() ==
+                   allocationsBeforeEmergency,
+           "incoming emergency control clears unavailable Playback On through the audio setter without output or allocation");
 
     midibuffer_test::HostDouble unavailable;
     expect(unavailable.instantiate(1),
@@ -4706,28 +4716,71 @@ void verifyOneShotClearRecording() {
     startCapture(maximum);
     acquireClock(maximum);
     const uint32_t capacity = snapshot(maximum).eventCapacity;
-    for (uint32_t index = 0; index < capacity; ++index) {
+    const uint32_t maximumOwnedNotes = 16U * 128U;
+    const uint32_t maximumOwnedSustain = 16U;
+    const uint32_t maximumOwnedOutputs =
+        maximumOwnedNotes + maximumOwnedSustain;
+    for (uint32_t index = maximumOwnedOutputs; index < capacity; ++index) {
         sendMidi(maximum, 0xB0U, 7U,
                  static_cast<uint8_t>(index & 0x7fU));
     }
+    const uint64_t ownedPulse = snapshot(maximum).currentPulse;
+    for (uint32_t channel = 0U; channel < 16U; ++channel) {
+        for (uint32_t note = 0U; note < 128U; ++note) {
+            sendMidi(maximum, static_cast<uint8_t>(0x90U | channel),
+                     static_cast<uint8_t>(note), 100U);
+        }
+        sendMidi(maximum, static_cast<uint8_t>(0xB0U | channel), 64U, 127U);
+    }
     expect(snapshot(maximum).eventCount == capacity,
-           "clear cost fixture fills the complete 5 MB event capacity");
+           "clear cost fixture fills the complete 5 MB event capacity with maximum fixed output ownership");
+    clockPulse(maximum);
+    stopCapture(maximum);
+    expect(snapshot(maximum).eventCount == capacity &&
+               midibuffer::setPulseSelection(maximum.algorithm(), ownedPulse,
+                                             ownedPulse + 1U),
+           "full-capacity fixture keeps generated endings outside the selected attack interval");
+    changeParameter(maximum, kPlaybackParameter, 1);
+    clockPulse(maximum);
+    noClockBlock(maximum);
+    expect(snapshot(maximum).playbackActive &&
+               snapshot(maximum).pendingNoteEndingCount == maximumOwnedNotes &&
+               snapshot(maximum).pendingSustainReleaseCount ==
+                   maximumOwnedSustain,
+           "full-capacity playback reaches every fixed note and sustain ownership slot");
+
     midibuffer_test::resetTrace();
     const uint64_t allocationsBeforeMaximum =
         midibuffer_test::heapAllocationCount();
     changeParameter(maximum, kClearRecordingParameter, 1);
     midibuffer::RecordedEvent removedMaximum = {};
+    const midibuffer_test::Trace& maximumCleanup = midibuffer_test::trace();
+    bool maximumCleanupOrdered =
+        maximumCleanup.midiCallCount == maximumOwnedOutputs;
+    for (uint32_t index = 0U;
+         index < maximumCleanup.midiCallCount; ++index) {
+        const midibuffer_test::MidiCall& call = maximumCleanup.midiCalls[index];
+        if (index < maximumOwnedNotes) {
+            maximumCleanupOrdered = maximumCleanupOrdered && call.size == 3U &&
+                                    (call.bytes[0] & 0xf0U) == 0x80U;
+        } else {
+            maximumCleanupOrdered = maximumCleanupOrdered && call.size == 3U &&
+                                    (call.bytes[0] & 0xf0U) == 0xB0U &&
+                                    call.bytes[1] == 64U &&
+                                    call.bytes[2] == 0U;
+        }
+    }
     expect(snapshot(maximum).eventCount == 0U &&
                snapshot(maximum).clearRecordingTransitions == 1U &&
                snapshot(maximum).clearHistoryMetadataOperations ==
                    cleared.clearHistoryMetadataOperations &&
                !midibuffer::recordedEventAt(maximum.algorithm(), 0U,
                                             removedMaximum) &&
-               snapshot(maximum).captureEnabled &&
-               snapshot(maximum).clockRunning &&
+               !snapshot(maximum).captureEnabled &&
+               snapshot(maximum).clockRunning && maximumCleanupOrdered &&
                midibuffer_test::heapAllocationCount() ==
                    allocationsBeforeMaximum,
-           "full 5 MB clear performs the same four metadata operations as small history, exposes no erased event, allocates nothing, and preserves live capture eligibility");
+           "full 5 MB clear performs the same four history metadata operations as small history and bounds ordered cleanup at 2,048 note slots plus 16 sustain slots without allocation");
 }
 
 void verifySharedControlPresetRestoration() {

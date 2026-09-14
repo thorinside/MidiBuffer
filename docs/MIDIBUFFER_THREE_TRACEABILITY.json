@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "approvedSpecSha256": "aefc6eaf7fc3736d253e6b929e2efed368d2fe9076d0bd9fd1f189a89ec5d05b",
+  "registryRequirementKeys": [
+    "requirement-790534bede8341f9ecad7b7e",
+    "requirement-45386de0d79316203bbc2d51",
+    "requirement-107312bfd6d8197c5ef509d0"
+  ],
+  "trackedAcceptanceCriteria": [
+    {
+      "criterionKey": "ac-pb-001",
+      "specIdentifier": "AC-PB-001",
+      "text": "**AC-PB-001:** The Playback parameter exposes Off = 0 and On = 1; setting 1 requests playback on, and setting 0 stops playback, rather than treating each trigger as a toggle.",
+      "evidence": "Production parameter definition and idempotent On/Off callback traces in verifyEntryAndLifecycle and verifySharedPlaybackParameter."
+    },
+    {
+      "criterionKey": "ac-pb-002",
+      "specIdentifier": "AC-PB-002",
+      "text": "**AC-PB-002:** The left encoder and Playback parameter control one shared on/off state; successive left-encoder presses toggle the parameter between On = 1 and Off = 0.",
+      "evidence": "Production custom-UI and offset API v13 setter traces in verifyTimelinePlaybackToggle and verifySharedPlaybackParameter."
+    },
+    {
+      "criterionKey": "ac-pb-003",
+      "specIdentifier": "AC-PB-003",
+      "text": "**AC-PB-003:** Preset saving includes the shared Playback parameter value through normal parameter persistence.",
+      "evidence": "HostDouble generic parameter images, both restoration orders, legacy migration, and 1–5 MB/full-5 MB round trips."
+    },
+    {
+      "criterionKey": "ac-pb-004",
+      "specIdentifier": "AC-PB-004",
+      "text": "**AC-PB-004:** Setting Playback to On when there is nothing to play leaves its value at 1 and produces no playback; it does not automatically reset to Off.",
+      "evidence": "Unavailable-selection production parameter trace in verifySharedPlaybackParameter."
+    },
+    {
+      "criterionKey": "ac-pb-005",
+      "specIdentifier": "AC-PB-005",
+      "text": "**AC-PB-005:** Selecting a valid loop while Playback remains On begins playback under existing clock timing without another Off/On action.",
+      "evidence": "Later-selection and fresh two-pulse acquisition trace in verifySharedPlaybackParameter."
+    }
+  ],
+  "specRequirements": [
+    {
+      "label": "1. Shared Playback control",
+      "criterionIdentifiers": ["AC-PB-001", "AC-PB-002", "AC-PB-003", "AC-PB-004", "AC-PB-005", "AC-PB-006", "AC-PB-007"]
+    },
+    {
+      "label": "2. Zoom-aware boundary editing",
+      "criterionIdentifiers": ["AC-ZM-001", "AC-ZM-002", "AC-ZM-003", "AC-ZM-004"]
+    },
+    {
+      "label": "3. Resolution label",
+      "criterionIdentifiers": ["AC-RD-001"]
+    },
+    {
+      "label": "4. One-shot Clear Recording",
+      "criterionIdentifiers": ["AC-CR-001", "AC-CR-002", "AC-CR-003", "AC-CR-004", "AC-CR-005", "AC-CR-006"]
+    },
+    {
+      "label": "5. Host compatibility, persistence and real-time safety",
+      "criterionIdentifiers": ["AC-IC-001", "AC-IC-002", "AC-IC-003", "AC-IC-004", "AC-IC-005", "AC-IC-006", "AC-IC-007", "AC-IC-008", "AC-IC-009", "AC-IC-010"]
+    },
+    {
+      "label": "6. Inherited scope and release boundaries",
+      "criterionIdentifiers": ["AC-001–045", "AC-047–067", "UX-AC-001–012"]
+    }
+  ],
+  "inheritedNormativeIdentifiers": {
+    "requirements": [
+      "REQ-001", "REQ-002", "REQ-003", "REQ-004", "REQ-005", "REQ-006", "REQ-007", "REQ-008", "REQ-009", "REQ-010",
+      "REQ-011", "REQ-012", "REQ-013", "REQ-014", "REQ-015", "REQ-016", "REQ-017", "REQ-018", "REQ-019", "REQ-020",
+      "REQ-021", "REQ-022", "REQ-023", "REQ-024", "REQ-025", "REQ-026", "REQ-027", "REQ-028", "REQ-029", "REQ-030",
+      "REQ-031", "REQ-032", "REQ-033", "REQ-034", "REQ-035", "REQ-036", "REQ-037"
+    ],
+    "acceptanceCriteria": [
+      "AC-001", "AC-002", "AC-003", "AC-004", "AC-005", "AC-006", "AC-007", "AC-008", "AC-009", "AC-010",
+      "AC-011", "AC-012", "AC-013", "AC-014", "AC-015", "AC-016", "AC-017", "AC-018", "AC-019", "AC-020",
+      "AC-021", "AC-022", "AC-023", "AC-024", "AC-025", "AC-026", "AC-027", "AC-028", "AC-029", "AC-030",
+      "AC-031", "AC-032", "AC-033", "AC-034", "AC-035", "AC-036", "AC-037", "AC-038", "AC-039", "AC-040",
+      "AC-041", "AC-042", "AC-043", "AC-044", "AC-045", "AC-047", "AC-048", "AC-049", "AC-050", "AC-051",
+      "AC-052", "AC-053", "AC-054", "AC-055", "AC-056", "AC-057", "AC-058", "AC-059", "AC-060", "AC-061",
+      "AC-062", "AC-063", "AC-064", "AC-065", "AC-066", "AC-067"
+    ],
+    "uxRequirements": [
+      "UX-REQ-001", "UX-REQ-002", "UX-REQ-003", "UX-REQ-004", "UX-REQ-005", "UX-REQ-006",
+      "UX-REQ-007", "UX-REQ-008", "UX-REQ-009", "UX-REQ-010", "UX-REQ-011"
+    ],
+    "uxAcceptanceCriteria": [
+      "UX-AC-001", "UX-AC-002", "UX-AC-003", "UX-AC-004", "UX-AC-005", "UX-AC-006",
+      "UX-AC-007", "UX-AC-008", "UX-AC-009", "UX-AC-010", "UX-AC-011", "UX-AC-012"
+    ],
+    "retiredIdentifiers": ["AC-046"]
+  },
+  "verificationSeams": [
+    {
+      "scope": "AC-PB-001–007, AC-IC-001–002",
+      "evidence": "verifyEntryAndLifecycle, verifyTimelinePlaybackToggle, verifySharedPlaybackParameter, and emergency-control traces exercise production factory, callback, parameter-offset, audio-setter and UI-setter adapters."
+    },
+    {
+      "scope": "AC-ZM-001–004 and AC-RD-001",
+      "evidence": "Range-motion arithmetic plus production custom-UI/draw/framebuffer traces cover zoom invariance, fine edits, boundary retrieval/handles, PPQN text and timing invariance."
+    },
+    {
+      "scope": "AC-CR-001–006, AC-IC-007–009",
+      "evidence": "verifyOneShotClearRecording covers one-shot/rearm behavior, capture preservation, ordered cleanup, stale-state invalidation, four history-metadata operations, no allocation, full 5 MB history and all 2,048 note plus 16 sustain ownership slots."
+    },
+    {
+      "scope": "AC-IC-003–005",
+      "evidence": "Shared-control and complete-preset suites cover valid new and legacy images, generic-before-custom and generic-after-custom restoration, exact reserialization, silent load and two fresh clock pulses."
+    },
+    {
+      "scope": "AC-IC-006 and inherited identifiers",
+      "evidence": "The integrated callback suite retains clock, reset, panic, routing/filtering, capture exclusion, scheduler, pending-range, ownership, persistence, timeline/navigation and cleanup regressions; range_motion_test retains fixed-size arithmetic."
+    },
+    {
+      "scope": "AC-IC-010",
+      "evidence": "make verify runs optimized native production tests, ASan/UBSan, Cppcheck, blocking-I/O/logging source inspection, this manifest validator, ARM Cortex-M7 builds, ELF/pluginEntry checks and a strict reviewed undefined-symbol allowlist."
+    }
+  ],
+  "evidenceBoundaries": {
+    "nativeAndEmulator": "Host-double MIDI/framebuffer traces and measured payload/timing observations are synthetic native evidence only and do not establish firmware budgets.",
+    "arm": "The built artifact is inspected as an ELF32 little-endian ARM relocatable object exporting pluginEntry; only reviewed API v13 host/JSON and libc imports are allowed.",
+    "physical": "Physical disting NT evidence remains exclusively in docs/HARDWARE_SMOKE_TEST.md and docs/UX_REFINEMENT_HARDWARE_TEST.md; make verify does not claim it.",
+    "excluded": "No publication, firmware-owned corrupt-preset behavior, MIDI-file export, older-firmware support or expanded physical compatibility claim is included."
+  }
+}
