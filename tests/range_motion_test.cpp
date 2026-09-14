@@ -268,6 +268,80 @@ void verifyEstablishRebaseAndNoOpDomains() {
            "domain no-op checks do not alter the valid fixture");
 }
 
+void verifyZoomAwareBoundaryMotion() {
+    midibuffer::BoundaryMotionState stationary(0.4);
+    uint64_t offscreen = 120U;
+    expect(!midibuffer::moveBoundaryMotion(stationary, 100U, 279U,
+                                            260U, 300U, offscreen, 0.4) &&
+               offscreen == 120U,
+           "stationary boundary input does not retrieve an offscreen boundary");
+    expect(midibuffer::moveBoundaryMotion(stationary, 100U, 279U,
+                                           260U, 300U, offscreen, 0.41) &&
+               offscreen == 260U,
+           "first deliberate input retrieves an older offscreen boundary to the visible edge");
+    midibuffer::moveBoundaryMotion(stationary, 100U, 279U,
+                                   260U, 300U, offscreen, 0.435);
+    expect(offscreen == 261U,
+           "motion after retrieval is viewport-scaled and pulse-aligned");
+
+    midibuffer::BoundaryMotionState newerState(0.6);
+    uint64_t newer = 220U;
+    expect(midibuffer::moveBoundaryMotion(newerState, 100U, 279U,
+                                           100U, 140U, newer, 0.59) &&
+               newer == 140U,
+           "first deliberate input retrieves a newer offscreen boundary to the visible edge");
+
+    midibuffer::BoundaryMotionState constrainedStart(0.2);
+    uint64_t start = 150U;
+    expect(midibuffer::moveBoundaryMotion(constrainedStart, 100U, 159U,
+                                           260U, 300U, start, 0.3) &&
+               start == 159U,
+           "retrieval preserves the one-pulse ordering limit when no visible start is legal");
+    midibuffer::BoundaryMotionState constrainedEnd(0.8);
+    uint64_t end = 250U;
+    expect(midibuffer::moveBoundaryMotion(constrainedEnd, 201U, 300U,
+                                           100U, 140U, end, 0.7) &&
+               end == 201U,
+           "end retrieval also preserves the one-pulse ordering limit");
+
+    midibuffer::BoundaryMotionState largeScale(0.5);
+    midibuffer::BoundaryMotionState smallScale(0.5);
+    uint64_t largeBoundary = 997U;
+    uint64_t smallBoundary = 997U;
+    expect(midibuffer::moveBoundaryMotion(largeScale, 0U, 999U,
+                                           900U, 1000U, largeBoundary, 0.25) &&
+               midibuffer::moveBoundaryMotion(smallScale, 0U, 999U,
+                                                996U, 1000U, smallBoundary,
+                                                0.25) &&
+               largeBoundary == 972U && smallBoundary == 996U,
+           "the same pot travel is finer in a four-pulse viewport than a hundred-pulse viewport");
+
+    midibuffer::BoundaryMotionState wide(0.0);
+    uint64_t wideBoundary = 0U;
+    const uint64_t maximum = ~static_cast<uint64_t>(0);
+    expect(midibuffer::moveBoundaryMotion(wide, 0U, maximum,
+                                           0U, maximum, wideBoundary, 0.5) &&
+               wideBoundary == (static_cast<uint64_t>(1U) << 63U),
+           "full-uint64 viewport scaling avoids overflow and rounds to a whole pulse");
+
+    midibuffer::BoundaryMotionState residual(0.5);
+    uint64_t pulse = 50U;
+    expect(!midibuffer::moveBoundaryMotion(residual, 0U, 100U,
+                                            48U, 52U, pulse, 0.6) &&
+               pulse == 50U && residual.pulseResidual != 0.0,
+           "sub-pulse boundary travel is retained without fractional boundaries");
+    expect(midibuffer::moveBoundaryMotion(residual, 0U, 100U,
+                                           48U, 52U, pulse, 0.7) &&
+               pulse == 51U,
+           "retained boundary travel eventually emits one whole pulse");
+    midibuffer::seedBoundaryMotionPhysical(residual, 0.2);
+    const uint64_t reseededPulse = pulse;
+    expect(!midibuffer::moveBoundaryMotion(residual, 0U, 100U,
+                                            48U, 52U, pulse, 0.2) &&
+               pulse == reseededPulse && residual.pulseResidual == 0.0,
+           "reseeded stationary input clears stale travel without motion");
+}
+
 void verifyExactWideDisplacementAndLengthInvariant() {
     const uint64_t halfTravel = static_cast<uint64_t>(1) << 39U;
     const uint64_t travel = static_cast<uint64_t>(1) << 40U;
@@ -377,6 +451,7 @@ int main() {
     verifyResidualStationaryAndReversal();
     verifyClampsAndEndpointMismatch();
     verifyEstablishRebaseAndNoOpDomains();
+    verifyZoomAwareBoundaryMotion();
     verifyExactWideDisplacementAndLengthInvariant();
 
     if (gFailures != 0) {

@@ -230,6 +230,13 @@ void endRightPotZoom(midibuffer_test::HostDouble& host, float pot) {
     moveUi(host, 0U, 0.0f, 0.0f, pot, 0, 0, kNT_potButtonR);
 }
 
+void seedBoundaryPots(midibuffer_test::HostDouble& host, float left,
+                      float centre, float right = 0.0f) {
+    _NT_float3 setupPots = {};
+    host.factory()->setupUi(host.algorithm(), setupPots);
+    moveUi(host, 0U, left, centre, right);
+}
+
 bool installRangeFixture(midibuffer_test::HostDouble& host,
                          uint64_t historyStart, uint64_t historyEnd,
                          uint64_t selectionStart, uint64_t selectionEnd) {
@@ -2021,6 +2028,186 @@ void verifyShowAllAndRelativeTimelineNavigation() {
            "full held zoom-out reaches exact Show All beyond 2^32 without a 256 or uint32 cap");
 }
 
+void verifyZoomAwareBoundaryEditing() {
+    struct RetrievalCase {
+        bool startBoundary;
+        uint64_t selectionStart;
+        uint64_t selectionEnd;
+        uint64_t scroll;
+        uint64_t expected;
+    };
+    const RetrievalCase cases[] = {
+        {true, 120U, 280U, 0U, 260U},
+        {true, 180U, 220U, 160U, 140U},
+        {false, 120U, 180U, 0U, 260U},
+        {false, 120U, 280U, 160U, 140U},
+        {true, 120U, 200U, 0U, 199U},
+        {false, 200U, 280U, 160U, 201U},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(cases); ++index) {
+        midibuffer_test::HostDouble host;
+        expect(installRangeFixture(host, 100U, 300U,
+                                   cases[index].selectionStart,
+                                   cases[index].selectionEnd) &&
+                   midibuffer::setTimelineNavigationFixture(
+                       host.algorithm(), false, 40U, cases[index].scroll,
+                       midibuffer::kSelectionFineTargetEnd),
+               "offscreen boundary callback fixture installs");
+        seedBoundaryPots(host, 0.4f, 0.6f);
+        const midibuffer::CaptureSnapshot seeded = snapshot(host);
+        const uint64_t scrollBefore = seeded.timelineScrollPulses;
+        moveUi(host, cases[index].startBoundary ? kNT_potL : kNT_potC,
+               0.4f, 0.6f, 0.0f);
+        const midibuffer::CaptureSnapshot stationary = snapshot(host);
+        expect(stationary.selection.startPulse == seeded.selection.startPulse &&
+                   stationary.selection.endPulse == seeded.selection.endPulse &&
+                   stationary.timelineScrollPulses == scrollBefore,
+               "stationary changed-mask input does not retrieve an offscreen actual boundary");
+        moveUi(host, cases[index].startBoundary ? kNT_potL : kNT_potC,
+               cases[index].startBoundary ? 0.41f : 0.4f,
+               cases[index].startBoundary ? 0.6f : 0.61f, 0.0f);
+        const midibuffer::CaptureSnapshot retrieved = snapshot(host);
+        const uint64_t actual = cases[index].startBoundary
+                                    ? retrieved.selection.startPulse
+                                    : retrieved.selection.endPulse;
+        expect(actual == cases[index].expected &&
+                   retrieved.selection.startPulse <
+                       retrieved.selection.endPulse &&
+                   retrieved.timelineScrollPulses == scrollBefore,
+               "first deliberate callback retrieves either offscreen boundary with ordering and no viewport scroll");
+    }
+
+    midibuffer_test::HostDouble subsequent;
+    expect(installRangeFixture(subsequent, 100U, 300U, 120U, 280U) &&
+               midibuffer::setTimelineNavigationFixture(
+                   subsequent.algorithm(), false, 40U, 0U,
+                   midibuffer::kSelectionFineTargetEnd),
+           "post-retrieval motion fixture installs");
+    seedBoundaryPots(subsequent, 0.4f, 0.6f);
+    moveUi(subsequent, kNT_potL, 0.41f, 0.6f, 0.0f);
+    moveUi(subsequent, kNT_potL, 0.44f, 0.6f, 0.0f);
+    const midibuffer::CaptureSnapshot afterFineMotion = snapshot(subsequent);
+    expect(afterFineMotion.selection.startPulse == 261U &&
+               afterFineMotion.selection.endPulse == 280U &&
+               afterFineMotion.timelineViewStartPulse == 260U &&
+               afterFineMotion.timelineViewEndPulse == 300U &&
+               afterFineMotion.timelineScrollPulses == 0U,
+           "motion after retrieval uses the forty-pulse viewport scale and remains pulse-aligned without scrolling");
+
+    midibuffer_test::HostDouble large;
+    midibuffer_test::HostDouble small;
+    expect(installRangeFixture(large, 900U, 1000U, 997U, 1000U) &&
+               installRangeFixture(small, 900U, 1000U, 997U, 1000U) &&
+               midibuffer::setTimelineNavigationFixture(
+                   large.algorithm(), false, 100U, 0U,
+                   midibuffer::kSelectionFineTargetStart) &&
+               midibuffer::setTimelineNavigationFixture(
+                   small.algorithm(), false, 4U, 0U,
+                   midibuffer::kSelectionFineTargetStart),
+           "large and small viewport scaling fixtures install");
+    seedBoundaryPots(large, 0.5f, 1.0f);
+    seedBoundaryPots(small, 0.5f, 1.0f);
+    moveUi(large, kNT_potL, 0.25f, 1.0f, 0.0f);
+    moveUi(small, kNT_potL, 0.25f, 1.0f, 0.0f);
+    expect(snapshot(large).selection.startPulse == 972U &&
+               snapshot(small).selection.startPulse == 996U &&
+               snapshot(large).selection.endPulse == 1000U &&
+               snapshot(small).selection.endPulse == 1000U,
+           "identical deliberate Start travel is finer when zoomed in and both results are whole pulses");
+
+    midibuffer_test::HostDouble largeEnd;
+    midibuffer_test::HostDouble smallEnd;
+    expect(installRangeFixture(largeEnd, 900U, 1000U, 900U, 903U) &&
+               installRangeFixture(smallEnd, 900U, 1000U, 900U, 903U) &&
+               midibuffer::setTimelineNavigationFixture(
+                   largeEnd.algorithm(), false, 100U, 0U,
+                   midibuffer::kSelectionFineTargetEnd) &&
+               midibuffer::setTimelineNavigationFixture(
+                   smallEnd.algorithm(), false, 4U, 96U,
+                   midibuffer::kSelectionFineTargetEnd),
+           "End scaling fixtures install with the boundary visible at both scales");
+    seedBoundaryPots(largeEnd, 0.0f, 0.5f);
+    seedBoundaryPots(smallEnd, 0.0f, 0.5f);
+    moveUi(largeEnd, kNT_potC, 0.0f, 0.75f, 0.0f);
+    moveUi(smallEnd, kNT_potC, 0.0f, 0.75f, 0.0f);
+    expect(snapshot(largeEnd).selection.endPulse == 928U &&
+               snapshot(smallEnd).selection.endPulse == 904U &&
+               snapshot(largeEnd).selection.startPulse == 900U &&
+               snapshot(smallEnd).selection.startPulse == 900U,
+           "identical deliberate End travel is finer when zoomed in and both results are whole pulses");
+
+    midibuffer_test::HostDouble wide;
+    const uint64_t wideEnd = static_cast<uint64_t>(1U) << 40U;
+    expect(installRangeFixture(wide, 0U, wideEnd, 0U, wideEnd),
+           "wide boundary callback fixture installs beyond uint32");
+    seedBoundaryPots(wide, 0.5f, 0.5f);
+    moveUi(wide, kNT_potL, 0.75f, 0.5f, 0.0f);
+    expect(snapshot(wide).selection.startPulse ==
+                   (static_cast<uint64_t>(1U) << 38U) &&
+               snapshot(wide).selection.endPulse == wideEnd,
+           "production Start callback scales a wide viewport without overflow or fractional pulses");
+
+    midibuffer_test::HostDouble shortSpan;
+    expect(installRangeFixture(shortSpan, 100U, 103U, 100U, 103U),
+           "sub-minimum zoom-only fixture installs");
+    const midibuffer::CaptureSnapshot shortBefore = snapshot(shortSpan);
+    beginRightPotZoom(shortSpan, 0.5f);
+    continueRightPotZoom(shortSpan, 0.0f);
+    endRightPotZoom(shortSpan, 0.0f);
+    const midibuffer::CaptureSnapshot shortAfter = snapshot(shortSpan);
+    expect(shortAfter.timelineShowAll &&
+               shortAfter.timelineViewStartPulse == 100U &&
+               shortAfter.timelineViewEndPulse == 103U &&
+               sameSelectionAndTransport(shortBefore, shortAfter),
+           "deliberate zoom on a sub-minimum span preserves the only valid viewport and phrase");
+
+    midibuffer_test::HostDouble playing;
+    expect(installRangeFixture(playing, 100U, 300U, 120U, 180U),
+           "playing zoom-invariance fixture installs");
+    seedBoundaryPots(playing, 0.4f, 0.6f);
+    clockPulse(playing);
+    clockPulse(playing);
+    expect(midibuffer::startPlayback(playing.algorithm()),
+           "zoom-invariance fixture arms playback");
+    clockPulse(playing);
+    expect(midibuffer::setTimelineNavigationFixture(
+               playing.algorithm(), false, 40U, 0U,
+               midibuffer::kSelectionFineTargetEnd),
+           "playing fixture fixes an end-relative manual viewport");
+    const midibuffer::CaptureSnapshot beforeZoom = snapshot(playing);
+    beginRightPotZoom(playing, 0.5f);
+    continueRightPotZoom(playing, 0.0f);
+    endRightPotZoom(playing, 0.0f);
+    const midibuffer::CaptureSnapshot zoomed = snapshot(playing);
+    expect(beforeZoom.playbackActive && beforeZoom.activeSelectionValid &&
+               zoomed.timelineVisiblePulses == 4U &&
+               zoomed.timelineViewStartPulse !=
+                   beforeZoom.timelineViewStartPulse &&
+               sameSelectionAndTransport(beforeZoom, zoomed),
+           "zoom-only production callbacks change the viewport while selected and active playing phrases remain invariant");
+
+    expect(midibuffer::setTimelineNavigationFixture(
+               playing.algorithm(), false, 40U, 0U,
+               midibuffer::kSelectionFineTargetEnd),
+           "pending-edit fixture restores the forty-pulse viewport");
+    moveUi(playing, kNT_potC, 0.4f, 0.61f, 0.0f);
+    const midibuffer::CaptureSnapshot pending = snapshot(playing);
+    expect(pending.selection.startPulse == 120U &&
+               pending.selection.endPulse == 260U &&
+               pending.activeSelection.startPulse == 120U &&
+               pending.activeSelection.endPulse == 180U &&
+               pending.rangeTransitionPending &&
+               pending.timelineScrollPulses == 0U,
+           "deliberate offscreen End retrieval updates only the pending selected phrase for next-wrap adoption");
+    beginRightPotZoom(playing, 0.5f);
+    continueRightPotZoom(playing, 0.0f);
+    endRightPotZoom(playing, 0.0f);
+    const midibuffer::CaptureSnapshot pendingZoomed = snapshot(playing);
+    expect(pendingZoomed.timelineVisiblePulses == 4U &&
+               sameSelectionAndTransport(pending, pendingZoomed),
+           "zoom-only callbacks preserve both active and pending ranges before next-wrap adoption");
+}
+
 void verifyIntegratedRangeMotionAndFineTargets() {
     midibuffer_test::HostDouble range;
     expect(installRangeFixture(range, 100U, 200U, 120U, 140U),
@@ -2203,27 +2390,30 @@ void verifyIntegratedRangeMotionAndFineTargets() {
     midibuffer_test::HostDouble targets;
     expect(installRangeFixture(targets, 100U, 300U, 120U, 140U),
            "fine-target and callback-order fixture installs");
-    seedRightPot(targets, 0.1f);
-    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, 1);
+    seedBoundaryPots(targets, 0.5f, 0.5f, 0.1f);
+    moveUi(targets, 0U, 0.5f, 0.5f, 0.1f, 0, 1);
     expect(snapshot(targets).selection.startPulse == 120U &&
                snapshot(targets).selection.endPulse == 141U &&
                snapshot(targets).selectionFineTarget ==
                    midibuffer::kSelectionFineTargetEnd,
            "fresh encoder target is End and steps it by one pulse");
-    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
-    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, 1);
-    expect(snapshot(targets).selection.startPulse == 101U &&
+    moveUi(targets, kNT_potL, 0.49f, 0.5f, 0.1f);
+    const midibuffer::CaptureSnapshot startTarget = snapshot(targets);
+    moveUi(targets, 0U, 0.49f, 0.5f, 0.1f, 0, 1);
+    expect(snapshot(targets).selection.startPulse ==
+                   startTarget.selection.startPulse + 1U &&
                snapshot(targets).selection.endPulse == 141U,
            "effective pot 1 selects Start for an independent one-pulse nudge");
-    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
-    moveUi(targets, kNT_potC, 0.0f, 0.5f, 0.1f);
+    moveUi(targets, kNT_potL, 0.49f, 0.5f, 0.1f);
+    moveUi(targets, kNT_potC, 0.49f, 0.6f, 0.1f);
     const midibuffer::CaptureSnapshot endTarget = snapshot(targets);
-    moveUi(targets, kNT_potL, 0.0f, 0.0f, 0.1f);
-    moveUi(targets, 0U, 0.0f, 0.0f, 0.1f, 0, -1);
-    expect(snapshot(targets).selection.startPulse == 100U &&
+    moveUi(targets, kNT_potL, 0.49f, 0.6f, 0.1f);
+    moveUi(targets, 0U, 0.49f, 0.6f, 0.1f, 0, -1);
+    expect(snapshot(targets).selection.startPulse ==
+                   endTarget.selection.startPulse &&
                snapshot(targets).selection.endPulse + 1U ==
                    endTarget.selection.endPulse,
-           "a clamped pot boundary does not steal the prior effective End target");
+           "a stationary pot boundary does not steal the prior effective End target");
 
     expect(midibuffer::setPulseSelection(targets.algorithm(), 120U, 140U),
            "Range fine-target pair resets through the public selection seam");
@@ -5379,6 +5569,7 @@ int main() {
     verifyTimelineSelectionDisplayAndControls();
     verifyPlaybackHeadObservationAndWideMapping();
     verifyShowAllAndRelativeTimelineNavigation();
+    verifyZoomAwareBoundaryEditing();
     verifyIntegratedRangeMotionAndFineTargets();
     verifyCaptureStopEndings();
     verifyRollingHistoryAndSelectionInvalidation();

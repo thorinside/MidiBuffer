@@ -195,7 +195,8 @@ struct Algorithm : public _NT_algorithm {
           playbackEventIndex(0), clockIntervalWriteIndex(0),
           clockIntervalCount(0), clockIntervals(), selection(),
           activeSelection(), state(), recordedState(), playbackOutputState(),
-          pendingEndings(), rangeMotion(), transportState(kTransportStopped),
+          pendingEndings(), rangeMotion(), startBoundaryMotion(0.0),
+          endBoundaryMotion(1.0), transportState(kTransportStopped),
           playbackIntervalOrdinal(0), timelineScrollPulses(0),
           timelineVisiblePulses(kDefaultTimelineVisiblePulses),
           zoomPressVisiblePulses(0), zoomPressManualVisiblePulses(0),
@@ -213,7 +214,9 @@ struct Algorithm : public _NT_algorithm {
           selectionFineTarget(kSelectionFineTargetEnd),
           timelineShowAll(true), zoomPressShowAll(true),
           rightPotZoomActive(false), rangeMotionDomainKnown(false),
-          rangeMotionNeedsPhysicalSeed(true), rightEncoderHoldActive(false),
+          rangeMotionNeedsPhysicalSeed(true),
+          boundaryMotionNeedsPhysicalSeed(false),
+          rightEncoderHoldActive(false),
           rightEncoderPanicFired(false),
           pendingNextEndingSample(0), rightEncoderHoldStartSample(0) {}
 
@@ -243,6 +246,8 @@ struct Algorithm : public _NT_algorithm {
     PlaybackOutputState playbackOutputState;
     PendingPlaybackEndings pendingEndings;
     RangeMotionState rangeMotion;
+    BoundaryMotionState startBoundaryMotion;
+    BoundaryMotionState endBoundaryMotion;
     TransportState transportState;
     uint64_t playbackIntervalOrdinal;
     uint64_t timelineScrollPulses;
@@ -278,6 +283,7 @@ struct Algorithm : public _NT_algorithm {
     bool rightPotZoomActive;
     bool rangeMotionDomainKnown;
     bool rangeMotionNeedsPhysicalSeed;
+    bool boundaryMotionNeedsPhysicalSeed;
     bool rightEncoderHoldActive;
     bool rightEncoderPanicFired;
     uint64_t pendingNextEndingSample;
@@ -1947,16 +1953,6 @@ bool retainedTimelineBounds(const Algorithm& algorithm, uint64_t& start,
     return end > start;
 }
 
-uint64_t scaleTimelineDistance(uint64_t distance, uint32_t numerator,
-                               uint32_t denominator) {
-    uint32_t remainder = 0;
-    const uint64_t quotient =
-        divideUnsigned64By32(distance, denominator, remainder);
-    const uint32_t scaledRemainder =
-        (remainder * numerator + denominator / 2U) / denominator;
-    return quotient * numerator + scaledRemainder;
-}
-
 uint32_t normalizedTimelinePot(float value) {
     if (!(value >= 0.0f)) {
         return 0;
@@ -1966,15 +1962,6 @@ uint32_t normalizedTimelinePot(float value) {
     }
     return static_cast<uint32_t>(
         value * static_cast<float>(kTimelineCoordinateMaximum) + 0.5f);
-}
-
-uint64_t pulseFromPot(uint64_t minimum, uint64_t maximum, float pot) {
-    if (maximum <= minimum) {
-        return minimum;
-    }
-    return minimum + scaleTimelineDistance(
-                         maximum - minimum, normalizedTimelinePot(pot),
-                         kTimelineCoordinateMaximum);
 }
 
 uint64_t retainedTimelineIntervals(const Algorithm& algorithm) {
@@ -2101,7 +2088,7 @@ bool ensureTimelineSelection(_NT_algorithm* self, Algorithm& algorithm) {
 }
 
 void moveTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
-                          bool startBoundary, uint64_t requested,
+                          bool startBoundary, float boundaryPotPhysical,
                           float rightPotPhysical) {
     if (!ensureTimelineSelection(self, algorithm)) {
         return;
@@ -2113,21 +2100,22 @@ void moveTimelineBoundary(_NT_algorithm* self, Algorithm& algorithm,
         return;
     }
 
+    uint64_t viewStart = 0;
+    uint64_t viewEnd = 0;
+    timelineViewBounds(algorithm, viewStart, viewEnd);
     uint64_t start = algorithm.selection.startPulse;
     uint64_t end = algorithm.selection.endPulse;
-    if (startBoundary) {
-        const uint64_t maximum = end - 1U;
-        start = requested < retainedStart
-                    ? retainedStart
-                    : (requested > maximum ? maximum : requested);
-    } else {
-        const uint64_t minimum = start + 1U;
-        end = requested < minimum
-                  ? minimum
-                  : (requested > retainedEnd ? retainedEnd : requested);
-    }
-    if (start == algorithm.selection.startPulse &&
-        end == algorithm.selection.endPulse) {
+    BoundaryMotionState& motion = startBoundary
+                                      ? algorithm.startBoundaryMotion
+                                      : algorithm.endBoundaryMotion;
+    uint64_t& boundary = startBoundary ? start : end;
+    const uint64_t legalMinimum = startBoundary ? retainedStart : start + 1U;
+    const uint64_t legalMaximum = startBoundary ? end - 1U : retainedEnd;
+    if (!moveBoundaryMotion(motion, legalMinimum, legalMaximum,
+                            viewStart, viewEnd, boundary,
+                            boundaryPotPhysical) ||
+        (start == algorithm.selection.startPulse &&
+         end == algorithm.selection.endPulse)) {
         return;
     }
     if (setPulseSelection(self, start, end)) {
@@ -2222,8 +2210,32 @@ void adjustTimelineSelection(_NT_algorithm* self, Algorithm& algorithm,
             --requested;
         }
     }
-    moveTimelineBoundary(self, algorithm, startBoundary, requested,
-                         rightPotPhysical);
+    if (startBoundary && requested >= algorithm.selection.endPulse) {
+        requested = algorithm.selection.endPulse - 1U;
+    } else if (!startBoundary &&
+               requested <= algorithm.selection.startPulse) {
+        requested = algorithm.selection.startPulse + 1U;
+    }
+    const uint64_t current = startBoundary
+                                 ? algorithm.selection.startPulse
+                                 : algorithm.selection.endPulse;
+    if (requested == current) {
+        return;
+    }
+    if (startBoundary) {
+        algorithm.startBoundaryMotion.pulseResidual = 0.0;
+    } else {
+        algorithm.endBoundaryMotion.pulseResidual = 0.0;
+    }
+    if (setPulseSelection(self, startBoundary ? requested
+                                              : algorithm.selection.startPulse,
+                          startBoundary ? algorithm.selection.endPulse
+                                        : requested)) {
+        algorithm.selectionFineTarget = startBoundary
+                                            ? kSelectionFineTargetStart
+                                            : kSelectionFineTargetEnd;
+        rebaseRangeMotionAfterEdit(algorithm, rightPotPhysical);
+    }
 }
 
 void scrollTimeline(Algorithm& algorithm, int delta) {
@@ -2321,6 +2333,13 @@ void updateTimelineZoom(Algorithm& algorithm, uint32_t coordinate) {
     const uint64_t minimum = retained < kTimelineMinimumVisiblePulses
                                  ? retained
                                  : kTimelineMinimumVisiblePulses;
+
+    // There is no smaller valid viewport for a retained span at or below the
+    // manual minimum. Keep the existing mode and bounds rather than creating a
+    // nominal manual width that cannot change what is visible.
+    if (retained <= kTimelineMinimumVisiblePulses) {
+        return;
+    }
 
     if (coordinate == algorithm.zoomPressCoordinate) {
         algorithm.timelineShowAll = algorithm.zoomPressShowAll;
@@ -2425,6 +2444,15 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
 
     bool suppressRightPotTranslation =
         prepareRangeMotion(*algorithm, data.pots[2]);
+    bool suppressBoundaryTranslation = false;
+    if (algorithm->boundaryMotionNeedsPhysicalSeed) {
+        seedBoundaryMotionPhysical(algorithm->startBoundaryMotion,
+                                   data.pots[0]);
+        seedBoundaryMotionPhysical(algorithm->endBoundaryMotion,
+                                   data.pots[1]);
+        algorithm->boundaryMotionNeedsPhysicalSeed = false;
+        suppressBoundaryTranslation = true;
+    }
 
     // Buttons are processed before pots and rotations. In particular, the
     // pot-3 release sample becomes the next relative baseline before a changed
@@ -2451,22 +2479,15 @@ void customUi(_NT_algorithm* self, const _NT_uiData& data) {
         suppressRightPotTranslation = true;
     }
 
-    if ((data.controls & kNT_potL) != 0U &&
-        ensureTimelineSelection(self, *algorithm)) {
-        moveTimelineBoundary(
-            self, *algorithm, true,
-            pulseFromPot(
-                algorithm->recordingEvents[algorithm->eventHead].pulse,
-                algorithm->selection.endPulse - 1U, data.pots[0]),
-            data.pots[2]);
+    if (!suppressBoundaryTranslation &&
+        (data.controls & kNT_potL) != 0U) {
+        moveTimelineBoundary(self, *algorithm, true, data.pots[0],
+                             data.pots[2]);
     }
-    if ((data.controls & kNT_potC) != 0U &&
-        ensureTimelineSelection(self, *algorithm)) {
-        moveTimelineBoundary(
-            self, *algorithm, false,
-            pulseFromPot(algorithm->selection.startPulse + 1U,
-                         algorithm->historyEndPulseExclusive, data.pots[1]),
-            data.pots[2]);
+    if (!suppressBoundaryTranslation &&
+        (data.controls & kNT_potC) != 0U) {
+        moveTimelineBoundary(self, *algorithm, false, data.pots[1],
+                             data.pots[2]);
     }
 
     if (rightPotHeld) {
@@ -2495,6 +2516,7 @@ void setupUi(_NT_algorithm* self, _NT_float3& pots) {
         return;
     }
     algorithm->rangeMotionNeedsPhysicalSeed = true;
+    algorithm->boundaryMotionNeedsPhysicalSeed = true;
     if (!algorithm->selectionValid) {
         return;
     }

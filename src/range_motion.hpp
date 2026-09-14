@@ -30,6 +30,24 @@ struct RangeMotionSelection {
     uint64_t end;
 };
 
+// Fixed-size state for one zoom-aware Start or End boundary pot. Movement is
+// relative to the last physical sample; pulseResidual retains sub-pulse travel
+// at the current viewport scale. offscreenSide records whether the boundary
+// was last observed before (-1), inside (0), or after (1) the viewport so a
+// newly offscreen boundary gets exactly one deliberate retrieval.
+struct BoundaryMotionState {
+    double physicalPosition;
+    double pulseResidual;
+    int8_t offscreenSide;
+    bool offscreenRetrievalConsumed;
+    bool established;
+
+    explicit BoundaryMotionState(double physicalPositionValue = 0.0)
+        : physicalPosition(physicalPositionValue), pulseResidual(0.0),
+          offscreenSide(0), offscreenRetrievalConsumed(false),
+          established(true) {}
+};
+
 namespace range_motion_detail {
 
 inline double clampNormalized(double value) {
@@ -236,6 +254,85 @@ inline uint64_t roundedScaledMovement(uint64_t travel, double magnitude,
 }
 
 } // namespace range_motion_detail
+
+inline bool seedBoundaryMotionPhysical(BoundaryMotionState& state,
+                                       double physicalPosition) {
+    state.physicalPosition =
+        range_motion_detail::clampNormalized(physicalPosition);
+    state.pulseResidual = 0.0;
+    state.established = true;
+    return true;
+}
+
+// Apply one genuine physical change at viewport scale. An actual boundary
+// outside the viewport is retrieved on the first changed sample only. The
+// retrieval clamps the nearest viewport edge through the legal boundary domain
+// so ordering and the caller's one-pulse minimum remain authoritative.
+inline bool moveBoundaryMotion(BoundaryMotionState& state,
+                               uint64_t legalMinimum,
+                               uint64_t legalMaximum,
+                               uint64_t viewStart,
+                               uint64_t viewEnd,
+                               uint64_t& boundary,
+                               double newPhysicalPosition) {
+    if (!state.established || legalMinimum > legalMaximum ||
+        boundary < legalMinimum || boundary > legalMaximum ||
+        viewEnd < viewStart) {
+        return false;
+    }
+
+    const int8_t side = boundary < viewStart ? -1 :
+                        (boundary > viewEnd ? 1 : 0);
+    if (side != state.offscreenSide) {
+        state.offscreenRetrievalConsumed = false;
+        state.offscreenSide = side;
+    }
+    if (side == 0) {
+        state.offscreenRetrievalConsumed = false;
+    }
+
+    const double physical =
+        range_motion_detail::clampNormalized(newPhysicalPosition);
+    const double delta = physical - state.physicalPosition;
+    if (delta == 0.0) {
+        return false;
+    }
+    state.physicalPosition = physical;
+
+    if (side != 0 && !state.offscreenRetrievalConsumed) {
+        uint64_t retrieved = side < 0 ? viewStart : viewEnd;
+        if (retrieved < legalMinimum) {
+            retrieved = legalMinimum;
+        } else if (retrieved > legalMaximum) {
+            retrieved = legalMaximum;
+        }
+        state.pulseResidual = 0.0;
+        state.offscreenRetrievalConsumed = true;
+        boundary = retrieved;
+        state.offscreenSide = boundary < viewStart ? -1 :
+                              (boundary > viewEnd ? 1 : 0);
+        return true;
+    }
+
+    const uint64_t viewportSpan = viewEnd - viewStart;
+    if (viewportSpan == 0U) {
+        return false;
+    }
+    const bool towardNewer = delta > 0.0;
+    const uint64_t available = towardNewer
+                                   ? legalMaximum - boundary
+                                   : boundary - legalMinimum;
+    double nextResidual = state.pulseResidual;
+    const uint64_t amount = range_motion_detail::roundedScaledMovement(
+        viewportSpan, range_motion_detail::absolute(delta), towardNewer,
+        available, state.pulseResidual, nextResidual);
+    state.pulseResidual = nextResidual;
+    if (amount == 0U) {
+        return false;
+    }
+    boundary = towardNewer ? boundary + amount : boundary - amount;
+    return true;
+}
 
 // Establish from the selected integer pair, never from the pot's absolute
 // position. Invalid, empty, and full-history ranges leave state untouched.
