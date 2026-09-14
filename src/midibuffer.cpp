@@ -201,8 +201,10 @@ struct Algorithm : public _NT_algorithm {
           zoomPressVisiblePulses(0), zoomPressManualVisiblePulses(0),
           rangeMotionHistoryStart(0), rangeMotionHistoryEnd(0),
           zoomPressCoordinate(0), clearRecordingTransitions(0),
-          clearHistoryMetadataOperations(0), captureEnabled(false),
-          clearRecordingArmed(true), clockRunning(false),
+          clearHistoryMetadataOperations(0), restoredPlaybackValue(0),
+          restoredClearRecordingValue(0), captureEnabled(false),
+          clearRecordingArmed(true), playbackRestorePending(false),
+          clearRecordingRestorePending(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
           rangeTransitionPending(false), playbackPositionValid(false),
@@ -252,9 +254,13 @@ struct Algorithm : public _NT_algorithm {
     uint32_t zoomPressCoordinate;
     uint32_t clearRecordingTransitions;
     uint32_t clearHistoryMetadataOperations;
+    int16_t restoredPlaybackValue;
+    int16_t restoredClearRecordingValue;
 
     bool captureEnabled;
     bool clearRecordingArmed;
+    bool playbackRestorePending;
+    bool clearRecordingRestorePending;
     bool clockRunning;
     bool haveAcquisitionPulse;
     bool clockHigh;
@@ -541,7 +547,22 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
     }
 
     ++algorithm->state.parameterChanges;
-    if (parameter == kParameterPlayback && algorithm->v != NULL) {
+    if (parameter == kParameterPlayback && algorithm->v != NULL &&
+        algorithm->playbackRestorePending &&
+        algorithm->v[kParameterPlayback] ==
+            algorithm->restoredPlaybackValue) {
+        // Generic parameters may be restored after custom state. Consume the
+        // matching host callback without replaying the already-restored
+        // transport transition or finalizing capture a second time.
+        algorithm->playbackRestorePending = false;
+    } else if (parameter == kParameterClearRecording && algorithm->v != NULL &&
+               algorithm->clearRecordingRestorePending &&
+               algorithm->v[kParameterClearRecording] ==
+                   algorithm->restoredClearRecordingValue) {
+        // A restored On is state, not a new Off-to-On gesture. In particular,
+        // it must not erase the history reconstructed by deserialise().
+        algorithm->clearRecordingRestorePending = false;
+    } else if (parameter == kParameterPlayback && algorithm->v != NULL) {
         const bool requested = algorithm->v[kParameterPlayback] != 0;
         if (requested) {
             startPlayback(self);
@@ -2950,6 +2971,18 @@ void serialise(_NT_algorithm* self, _NT_jsonStream& stream) {
     stream.addNumber(static_cast<int>(algorithm->selectionFineTarget));
     stream.closeArray();
 
+    // The host remains authoritative and persists these as ordinary generic
+    // parameters. This copy exists only to reconcile either host callback
+    // order and to distinguish new images from ten-parameter legacy images.
+    stream.addMemberName("sharedControls");
+    stream.openArray();
+    stream.addNumber(1);  // shared-control reconciliation revision
+    stream.addBoolean(algorithm->v != NULL &&
+                      algorithm->v[kParameterPlayback] != 0);
+    stream.addBoolean(algorithm->v != NULL &&
+                      algorithm->v[kParameterClearRecording] != 0);
+    stream.closeArray();
+
     serialiseBytes(stream, "recorded", &algorithm->recordedState,
                    sizeof(algorithm->recordedState));
     serialiseBytes(stream, "output", &algorithm->playbackOutputState,
@@ -3030,6 +3063,23 @@ struct NavigationPresetState {
     SelectionFineTarget target;
 };
 
+struct SharedControlPresetState {
+    SharedControlPresetState() : playback(false), clearRecording(false) {}
+
+    bool playback;
+    bool clearRecording;
+};
+
+bool parseSharedControls(_NT_jsonParse& parse,
+                         SharedControlPresetState& state) {
+    int count = 0;
+    int representation = 0;
+    return parse.numberOfArrayElements(count) && count == 3 &&
+           parse.number(representation) && representation == 1 &&
+           parse.boolean(state.playback) &&
+           parse.boolean(state.clearRecording);
+}
+
 bool parseNavigation(_NT_jsonParse& parse, NavigationPresetState& state) {
     int count = 0;
     int representation = 0;
@@ -3091,6 +3141,8 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
     bool flagsSeen = false;
     bool navigationSeen = false;
     NavigationPresetState navigation;
+    bool sharedControlsSeen = false;
+    SharedControlPresetState sharedControls;
     bool recordedSeen = false;
     bool outputSeen = false;
     bool pendingSeen = false;
@@ -3127,6 +3179,11 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
                 return false;
             }
             navigationSeen = true;
+        } else if (parse.matchName("sharedControls")) {
+            if (!parseSharedControls(parse, sharedControls)) {
+                return false;
+            }
+            sharedControlsSeen = true;
         } else if (parse.matchName("recorded")) {
             if (!deserialiseBytes(parse, &algorithm.recordedState,
                                   sizeof(algorithm.recordedState))) {
@@ -3175,6 +3232,43 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
         // manual view. Never reinterpret a legacy width as the fresh default.
         algorithm.timelineShowAll = false;
     }
+
+    if (sharedControlsSeen) {
+        algorithm.restoredPlaybackValue = sharedControls.playback ? 1 : 0;
+        algorithm.restoredClearRecordingValue =
+            sharedControls.clearRecording ? 1 : 0;
+        const bool genericParametersAlreadyRestored =
+            algorithm.v != NULL &&
+            ((algorithm.restoredPlaybackValue !=
+                  kParameters[kParameterPlayback].def &&
+              algorithm.v[kParameterPlayback] ==
+                  algorithm.restoredPlaybackValue) ||
+             (algorithm.restoredClearRecordingValue !=
+                  kParameters[kParameterClearRecording].def &&
+              algorithm.v[kParameterClearRecording] ==
+                  algorithm.restoredClearRecordingValue));
+        algorithm.playbackRestorePending =
+            !genericParametersAlreadyRestored && algorithm.v != NULL &&
+            algorithm.v[kParameterPlayback] !=
+                algorithm.restoredPlaybackValue;
+        algorithm.clearRecordingRestorePending =
+            !genericParametersAlreadyRestored && algorithm.v != NULL &&
+            algorithm.v[kParameterClearRecording] !=
+                algorithm.restoredClearRecordingValue;
+        // Both On and Off have already been interpreted in the saved image.
+        // On therefore restores consumed; Off restores armed.
+        algorithm.clearRecordingArmed = !sharedControls.clearRecording;
+    } else {
+        // Valid legacy images had ten generic parameters. Their complete
+        // custom transport intent is the migration source for Playback, and
+        // Clear Recording did not exist.
+        algorithm.restoredPlaybackValue =
+            algorithm.transportState == kTransportStopped ? 0 : 1;
+        algorithm.restoredClearRecordingValue = 0;
+        algorithm.playbackRestorePending = false;
+        algorithm.clearRecordingRestorePending = false;
+        algorithm.clearRecordingArmed = true;
+    }
     return true;
 }
 
@@ -3217,6 +3311,33 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
     algorithm->rangeMotion = RangeMotionState();
     algorithm->rangeMotionDomainKnown = false;
     algorithm->rangeMotionNeedsPhysicalSeed = true;
+
+    // Clear diagnostics are deliberately not preset state. Resetting them also
+    // makes a generic-parameters-before-custom-state Clear On callback
+    // observationally disappear after the complete image is reconstructed.
+    algorithm->clearRecordingTransitions = 0;
+    algorithm->clearHistoryMetadataOperations = 0;
+
+    const bool playbackNeedsImmediatePublish =
+        algorithm->v != NULL &&
+        algorithm->v[kParameterPlayback] !=
+            algorithm->restoredPlaybackValue &&
+        !algorithm->playbackRestorePending;
+    if (playbackNeedsImmediatePublish) {
+        // This covers legacy migration and the generic-before order where a
+        // restored Clear On briefly stopped Playback before custom state was
+        // available. API v13's UI setter is valid from any callback, keeping
+        // host mappings, UI, and future generic saves authoritative without
+        // directly writing host-owned v[].
+        algorithm->playbackRestorePending = true;
+        nt_host::setParameterFromUi(self, kParameterPlayback,
+                                    algorithm->restoredPlaybackValue);
+        if (algorithm->v[kParameterPlayback] !=
+            algorithm->restoredPlaybackValue) {
+            return false;
+        }
+    }
+
     return !algorithm->captureEnabled ||
            algorithm->transportState == kTransportStopped;
 }

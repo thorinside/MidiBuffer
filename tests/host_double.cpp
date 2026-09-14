@@ -723,6 +723,21 @@ uint64_t PresetImage::valueCount() const {
     return jsonValueCount(static_cast<const JsonDocument*>(document_)->root);
 }
 
+uint32_t PresetImage::parameterCount() const {
+    return static_cast<const JsonDocument*>(document_)->parameterCount;
+}
+
+bool PresetImage::parameter(size_t index, int16_t& value) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    if (index >= document->parameterCount ||
+        index >= ARRAY_SIZE(document->parameters)) {
+        return false;
+    }
+    value = document->parameters[index];
+    return true;
+}
+
 bool PresetImage::equals(const PresetImage& other) const {
     const JsonDocument* left = static_cast<const JsonDocument*>(document_);
     const JsonDocument* right =
@@ -772,6 +787,27 @@ bool PresetImage::removeNavigation() {
          child != state->children.end(); ++child) {
         if (child->name == "navigation") {
             state->children.erase(child);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PresetImage::makeLegacyWithoutAppendedParameters() {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    if (document->parameterCount < 10U || state == NULL) {
+        return false;
+    }
+    for (std::vector<JsonNode>::iterator child = state->children.begin();
+         child != state->children.end(); ++child) {
+        if (child->name == "sharedControls") {
+            state->children.erase(child);
+            document->parameterCount = 10U;
+            for (uint32_t index = 10U;
+                 index < ARRAY_SIZE(document->parameters); ++index) {
+                document->parameters[index] = 0;
+            }
             return true;
         }
     }
@@ -915,7 +951,9 @@ bool HostDouble::loadPreset(const PresetImage& image,
     }
     const JsonDocument* document =
         static_cast<const JsonDocument*>(image.document_);
-    if (document->parameterCount != requirements_.numParameters ||
+    const uint32_t inheritedParameterCount = 10U;
+    if (document->parameterCount < inheritedParameterCount ||
+        document->parameterCount > requirements_.numParameters ||
         document->parameterCount > ARRAY_SIZE(values_)) {
         return false;
     }

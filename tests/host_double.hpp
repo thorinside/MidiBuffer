@@ -71,9 +71,12 @@ class PresetImage {
 
     uint64_t payloadBytes() const;
     uint64_t valueCount() const;
+    uint32_t parameterCount() const;
+    bool parameter(size_t index, int16_t& value) const;
     bool equals(const PresetImage& other) const;
     bool navigation(bool& showAll, uint64_t& manualSpan, int& target) const;
     bool removeNavigation();
+    bool makeLegacyWithoutAppendedParameters();
     bool corruptNavigationTarget();
 
   private:

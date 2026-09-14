@@ -4289,6 +4289,203 @@ void verifyOneShotClearRecording() {
            "full 5 MB clear performs the same four metadata operations as small history, exposes no erased event, allocates nothing, and preserves live capture eligibility");
 }
 
+void verifySharedControlPresetRestoration() {
+    midibuffer_test::HostDouble source;
+    expect(source.instantiate(1),
+           "shared-control preset source constructs");
+
+    // Consume Clear while empty, then retain a complete playable history. This
+    // is the valid state that distinguishes restoration from a live clear
+    // gesture: Clear is On, but the later recording must survive.
+    changeParameter(source, kClearRecordingParameter, 1);
+    startCapture(source);
+    expect(clockPulseAt(source, 0U) && clockPulseAt(source, 16U),
+           "consumed-clear preset source acquires its recording clock");
+    const uint64_t selectionStart = snapshot(source).currentPulse;
+    sendMidi(source, 0x92U, 60U, 100U);
+    sendMidi(source, 0xB2U, 64U, 127U);
+    expect(clockPulseAt(source, 32U),
+           "consumed-clear preset source reaches its ending pulse");
+    sendMidi(source, 0x82U, 60U, 0U);
+    sendMidi(source, 0xB2U, 64U, 0U);
+    expect(clockPulseAt(source, 48U),
+           "consumed-clear preset source closes retained history");
+    stopCapture(source);
+    expect(midibuffer::setPulseSelection(source.algorithm(), selectionStart,
+                                         selectionStart + 2U),
+           "consumed-clear preset source selects retained history");
+    changeParameter(source, kPlaybackDestinationParameter, 1);
+    changeParameter(source, kPlaybackChannelParameter, 5);
+    changeParameter(source, kPlaybackParameter, 1);
+    expect(clockPulseAt(source, 64U),
+           "consumed-clear preset source starts shared Playback");
+    stepThrough(source, 72U);
+
+    const midibuffer::CaptureSnapshot saved = snapshot(source);
+    const HistoryImage savedHistory = captureHistory(source);
+    expect(saved.playbackActive && !saved.captureEnabled &&
+               !saved.clearRecordingArmed && saved.eventCount == 4U,
+           "new preset fixture combines active Playback, consumed Clear, and retained history");
+
+    midibuffer_test::PresetImage image;
+    int16_t savedPlayback = -1;
+    int16_t savedClear = -1;
+    expect(source.savePreset(image) && image.parameterCount() == 12U &&
+               image.parameter(kPlaybackParameter, savedPlayback) &&
+               image.parameter(kClearRecordingParameter, savedClear) &&
+               savedPlayback == 1 && savedClear == 1,
+           "normal host parameter persistence saves Playback and Clear Recording On outside custom state");
+
+    for (int order = 0; order < 2; ++order) {
+        midibuffer_test::HostDouble restored;
+        midibuffer_test::resetTrace();
+        expect(restored.instantiate(1) &&
+                   restored.loadPreset(image, order != 0),
+               order == 0
+                   ? "new shared controls load with generic parameters before custom state"
+                   : "new shared controls load with generic parameters after custom state");
+        const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+        expect(restored.parameter(kPlaybackParameter) == 1 &&
+                   restored.parameter(kClearRecordingParameter) == 1 &&
+                   !loaded.clearRecordingArmed &&
+                   loaded.clearRecordingTransitions == 0U &&
+                   loaded.clearHistoryMetadataOperations == 0U &&
+                   sameSelectionAndTransport(saved, loaded) &&
+                   loaded.pendingNoteEndingCount ==
+                       saved.pendingNoteEndingCount &&
+                   loaded.pendingSustainReleaseCount ==
+                       saved.pendingSustainReleaseCount &&
+                   loaded.timelineVisiblePulses ==
+                       saved.timelineVisiblePulses &&
+                   loaded.timelineScrollPulses ==
+                       saved.timelineScrollPulses &&
+                   sameHistory(savedHistory, restored),
+               "both restoration orders reconcile shared values while preserving complete selection, scheduling, ownership, navigation, and event state");
+        expect(midibuffer_test::trace().midiCallCount == 0U,
+               "shared-control load emits no cleanup or playback MIDI");
+
+        midibuffer_test::PresetImage roundTrip;
+        expect(restored.savePreset(roundTrip) && image.equals(roundTrip),
+               "new shared-control image round-trips every generic parameter and custom JSON value exactly");
+
+        midibuffer_test::resetTrace();
+        changeParameter(restored, kClearRecordingParameter, 1);
+        expect(snapshot(restored).eventCount == saved.eventCount &&
+                   snapshot(restored).clearRecordingTransitions == 0U &&
+                   midibuffer_test::trace().midiCallCount == 0U,
+               "restored Clear Recording On is consumed and repeated On cannot erase or clean up");
+
+        const uint64_t firstFreshPulse = restored.elapsedSamples();
+        expect(clockPulseAt(restored, firstFreshPulse) &&
+                   !snapshot(restored).clockRunning &&
+                   midibuffer_test::trace().midiCallCount == 0U,
+               "restored transport stays silent on its first fresh clock pulse");
+        expect(clockPulseAt(restored, firstFreshPulse + 16U) &&
+                   snapshot(restored).clockRunning,
+               "restored transport resumes only after its second fresh clock pulse");
+
+        changeParameter(restored, kClearRecordingParameter, 0);
+        expect(snapshot(restored).clearRecordingArmed &&
+                   snapshot(restored).eventCount == saved.eventCount,
+               "post-load Clear Off rearms without changing retained history");
+        changeParameter(restored, kClearRecordingParameter, 1);
+        expect(snapshot(restored).eventCount == 0U &&
+                   snapshot(restored).clearRecordingTransitions == 1U &&
+                   !snapshot(restored).clearRecordingArmed &&
+                   restored.parameter(kPlaybackParameter) == 0,
+               "only a post-load Off-to-On Clear transition erases and stops Playback");
+    }
+}
+
+void verifyLegacySharedControlPresetMigration() {
+    enum LegacyIntent {
+        kLegacyStopped,
+        kLegacyArmed,
+        kLegacyPlaying,
+        kLegacyClockLossPaused,
+    };
+    const LegacyIntent intents[] = {
+        kLegacyStopped,
+        kLegacyArmed,
+        kLegacyPlaying,
+        kLegacyClockLossPaused,
+    };
+
+    for (size_t intentIndex = 0; intentIndex < ARRAY_SIZE(intents);
+         ++intentIndex) {
+        midibuffer_test::HostDouble source;
+        TransportFixture fixture = prepareTransportHistory(source);
+        if (intents[intentIndex] != kLegacyStopped) {
+            changeParameter(source, kPlaybackParameter, 1);
+        }
+        if (intents[intentIndex] == kLegacyPlaying ||
+            intents[intentIndex] == kLegacyClockLossPaused) {
+            fixture.lastClockSample += 16U;
+            expect(clockPulseAt(source, fixture.lastClockSample),
+                   "legacy playing fixture starts on its next clock");
+        }
+        if (intents[intentIndex] == kLegacyClockLossPaused) {
+            while (!snapshot(source).playbackClockLossPaused) {
+                noClockBlock(source);
+            }
+        }
+        const midibuffer::CaptureSnapshot saved = snapshot(source);
+        const HistoryImage savedHistory = captureHistory(source);
+        const bool expectedPlayback = intents[intentIndex] != kLegacyStopped;
+        expect((intents[intentIndex] == kLegacyStopped &&
+                !saved.playbackArmed && !saved.playbackActive &&
+                !saved.playbackClockLossPaused) ||
+                   (intents[intentIndex] == kLegacyArmed &&
+                    saved.playbackArmed) ||
+                   (intents[intentIndex] == kLegacyPlaying &&
+                    saved.playbackActive) ||
+                   (intents[intentIndex] == kLegacyClockLossPaused &&
+                    saved.playbackClockLossPaused),
+               "legacy fixture reaches its requested transport intent");
+
+        midibuffer_test::PresetImage legacyImage;
+        expect(source.savePreset(legacyImage) &&
+                   legacyImage.makeLegacyWithoutAppendedParameters() &&
+                   legacyImage.parameterCount() == 10U,
+               "valid legacy image omits both appended generic parameters and shared-control reconciliation state");
+
+        for (int order = 0; order < 2; ++order) {
+            midibuffer_test::HostDouble restored;
+            midibuffer_test::resetTrace();
+            expect(restored.instantiate(1) &&
+                       restored.loadPreset(legacyImage, order != 0),
+                   "legacy image loads under either generic/custom restoration order");
+            const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+            expect(restored.parameter(kPlaybackParameter) ==
+                       (expectedPlayback ? 1 : 0) &&
+                       restored.parameter(kClearRecordingParameter) == 0 &&
+                       loaded.clearRecordingArmed &&
+                       loaded.clearRecordingTransitions == 0U &&
+                       sameSelectionAndTransport(saved, loaded) &&
+                       loaded.pendingNoteEndingCount ==
+                           saved.pendingNoteEndingCount &&
+                       loaded.pendingSustainReleaseCount ==
+                           saved.pendingSustainReleaseCount &&
+                       sameHistory(savedHistory, restored),
+                   "legacy Stopped maps Playback Off; Armed, Playing, and ClockLossPaused map On while Clear defaults Off and armed with custom state intact");
+            expect(midibuffer_test::trace().midiCallCount == 0U,
+                   "legacy migration emits no cleanup or playback MIDI during load");
+
+            if (expectedPlayback) {
+                const uint64_t firstFreshPulse = restored.elapsedSamples();
+                midibuffer_test::resetTrace();
+                expect(clockPulseAt(restored, firstFreshPulse) &&
+                           !snapshot(restored).clockRunning &&
+                           midibuffer_test::trace().midiCallCount == 0U,
+                       "legacy restored transport remains gated on the first fresh pulse");
+                expect(clockPulseAt(restored, firstFreshPulse + 16U) &&
+                           snapshot(restored).clockRunning,
+                       "legacy restored transport requires the second fresh pulse before resuming");
+            }
+        }
+    }
+}
+
 void verifyTimedRightEncoderPanic() {
     const uint32_t destinations[] = {
         kNT_destinationBreakout,
@@ -4938,15 +5135,21 @@ void verifyPresetSupportedBufferRangeAndCost() {
         midibuffer_test::HostDouble source;
         expect(source.instantiate(megabytes),
                "supported-range preset source constructs");
+        changeParameter(source, kClearRecordingParameter, 1);
         startCapture(source);
         acquireClock(source);
         sendMidi(source, 0xB0U, 7U,
                  static_cast<uint8_t>(megabytes * 10));
+        changeParameter(source, kPlaybackParameter, 1);
         midibuffer_test::PresetImage image;
         midibuffer_test::HostDouble restored;
         expect(source.savePreset(image) && restored.instantiate(megabytes) &&
-                   restored.loadPreset(image),
-               "valid preset round-trips at each supported buffer specification");
+                   restored.loadPreset(image) &&
+                   restored.parameter(kPlaybackParameter) == 1 &&
+                   restored.parameter(kClearRecordingParameter) == 1 &&
+                   !snapshot(restored).clearRecordingArmed &&
+                   snapshot(restored).eventCount == 1U,
+               "valid preset round-trips both shared controls and retained custom state at each supported buffer specification");
         midibuffer_test::PresetImage secondImage;
         expect(restored.savePreset(secondImage) && image.equals(secondImage),
                "each supported buffer specification has exhaustive saved-state equality");
@@ -4955,6 +5158,7 @@ void verifyPresetSupportedBufferRangeAndCost() {
     midibuffer_test::HostDouble maximum;
     expect(maximum.instantiate(5),
            "maximum-size preset cost fixture constructs");
+    changeParameter(maximum, kClearRecordingParameter, 1);
     startCapture(maximum);
     acquireClock(maximum);
     const uint32_t capacity = snapshot(maximum).eventCapacity;
@@ -4962,6 +5166,7 @@ void verifyPresetSupportedBufferRangeAndCost() {
         sendMidi(maximum, 0xB0U, 7U,
                  static_cast<uint8_t>(index & 0x7fU));
     }
+    changeParameter(maximum, kPlaybackParameter, 1);
     midibuffer_test::PresetImage maximumImage;
     const std::clock_t saveStart = std::clock();
     expect(maximum.savePreset(maximumImage),
@@ -4976,9 +5181,12 @@ void verifyPresetSupportedBufferRangeAndCost() {
     const std::clock_t loadEnd = std::clock();
     midibuffer_test::PresetImage maximumRoundTrip;
     expect(snapshot(restored).eventCount == capacity &&
+               restored.parameter(kPlaybackParameter) == 1 &&
+               restored.parameter(kClearRecordingParameter) == 1 &&
+               !snapshot(restored).clearRecordingArmed &&
                restored.savePreset(maximumRoundTrip) &&
                maximumImage.equals(maximumRoundTrip),
-           "full supported payload preserves every retained event and all saved state");
+           "full supported payload preserves both shared controls, every retained event, and all saved state");
     const double saveMilliseconds =
         1000.0 * static_cast<double>(saveEnd - saveStart) / CLOCKS_PER_SEC;
     const double loadMilliseconds =
@@ -5192,6 +5400,8 @@ int main() {
     verifyTimelinePlaybackToggle();
     verifySharedPlaybackParameter();
     verifyOneShotClearRecording();
+    verifySharedControlPresetRestoration();
+    verifyLegacySharedControlPresetMigration();
     verifyTimedRightEncoderPanic();
     verifyLegacyNavigationPresetCompatibility();
     verifyShowAllPresetPolicy();
