@@ -31,6 +31,19 @@ struct MidiCall {
     uint8_t size;
 };
 
+enum ParameterSetSource {
+    kParameterSetFromAudio,
+    kParameterSetFromUi,
+};
+
+struct ParameterSetCall {
+    uint32_t algorithmIndex;
+    uint32_t parameter;
+    int16_t value;
+    ParameterSetSource source;
+    uint32_t callbackDepth;
+};
+
 struct Trace {
     DrawCall drawCalls[16];
     size_t drawCallCount;
@@ -38,6 +51,9 @@ struct Trace {
     size_t shapeCallCount;
     MidiCall midiCalls[128];
     size_t midiCallCount;
+    ParameterSetCall parameterSetCalls[64];
+    size_t parameterSetCallCount;
+    uint32_t maximumParameterCallbackDepth;
 };
 
 void resetTrace();

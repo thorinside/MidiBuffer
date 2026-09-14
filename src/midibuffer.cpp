@@ -118,8 +118,15 @@ enum Parameter {
     kParameterFilterPitchBend,
     kParameterFilterAftertouch,
     kParameterPulsesPerDisplayedBeat,
+    kParameterPlayback,
+    kParameterClearRecording,
     kNumParameters,
 };
+
+static_assert(kParameterPulsesPerDisplayedBeat == 9 &&
+                  kParameterPlayback == 10 &&
+                  kParameterClearRecording == 11,
+              "appended controls must not renumber inherited parameters");
 
 enum Specification {
     kSpecificationBufferMegabytes,
@@ -285,7 +292,7 @@ static const char* const kPlaybackChannelStrings[] = {
     "9",        "10", "11", "12", "13", "14", "15", "16",
 };
 
-static const char* const kFilterStrings[] = {
+static const char* const kBooleanStrings[] = {
     "Off",
     "On",
 };
@@ -346,7 +353,7 @@ static const _NT_parameter kParameters[] = {
         .def = 0,
         .unit = kNT_unitEnum,
         .scaling = kNT_scalingNone,
-        .enumStrings = kFilterStrings,
+        .enumStrings = kBooleanStrings,
     },
     {
         .name = "Filter Pitch Bend",
@@ -355,7 +362,7 @@ static const _NT_parameter kParameters[] = {
         .def = 0,
         .unit = kNT_unitEnum,
         .scaling = kNT_scalingNone,
-        .enumStrings = kFilterStrings,
+        .enumStrings = kBooleanStrings,
     },
     {
         .name = "Filter Aftertouch",
@@ -364,7 +371,7 @@ static const _NT_parameter kParameters[] = {
         .def = 0,
         .unit = kNT_unitEnum,
         .scaling = kNT_scalingNone,
-        .enumStrings = kFilterStrings,
+        .enumStrings = kBooleanStrings,
     },
     {
         .name = "Pulses/Beat",
@@ -374,6 +381,24 @@ static const _NT_parameter kParameters[] = {
         .unit = kNT_unitEnum,
         .scaling = kNT_scalingNone,
         .enumStrings = kPulsesPerDisplayedBeatStrings,
+    },
+    {
+        .name = "Playback",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kBooleanStrings,
+    },
+    {
+        .name = "Clear Recording",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kBooleanStrings,
     },
 };
 // clang-format on
@@ -386,9 +411,11 @@ static const uint8_t kInputPageParameters[] = {
 static const uint8_t kCapturePageParameters[] = {
     kParameterCapture,
     kParameterRecordingChannel,
+    kParameterClearRecording,
 };
 
 static const uint8_t kPlaybackPageParameters[] = {
+    kParameterPlayback,
     kParameterPlaybackDestination,
     kParameterPlaybackChannel,
     kParameterFilterControlChange,
@@ -492,6 +519,14 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
 
 void finalizeCapture(Algorithm& algorithm);
 void clearPendingPlaybackEndings(Algorithm& algorithm);
+void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample);
+
+void stopTransport(Algorithm& algorithm) {
+    releasePlaybackOutput(algorithm, algorithm.sampleCursor);
+    algorithm.transportState = kTransportStopped;
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+}
 
 void parameterChanged(_NT_algorithm* self, int parameter) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
@@ -500,7 +535,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
     }
 
     ++algorithm->state.parameterChanges;
-    if (parameter == kParameterCapture && algorithm->v != NULL) {
+    if (parameter == kParameterPlayback && algorithm->v != NULL) {
+        const bool requested = algorithm->v[kParameterPlayback] != 0;
+        if (requested) {
+            startPlayback(self);
+        } else {
+            stopTransport(*algorithm);
+        }
+    } else if (parameter == kParameterCapture && algorithm->v != NULL) {
         const bool requested = algorithm->v[kParameterCapture] !=
                                kParameters[kParameterCapture].min;
         if (!requested) {
@@ -1694,7 +1736,31 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
 }
 
-void emergencySilence(Algorithm& algorithm) {
+void setPlaybackRequest(_NT_algorithm* self, bool requested,
+                        bool fromUi) {
+    if (self == NULL) {
+        return;
+    }
+    const int16_t value = requested ? 1 : 0;
+    if (fromUi) {
+        nt_host::setParameterFromUi(self, kParameterPlayback, value);
+    } else {
+        nt_host::setParameterFromAudio(self, kParameterPlayback, value);
+    }
+}
+
+void emergencySilence(_NT_algorithm* self, Algorithm& algorithm,
+                      bool fromUi) {
+    // Publish Off through the host first. Its parameter callback performs the
+    // same ordered note/sustain cleanup as every explicit shared-state stop.
+    // The fallback keeps the legacy low-level transport seam safe when its
+    // host value was already Off.
+    if (algorithm.v != NULL && algorithm.v[kParameterPlayback] != 0) {
+        setPlaybackRequest(self, false, fromUi);
+    } else {
+        stopTransport(algorithm);
+    }
+
     // Manual panic can be reached while capture is active; use the established
     // finite capture-stop path so emergency silence always leaves it paused.
     finalizeCapture(algorithm);
@@ -1740,9 +1806,16 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
 
     const bool emergencyController =
         (byte0 & 0xf0U) == 0xb0U && (byte1 == 120U || byte1 == 123U);
-    if (emergencyController &&
-        algorithm->transportState != kTransportStopped) {
-        emergencySilence(*algorithm);
+    if (emergencyController) {
+        const bool playbackOn =
+            algorithm->v != NULL && algorithm->v[kParameterPlayback] != 0;
+        if (algorithm->transportState != kTransportStopped) {
+            emergencySilence(self, *algorithm, false);
+        } else if (playbackOn) {
+            // Preserve the existing no-output behavior when no transport ever
+            // started, while still clearing the continuing host request.
+            setPlaybackRequest(self, false, false);
+        }
         return;
     }
 
@@ -2266,23 +2339,16 @@ void updateRightEncoderPanic(Algorithm& algorithm, const _NT_uiData& data) {
     if (!algorithm.rightEncoderPanicFired && NT_globals.sampleRate != 0U &&
         algorithm.sampleCursor - algorithm.rightEncoderHoldStartSample >=
             NT_globals.sampleRate) {
-        emergencySilence(algorithm);
+        emergencySilence(&algorithm, algorithm, true);
         algorithm.rightEncoderPanicFired = true;
     }
 }
 
 void toggleTimelinePlayback(_NT_algorithm* self, Algorithm& algorithm) {
-    if (algorithm.transportState != kTransportStopped) {
-        stopPlayback(self);
+    if (algorithm.v == NULL) {
         return;
     }
-
-    // Refuse the gesture before startPlayback's capture-finalization path so
-    // an invalid selection makes the button a true no-op.
-    PulseRange range = {};
-    if (acquirePlaybackSelection(self, range)) {
-        startPlayback(self);
-    }
+    setPlaybackRequest(self, algorithm.v[kParameterPlayback] == 0, true);
 }
 
 void customUi(_NT_algorithm* self, const _NT_uiData& data) {
@@ -3412,6 +3478,10 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
         algorithm->rangeTransitionPending = false;
         algorithm->playbackPositionValid = false;
     }
+    if (algorithm->transportState == kTransportStopped &&
+        algorithm->v != NULL && algorithm->v[kParameterPlayback] != 0) {
+        startPlayback(self);
+    }
     return true;
 }
 
@@ -3447,15 +3517,15 @@ bool startPlayback(_NT_algorithm* self) {
     if (algorithm == NULL) {
         return false;
     }
-    // Playback is a capture-stop path: freeze a finite performance before
-    // validating its retained selection, without transmitting live cleanup.
-    // Capture never restarts as a side effect of any transport transition.
-    finalizeCapture(*algorithm);
-
     PulseRange range = {};
     if (!acquirePlaybackSelection(self, range)) {
         return false;
     }
+
+    // A valid continuing request is a capture-stop path: freeze a finite
+    // performance without transmitting live cleanup. An unavailable request
+    // remains On but leaves capture untouched until a valid range exists.
+    finalizeCapture(*algorithm);
     if (algorithm->transportState != kTransportStopped) {
         return true;
     }
@@ -3480,11 +3550,14 @@ bool startPlayback(_NT_algorithm* self) {
 
 void stopPlayback(_NT_algorithm* self) {
     Algorithm* algorithm = asAlgorithm(self);
-    if (algorithm != NULL) {
-        releasePlaybackOutput(*algorithm, algorithm->sampleCursor);
-        algorithm->transportState = kTransportStopped;
-        algorithm->playbackIntervalOpen = false;
-        algorithm->playbackNextEventScheduled = false;
+    if (algorithm == NULL) {
+        return;
+    }
+    if (algorithm->v != NULL && algorithm->v[kParameterPlayback] != 0) {
+        nt_host::setParameterFromAudio(self, kParameterPlayback, 0);
+    } else {
+        // Keep the low-level seam safe for an already-Off or unattached host.
+        stopTransport(*algorithm);
     }
 }
 
@@ -3543,6 +3616,26 @@ void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1,
                uint8_t byte2, uint64_t dispatchSample) {
     traceDispatchSample(dispatchSample);
     NT_sendMidi3ByteMessage(destination, byte0, byte1, byte2);
+}
+
+void setParameterFromAudio(_NT_algorithm* algorithm, uint32_t parameter,
+                           int16_t value) {
+    const int32_t algorithmIndex = NT_algorithmIndex(algorithm);
+    if (algorithmIndex >= 0) {
+        NT_setParameterFromAudio(
+            static_cast<uint32_t>(algorithmIndex),
+            parameter + NT_parameterOffset(), value);
+    }
+}
+
+void setParameterFromUi(_NT_algorithm* algorithm, uint32_t parameter,
+                        int16_t value) {
+    const int32_t algorithmIndex = NT_algorithmIndex(algorithm);
+    if (algorithmIndex >= 0) {
+        NT_setParameterFromUi(
+            static_cast<uint32_t>(algorithmIndex),
+            parameter + NT_parameterOffset(), value);
+    }
 }
 
 } // namespace nt_host

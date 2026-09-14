@@ -13,7 +13,84 @@ namespace {
 
 uint64_t gHeapAllocationCount = 0;
 uint64_t gPendingDispatchSample = 0;
+uint32_t gParameterCallbackDepth = 0;
 midibuffer_test::Trace gTrace;
+
+const uint32_t kHostParameterOffset = 3U;
+
+struct HostBinding {
+    _NT_algorithm* algorithm;
+    const _NT_factory* factory;
+    int16_t* values;
+    uint32_t parameterCount;
+};
+
+HostBinding gHostBindings[16];
+
+int32_t bindingIndex(const _NT_algorithm* algorithm) {
+    for (uint32_t index = 0; index < ARRAY_SIZE(gHostBindings); ++index) {
+        if (gHostBindings[index].algorithm == algorithm) {
+            return static_cast<int32_t>(index);
+        }
+    }
+    return -1;
+}
+
+bool registerBinding(_NT_algorithm* algorithm, const _NT_factory* factory,
+                     int16_t* values, uint32_t parameterCount) {
+    if (bindingIndex(algorithm) >= 0) {
+        return true;
+    }
+    for (uint32_t index = 0; index < ARRAY_SIZE(gHostBindings); ++index) {
+        if (gHostBindings[index].algorithm == NULL) {
+            gHostBindings[index].algorithm = algorithm;
+            gHostBindings[index].factory = factory;
+            gHostBindings[index].values = values;
+            gHostBindings[index].parameterCount = parameterCount;
+            return true;
+        }
+    }
+    return false;
+}
+
+void unregisterBinding(const _NT_algorithm* algorithm) {
+    const int32_t index = bindingIndex(algorithm);
+    if (index >= 0) {
+        gHostBindings[index] = HostBinding();
+    }
+}
+
+void setBoundParameter(uint32_t algorithmIndex, uint32_t parameter,
+                       int16_t value,
+                       midibuffer_test::ParameterSetSource source) {
+    if (gTrace.parameterSetCallCount < ARRAY_SIZE(gTrace.parameterSetCalls)) {
+        midibuffer_test::ParameterSetCall& call =
+            gTrace.parameterSetCalls[gTrace.parameterSetCallCount++];
+        call.algorithmIndex = algorithmIndex;
+        call.parameter = parameter;
+        call.value = value;
+        call.source = source;
+        call.callbackDepth = gParameterCallbackDepth;
+    }
+    if (algorithmIndex >= ARRAY_SIZE(gHostBindings) ||
+        parameter < kHostParameterOffset) {
+        return;
+    }
+    HostBinding& binding = gHostBindings[algorithmIndex];
+    const uint32_t localParameter = parameter - kHostParameterOffset;
+    if (binding.algorithm == NULL || binding.factory == NULL ||
+        binding.values == NULL || localParameter >= binding.parameterCount) {
+        return;
+    }
+    binding.values[localParameter] = value;
+    ++gParameterCallbackDepth;
+    if (gParameterCallbackDepth > gTrace.maximumParameterCallbackDepth) {
+        gTrace.maximumParameterCallbackDepth = gParameterCallbackDepth;
+    }
+    binding.factory->parameterChanged(
+        binding.algorithm, static_cast<int>(localParameter));
+    --gParameterCallbackDepth;
+}
 
 void copyText(char* destination, size_t capacity, const char* source) {
     if (capacity == 0) {
@@ -573,6 +650,26 @@ void NT_sendMidi3ByteMessage(uint32_t destination, uint8_t byte0,
     recordMidi(destination, 3, byte0, byte1, byte2);
 }
 
+int32_t NT_algorithmIndex(const _NT_algorithm* algorithm) {
+    return bindingIndex(algorithm);
+}
+
+uint32_t NT_parameterOffset(void) {
+    return kHostParameterOffset;
+}
+
+void NT_setParameterFromAudio(uint32_t algorithmIndex, uint32_t parameter,
+                              int16_t value) {
+    setBoundParameter(algorithmIndex, parameter, value,
+                      midibuffer_test::kParameterSetFromAudio);
+}
+
+void NT_setParameterFromUi(uint32_t algorithmIndex, uint32_t parameter,
+                           int16_t value) {
+    setBoundParameter(algorithmIndex, parameter, value,
+                      midibuffer_test::kParameterSetFromUi);
+}
+
 }  // extern "C"
 
 namespace midibuffer_test {
@@ -707,6 +804,7 @@ HostDouble::HostDouble()
       elapsedSamples_(0) {}
 
 HostDouble::~HostDouble() {
+    unregisterBinding(algorithm_);
     std::free(sram_);
     std::free(dram_);
 }
@@ -756,7 +854,8 @@ bool HostDouble::instantiate(int32_t bufferMegabytes) {
     }
     algorithm_->v = values_;
     algorithm_->vIncludingCommon = values_;
-    return true;
+    return registerBinding(algorithm_, factory_, values_,
+                           requirements_.numParameters);
 }
 
 _NT_algorithm* HostDouble::algorithm() {

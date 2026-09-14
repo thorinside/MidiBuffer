@@ -35,7 +35,7 @@ inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 	@$(ARM_NM) --defined-only $(ARM_OBJECT) | grep -Eq '[[:space:]]T[[:space:]]pluginEntry$$'
 	@$(ARM_READELF) -h $(ARM_RANGE_MOTION_OBJECT) | grep -Eq 'Machine:[[:space:]]+ARM'
 	@test -z "$$($(ARM_NM) -u $(ARM_RANGE_MOTION_OBJECT))" || { echo "Range motion ARM object has unexpected undefined symbols:"; $(ARM_NM) -u $(ARM_RANGE_MOTION_OBJECT); exit 1; }
-	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|NT_drawShapeI|NT_drawText|NT_globals|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|memset|_ZN13_NT_jsonParse.*|_ZN14_NT_jsonStream.*)$$' || true )"; \
+	@unexpected="$$( $(ARM_NM) -u $(ARM_OBJECT) | awk '{print $$2}' | grep -Ev '^(_GLOBAL_OFFSET_TABLE_|NT_algorithmIndex|NT_drawShapeI|NT_drawText|NT_globals|NT_parameterOffset|NT_sendMidiByte|NT_sendMidi2ByteMessage|NT_sendMidi3ByteMessage|NT_setParameterFromAudio|NT_setParameterFromUi|memset|_ZN13_NT_jsonParse.*|_ZN14_NT_jsonStream.*)$$' || true )"; \
 		test -z "$$unexpected" || { echo "Unexpected undefined symbols:"; echo "$$unexpected"; exit 1; }
 	@echo "PASS: valid ARM objects include range-motion code; pluginEntry and host/libc allowlist verified"
 

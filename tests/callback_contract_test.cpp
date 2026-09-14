@@ -21,6 +21,8 @@ const size_t kFilterControlChangeParameter = 6;
 const size_t kFilterPitchBendParameter = 7;
 const size_t kFilterAftertouchParameter = 8;
 const size_t kPulsesPerDisplayedBeatParameter = 9;
+const size_t kPlaybackParameter = 10;
+const size_t kClearRecordingParameter = 11;
 
 const uint32_t kPulsesPerDisplayedBeatValues[] = {1, 2, 4, 8, 16, 24, 48};
 
@@ -415,8 +417,8 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
             minimumRequirements.dram == 1000000U &&
             maximumRequirements.dram == 5000000U,
         "allocation requirements default and clamp to the approved byte range");
-    expect(host.requirements().numParameters == 10,
-           "stable controls plus the appended beat-display conversion are requested");
+    expect(host.requirements().numParameters == 12,
+           "indices 0 through 9 stay stable and Playback/Clear Recording append at 10 and 11");
     expect(host.requirements().dram == 3000000U,
            "selected recording bytes are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
@@ -432,8 +434,9 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                3000000U / sizeof(midibuffer::RecordedEvent),
            "actual event capacity is derived and reported");
     expect(initial.eventCount == 0 && !initial.captureEnabled &&
-               !initial.clockRunning,
-           "fresh instances start empty, stopped, and without acquired clock");
+               !initial.clockRunning && host.parameter(kCaptureParameter) == 0 &&
+               host.parameter(kPlaybackParameter) == 0,
+           "fresh instances start empty with Capture and Playback Off and no acquired clock");
 
     expect(host.algorithm()->parameters != NULL &&
                host.algorithm()->parameterPages != NULL,
@@ -544,17 +547,40 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                    kPulsesPerDisplayedBeatValues[index],
                "beat-display enum exposes the approved runtime value");
     }
+    expect(std::strcmp(host.algorithm()->parameters[kPlaybackParameter].name,
+                       "Playback") == 0 &&
+               host.algorithm()->parameters[kPlaybackParameter].min == 0 &&
+               host.algorithm()->parameters[kPlaybackParameter].max == 1 &&
+               host.algorithm()->parameters[kPlaybackParameter].def == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackParameter]
+                               .enumStrings[0],
+                           "Off") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kPlaybackParameter]
+                               .enumStrings[1],
+                           "On") == 0 &&
+               std::strcmp(host.algorithm()
+                               ->parameters[kClearRecordingParameter]
+                               .name,
+                           "Clear Recording") == 0 &&
+               host.algorithm()->parameters[kClearRecordingParameter].min == 0 &&
+               host.algorithm()->parameters[kClearRecordingParameter].max == 1 &&
+               host.algorithm()->parameters[kClearRecordingParameter].def == 0,
+           "appended Playback and reserved Clear Recording expose Boolean Off/On values");
     const _NT_parameterPages* pages = host.algorithm()->parameterPages;
-    expect(pages->numPages == 4 && pages->pages[1].numParams == 2 &&
-               pages->pages[2].numParams == 5 &&
-               pages->pages[2].params[2] ==
+    expect(pages->numPages == 4 && pages->pages[1].numParams == 3 &&
+               pages->pages[1].params[2] == kClearRecordingParameter &&
+               pages->pages[2].numParams == 6 &&
+               pages->pages[2].params[0] == kPlaybackParameter &&
+               pages->pages[2].params[3] ==
                    kFilterControlChangeParameter &&
-               pages->pages[2].params[3] == kFilterPitchBendParameter &&
-               pages->pages[2].params[4] == kFilterAftertouchParameter &&
+               pages->pages[2].params[4] == kFilterPitchBendParameter &&
+               pages->pages[2].params[5] == kFilterAftertouchParameter &&
                pages->pages[3].numParams == 1 &&
                pages->pages[3].params[0] ==
                    kPulsesPerDisplayedBeatParameter,
-           "timeline conversion is appended without moving playback controls");
+           "new controls join their pages without renumbering inherited controls");
 }
 
 void verifyMusicalDurationFormattingAndReadouts() {
@@ -2913,8 +2939,9 @@ void beginTransportOnHeldFirstBeat(midibuffer_test::HostDouble& host,
                                    uint32_t interval = 16U,
                                    uint8_t outputChannel = 2U) {
     midibuffer_test::resetTrace();
-    expect(midibuffer::startPlayback(host.algorithm()),
-           "transport playback arms");
+    changeParameter(host, kPlaybackParameter, 1);
+    expect(snapshot(host).playbackArmed && host.parameter(kPlaybackParameter) == 1,
+           "transport playback arms through the shared Playback parameter");
     fixture.lastClockSample += interval;
     expect(clockPulseAt(host, fixture.lastClockSample),
            "transport playback receives its start pulse");
@@ -3226,10 +3253,17 @@ void verifyPlaybackCaptureExclusionAndManualStop() {
                cleanup.midiCalls[0].bytes[1] == 60U &&
                cleanup.midiCalls[1].bytes[0] == 0xB4U &&
                cleanup.midiCalls[1].bytes[1] == 64U &&
-               cleanup.midiCalls[1].bytes[2] == 0U,
-           "manual stop immediately sends routed note-off then sustain-off "
-           "through the filter-bypassing safety path");
+               cleanup.midiCalls[1].bytes[2] == 0U &&
+               cleanup.parameterSetCallCount == 1U &&
+               cleanup.parameterSetCalls[0].source ==
+                   midibuffer_test::kParameterSetFromAudio &&
+               cleanup.parameterSetCalls[0].parameter ==
+                   kPlaybackParameter + NT_parameterOffset() &&
+               cleanup.parameterSetCalls[0].value == 0 &&
+               cleanup.maximumParameterCallbackDepth == 1U,
+           "manual stop publishes host Playback Off through the offset audio setter before routed note-off then sustain-off cleanup");
     expect(!snapshot(stopHost).playbackActive &&
+               stopHost.parameter(kPlaybackParameter) == 0 &&
                snapshot(stopHost).playbackPulse == stoppedPulse &&
                sameHistory(beforeStop, stopHost),
            "manual stop preserves playback position and retained history");
@@ -3325,6 +3359,7 @@ void verifyClockLossCleanupAndContinuation() {
     const midibuffer_test::Trace& loss = midibuffer_test::trace();
     expect(!snapshot(host).clockRunning &&
                snapshot(host).playbackClockLossPaused &&
+               host.parameter(kPlaybackParameter) == 1 &&
                snapshot(host).playbackPulse == pausedPulse &&
                loss.midiCallCount == 2U &&
                loss.midiCalls[0].bytes[0] == 0x82U &&
@@ -3729,9 +3764,25 @@ void verifyPendingEndingDiscontinuityCleanup() {
 
 bool panicTraceMatches(uint32_t destination) {
     const midibuffer_test::Trace& current = midibuffer_test::trace();
-    bool matches = current.midiCallCount == 32U;
+    if (current.midiCallCount < 32U) {
+        return false;
+    }
+    const size_t panicStart = current.midiCallCount - 32U;
+    bool matches = true;
+    bool sustainCleanupSeen = false;
+    for (size_t index = 0; index < panicStart; ++index) {
+        const uint8_t type = current.midiCalls[index].bytes[0] & 0xf0U;
+        if (type == 0xb0U && current.midiCalls[index].bytes[1] == 64U) {
+            sustainCleanupSeen = true;
+        } else {
+            matches = matches && type == 0x80U && !sustainCleanupSeen;
+        }
+        matches = matches &&
+                  current.midiCalls[index].destination == destination;
+    }
     for (uint8_t channel = 0; channel < 16U; ++channel) {
-        const size_t soundOffIndex = static_cast<size_t>(channel) * 2U;
+        const size_t soundOffIndex =
+            panicStart + static_cast<size_t>(channel) * 2U;
         const size_t notesOffIndex = soundOffIndex + 1U;
         if (notesOffIndex >= current.midiCallCount) {
             matches = false;
@@ -3785,8 +3836,10 @@ void verifyLiveEmergencySilenceMatrix() {
             for (size_t controllerIndex = 0;
                  controllerIndex < ARRAY_SIZE(controllers);
                  ++controllerIndex) {
+                changeParameter(host, kPlaybackParameter, 1);
                 completeMatrixMatches =
-                    midibuffer::startPlayback(host.algorithm()) &&
+                    snapshot(host).playbackArmed &&
+                    host.parameter(kPlaybackParameter) == 1 &&
                     completeMatrixMatches;
                 clockPulse(host);
                 completeMatrixMatches = snapshot(host).playbackActive &&
@@ -3799,6 +3852,12 @@ void verifyLiveEmergencySilenceMatrix() {
                          controllers[controllerIndex], 99U);
                 completeMatrixMatches =
                     panicTraceMatches(destinations[destinationSetting]) &&
+                    host.parameter(kPlaybackParameter) == 0 &&
+                    midibuffer_test::trace().parameterSetCallCount == 1U &&
+                    midibuffer_test::trace().parameterSetCalls[0].source ==
+                        midibuffer_test::kParameterSetFromAudio &&
+                    midibuffer_test::trace().parameterSetCalls[0].parameter ==
+                        kPlaybackParameter + NT_parameterOffset() &&
                     !snapshot(host).playbackArmed &&
                     !snapshot(host).playbackActive &&
                     !snapshot(host).playbackClockLossPaused &&
@@ -3854,16 +3913,18 @@ void verifyTimelinePlaybackToggle() {
     expect(!snapshot(invalid).playbackArmed &&
                !snapshot(invalid).playbackActive &&
                snapshot(invalid).captureEnabled &&
-               snapshot(invalid).eventCount == eventCountBefore,
-           "left-encoder rising edge and held callback both refuse an invalid selection without stopping capture");
+               snapshot(invalid).eventCount == eventCountBefore &&
+               invalid.parameter(kPlaybackParameter) == 1,
+           "left-encoder rising edge leaves an unavailable continuing request On while held input neither repeats nor stops capture");
     releaseEncoderButton(invalid, kNT_encoderButtonL);
 
     midibuffer_test::HostDouble host;
     prepareTransportHistory(host);
     setEncoderButton(host, kNT_encoderButtonL, false);
     setEncoderButton(host, kNT_encoderButtonL, true);
-    expect(snapshot(host).playbackArmed && !snapshot(host).captureEnabled,
-           "one left-encoder rising edge arms and a held callback does not immediately stop");
+    expect(snapshot(host).playbackArmed && !snapshot(host).captureEnabled &&
+               host.parameter(kPlaybackParameter) == 1,
+           "one left-encoder rising edge sets Playback On and a held callback does not immediately stop");
     releaseEncoderButton(host, kNT_encoderButtonL);
 
     midibuffer_test::resetTrace();
@@ -3871,14 +3932,16 @@ void verifyTimelinePlaybackToggle() {
     setEncoderButton(host, kNT_encoderButtonL, true);
     expect(!snapshot(host).playbackArmed &&
                !snapshot(host).playbackActive &&
+               host.parameter(kPlaybackParameter) == 0 &&
                midibuffer_test::trace().midiCallCount == 0U,
-           "a new rising edge stops armed playback and its held callback does not rearm");
+           "a new rising edge sets Playback Off and its held callback does not rearm");
     releaseEncoderButton(host, kNT_encoderButtonL);
 
     setEncoderButton(host, kNT_encoderButtonL, false);
     setEncoderButton(host, kNT_encoderButtonL, true);
-    expect(snapshot(host).playbackArmed,
-           "a later rising edge rearms after the button release");
+    expect(snapshot(host).playbackArmed &&
+               host.parameter(kPlaybackParameter) == 1,
+           "a later rising edge restores shared Playback On after release");
     releaseEncoderButton(host, kNT_encoderButtonL);
     clockPulse(host);
     expect(snapshot(host).playbackActive,
@@ -3890,6 +3953,7 @@ void verifyTimelinePlaybackToggle() {
     setEncoderButton(host, kNT_encoderButtonL, true);
     expect(!snapshot(host).playbackActive &&
                !snapshot(host).playbackArmed &&
+               host.parameter(kPlaybackParameter) == 0 &&
                snapshot(host).playbackPulse == savedPulse &&
                !snapshot(host).captureEnabled &&
                midibuffer_test::trace().midiCallCount == 2U,
@@ -3901,6 +3965,124 @@ void verifyTimelinePlaybackToggle() {
     expect(midibuffer_test::trace().midiCallCount == 0U &&
                !snapshot(host).playbackActive,
            "left-encoder stop stays silent until another explicit rising edge");
+}
+
+void verifySharedPlaybackParameter() {
+    midibuffer_test::HostDouble silentEmergency;
+    expect(silentEmergency.instantiate(1),
+           "unavailable emergency host constructs");
+    changeParameter(silentEmergency, kPlaybackParameter, 1);
+    midibuffer_test::resetTrace();
+    sendMidi(silentEmergency, 0xB5U, 120U, 99U);
+    expect(silentEmergency.parameter(kPlaybackParameter) == 0 &&
+               !snapshot(silentEmergency).playbackArmed &&
+               midibuffer_test::trace().midiCallCount == 0U &&
+               midibuffer_test::trace().parameterSetCallCount == 1U &&
+               midibuffer_test::trace().parameterSetCalls[0].source ==
+                   midibuffer_test::kParameterSetFromAudio,
+           "incoming emergency control clears unavailable Playback On without producing output");
+
+    midibuffer_test::HostDouble unavailable;
+    expect(unavailable.instantiate(1),
+           "continuing-request host constructs");
+    startCapture(unavailable);
+    midibuffer_test::resetTrace();
+    changeParameter(unavailable, kPlaybackParameter, 1);
+    const midibuffer::CaptureSnapshot unavailableOn = snapshot(unavailable);
+    changeParameter(unavailable, kPlaybackParameter, 1);
+    expect(unavailable.parameter(kPlaybackParameter) == 1 &&
+               !unavailableOn.playbackArmed &&
+               !unavailableOn.playbackActive &&
+               unavailableOn.captureEnabled &&
+               snapshot(unavailable).captureEnabled &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "remote On writes are idempotent and remain On without a valid selection or output");
+
+    expect(midibuffer::setRetainedTimelineFixture(
+               unavailable.algorithm(), 10U, 12U) &&
+               midibuffer::setPulseSelection(unavailable.algorithm(), 10U,
+                                             12U),
+           "a valid range can arrive while Playback remains On");
+    expect(unavailable.parameter(kPlaybackParameter) == 1 &&
+               snapshot(unavailable).playbackArmed &&
+               !snapshot(unavailable).captureEnabled,
+           "the inherited continuing request arms automatically and enforces capture exclusion");
+
+    midibuffer_test::resetTrace();
+    clockPulse(unavailable);
+    expect(!snapshot(unavailable).clockRunning &&
+               snapshot(unavailable).playbackArmed &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "the first clock edge only begins acquisition for inherited Playback On");
+    clockPulse(unavailable);
+    expect(snapshot(unavailable).clockRunning &&
+               snapshot(unavailable).playbackActive &&
+               unavailable.parameter(kPlaybackParameter) == 1 &&
+               midibuffer_test::trace().midiCallCount == 1U &&
+               midibuffer_test::trace().midiCalls[0].bytes[0] == 0x90U,
+           "the second clock edge starts the later-selected loop without another On write");
+
+    const midibuffer::CaptureSnapshot beforeRepeatedOn = snapshot(unavailable);
+    midibuffer_test::resetTrace();
+    changeParameter(unavailable, kPlaybackParameter, 1);
+    const midibuffer::CaptureSnapshot afterRepeatedOn = snapshot(unavailable);
+    expect(afterRepeatedOn.playbackActive &&
+               afterRepeatedOn.playbackPulse ==
+                   beforeRepeatedOn.playbackPulse &&
+               afterRepeatedOn.playbackIntervalOrdinal ==
+                   beforeRepeatedOn.playbackIntervalOrdinal &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "repeated remote On neither toggles nor duplicates an active start");
+
+    midibuffer_test::resetTrace();
+    changeParameter(unavailable, kPlaybackParameter, 0);
+    expect(unavailable.parameter(kPlaybackParameter) == 0 &&
+               !snapshot(unavailable).playbackArmed &&
+               !snapshot(unavailable).playbackActive &&
+               midibuffer_test::trace().midiCallCount == 1U &&
+               (midibuffer_test::trace().midiCalls[0].bytes[0] & 0xf0U) ==
+                   0x80U,
+           "remote Off stops rather than toggles and releases playback-owned output");
+    midibuffer_test::resetTrace();
+    changeParameter(unavailable, kPlaybackParameter, 0);
+    clockPulse(unavailable);
+    expect(midibuffer_test::trace().midiCallCount == 0U &&
+               !snapshot(unavailable).playbackActive,
+           "repeated Off is idempotent and later clocks do not restart playback");
+
+    midibuffer_test::HostDouble encoder;
+    prepareTransportHistory(encoder);
+    midibuffer_test::resetTrace();
+    const uint64_t allocationsBeforeEncoder =
+        midibuffer_test::heapAllocationCount();
+    setEncoderButton(encoder, kNT_encoderButtonL, false);
+    setEncoderButton(encoder, kNT_encoderButtonL, true);
+    releaseEncoderButton(encoder, kNT_encoderButtonL);
+    setEncoderButton(encoder, kNT_encoderButtonL, false);
+    setEncoderButton(encoder, kNT_encoderButtonL, true);
+    const midibuffer_test::Trace& setterTrace = midibuffer_test::trace();
+    expect(encoder.parameter(kPlaybackParameter) == 0 &&
+               !snapshot(encoder).playbackArmed &&
+               setterTrace.parameterSetCallCount == 2U &&
+               setterTrace.parameterSetCalls[0].source ==
+                   midibuffer_test::kParameterSetFromUi &&
+               setterTrace.parameterSetCalls[0].algorithmIndex ==
+                   static_cast<uint32_t>(NT_algorithmIndex(
+                       encoder.algorithm())) &&
+               setterTrace.parameterSetCalls[0].parameter ==
+                   kPlaybackParameter + NT_parameterOffset() &&
+               setterTrace.parameterSetCalls[0].value == 1 &&
+               setterTrace.parameterSetCalls[1].source ==
+                   midibuffer_test::kParameterSetFromUi &&
+               setterTrace.parameterSetCalls[1].parameter ==
+                   kPlaybackParameter + NT_parameterOffset() &&
+               setterTrace.parameterSetCalls[1].value == 0 &&
+               setterTrace.parameterSetCalls[0].callbackDepth == 0U &&
+               setterTrace.parameterSetCalls[1].callbackDepth == 0U &&
+               setterTrace.maximumParameterCallbackDepth == 1U &&
+               midibuffer_test::heapAllocationCount() ==
+                   allocationsBeforeEncoder,
+           "successive left presses toggle one host value through offset API v13 UI setters without recursion or allocation");
 }
 
 void verifyTimedRightEncoderPanic() {
@@ -3972,6 +4154,12 @@ void verifyTimedRightEncoderPanic() {
         allDestinationsMatch =
             host.elapsedSamples() == deadline && exactTimestamp &&
             panicTraceMatches(destinations[destinationSetting]) &&
+            host.parameter(kPlaybackParameter) == 0 &&
+            midibuffer_test::trace().parameterSetCallCount == 1U &&
+            midibuffer_test::trace().parameterSetCalls[0].source ==
+                midibuffer_test::kParameterSetFromUi &&
+            midibuffer_test::trace().parameterSetCalls[0].parameter ==
+                kPlaybackParameter + NT_parameterOffset() &&
             !snapshot(host).playbackActive &&
             !snapshot(host).captureEnabled &&
             snapshot(host).playbackPulse == savedPulse &&
@@ -4798,6 +4986,7 @@ int main() {
     verifyPendingEndingDiscontinuityCleanup();
     verifyLiveEmergencySilenceMatrix();
     verifyTimelinePlaybackToggle();
+    verifySharedPlaybackParameter();
     verifyTimedRightEncoderPanic();
     verifyLegacyNavigationPresetCompatibility();
     verifyShowAllPresetPolicy();

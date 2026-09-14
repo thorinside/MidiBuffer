@@ -18,6 +18,10 @@ void sendMidi2(uint32_t destination, uint8_t byte0, uint8_t byte1,
                uint64_t dispatchSample = 0);
 void sendMidi3(uint32_t destination, uint8_t byte0, uint8_t byte1,
                uint8_t byte2, uint64_t dispatchSample = 0);
+void setParameterFromAudio(_NT_algorithm* algorithm, uint32_t parameter,
+                           int16_t value);
+void setParameterFromUi(_NT_algorithm* algorithm, uint32_t parameter,
+                        int16_t value);
 
 }  // namespace nt_host
 }  // namespace midibuffer
