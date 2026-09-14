@@ -7,13 +7,15 @@
 ## Build under test
 
 - Product: `plugins/MidiBuffer.o`
-- Implementation source commit: `ec63a92a777c9d023cccd3d5a3070b3da0efbfc5`
-- ARM object SHA-256: `6b44cb2644f9168f356e4920cfcd4c913f9f8cc0009b944ffae50dc6bf95190e`
+- Current candidate source commit: `a460387134ef225e6400d4feba962d2ea58e128d`
+- ARM object SHA-256: `d15ab42d2ebd9f53b6c7eadc81f52a4edffffc0063038df973ea7bf90b6967a2`
 - Pinned SDK commit: `5a4910d1d4233180114d6aee5ddaa4b8aec577e8` (`v1.18.0-1-g5a4910d`, API v13)
 - Supported firmware range: disting NT firmware **1.18 and later**; earlier firmware is unsupported.
 - Firmware actually tested: **pending — record the module's exact displayed version below.** The supported range is not a claim that every version in it has been tested.
 
 The build was produced with `make clean && make verify`. Native callback tests passed, including exhaustive preset-state equality and continuation, and ARM inspection identified an ELF32 little-endian ARM relocatable object exporting `pluginEntry`. Those automated results do not replace the physical checks below.
+
+This remains the inherited original v1 procedure for AC-001, AC-044, and AC-048. Updating its build identity does not expand its observations and does not satisfy or replace the separate UX-AC-002, UX-AC-008, and UX-AC-012 procedure in [`UX_REFINEMENT_HARDWARE_TEST.md`](UX_REFINEMENT_HARDWARE_TEST.md).
 
 ## Equipment and observation
 

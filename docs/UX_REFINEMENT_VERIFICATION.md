@@ -1,5 +1,19 @@
 # Integrated UX refinement verification
 
+## MidiBuffer Three preservation addendum — 2026-09-14 UTC
+
+This addendum records the current traceability review without rewriting the accepted post-build UX report below.
+
+- Approved MidiBuffer Three Spec SHA-256: `aefc6eaf7fc3736d253e6b929e2efed368d2fe9076d0bd9fd1f189a89ec5d05b`
+- Current candidate source commit: `a460387134ef225e6400d4feba962d2ea58e128d`
+- Current ARM product SHA-256: `d15ab42d2ebd9f53b6c7eadc81f52a4edffffc0063038df973ea7bf90b6967a2`
+
+A fresh complete native and ARM verification retains the accepted pot-3 range movement/held-zoom takeover, Show All/manual navigation, encoder targeting, playback-head visibility/layering, timeline duration, pending-wrap, reset, clock-loss, panic, routing, filtering, capture/playback, and valid-preset contracts. New callback/range-motion coverage additionally proves zoom-scaled Start/End edits and offscreen boundary handles/retrieval. The old native draw strings containing `ppb` below are preserved historical evidence for the accepted add-on; MidiBuffer Three explicitly supersedes only that suffix with `PPQN`, and current framebuffer assertions cover every supported value including `16 PPQN` without changing duration conversion or timing. The prior invalid-selection left-encoder no-op is likewise superseded only by the shared Playback request behavior documented in `README.md` and covered by current callback traces.
+
+No physical disting NT was used. UX-AC-002, UX-AC-008, and UX-AC-012 therefore remain partial owner-evidence gates under [`UX_REFINEMENT_HARDWARE_TEST.md`](UX_REFINEMENT_HARDWARE_TEST.md). They remain separate from the original v1 AC-001/AC-044/AC-048 gate, and the native/framebuffer evidence in this file is not relabelled as physical evidence. The procedure's build identity now points to the current candidate, but no new physical criterion or broader hardware programme was added.
+
+## Preserved accepted post-build report
+
 ## Scope and result
 
 - Verification date: 2026-09-13 UTC

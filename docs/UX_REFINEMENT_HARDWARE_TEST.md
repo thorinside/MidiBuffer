@@ -8,11 +8,15 @@
 
 - Product: `plugins/MidiBuffer.o`
 - Approved add-on Spec SHA-256: `fe17d6067caf1f3066a1b173ad5bb3f0d120774a3631102f50273be1b6456dfc`
-- ARM object SHA-256: `cdf5d035b2418daea44b30b6459d84835f4b32eee2f5a9d98ae2ced32dc66daa`
+- Current increment Spec SHA-256: `aefc6eaf7fc3736d253e6b929e2efed368d2fe9076d0bd9fd1f189a89ec5d05b`
+- Current candidate source commit: `a460387134ef225e6400d4feba962d2ea58e128d`
+- ARM object SHA-256: `d15ab42d2ebd9f53b6c7eadc81f52a4edffffc0063038df973ea7bf90b6967a2`
 - Pinned SDK: `5a4910d1d4233180114d6aee5ddaa4b8aec577e8` (API v13)
 - Supported firmware: disting NT firmware 1.18 or later
 
 Confirm the object digest before copying it to `/programs/plug-ins/MidiBuffer.o`. Record the exact firmware actually used. Do not treat native host-double, framebuffer, arithmetic, or ARM object checks as physical evidence.
+
+This procedure remains exclusively the inherited UX-AC-002, UX-AC-008, and UX-AC-012 physical gate. It does not satisfy the original v1 AC-001/AC-044/AC-048 gate, add a physical criterion for MidiBuffer Three, or turn automated PPQN, boundary-retrieval, Playback, or Clear Recording checks into physical evidence. The two expectation changes called out below only prevent explicitly superseded behavior from being treated as a regression; every other accepted step and result field is retained.
 
 ## Setup
 
@@ -42,7 +46,7 @@ At low, middle, and high right-pot press positions, perform every direction phys
 
 1. After effective left-pot, centre-pot, and unpressed-right-pot movement, turn the right encoder by one detent each way. Confirm it adjusts Start only, End only, or both Range boundaries respectively by exactly one pulse. Confirm held zoom and left-encoder scroll retain the prior target.
 2. Turn the left encoder quickly and slowly. Confirm one-pulse-per-detent manual scrolling with no acceleration; confirm it is a no-op in Show All.
-3. Press and hold the left encoder. Confirm playback toggles only on the rising edge and does not toggle repeatedly while held; an invalid selection remains a no-op.
+3. Press and hold the left encoder. Confirm playback toggles only on the rising edge and does not toggle repeatedly while held. The former invalid-selection no-op is explicitly superseded: the shared Playback value now toggles On while producing no playback, remains requested, and uses the inherited clock gate if a valid selection is created later.
 4. Hold the right encoder for less than one second, then for at least one second while also rotating an encoder and while holding pot 3. Confirm panic never fires early, fires once per hold at/after one second, and rearms only after release.
 5. During playback, edit the complete range more than once. Confirm the latest pair remains pending until wrap, then adopts together after established cleanup; editing back to the active pair cancels the pending transition.
 6. Confirm Reset, stop, clock loss/reacquisition, cleanup ordering, and playback continuation still match the established behavior.
@@ -50,7 +54,7 @@ At low, middle, and high right-pot press positions, perform every direction phys
 ### 4. Physical display
 
 1. With ordinary retained history and a valid selection, verify `Avail` remains at the original left origin and `Len` at the original right origin. Confirm both are readable as `bars:beats:ticks`, colons are visible, ticks have exactly three digits, and all tiny-glyph ink remains inside the top eight-pixel band and its left/right field.
-2. Set Pulses/Beat to 48 and repeat with a valid and invalid selection. Confirm invalid length reads `Len --`; no decimal `b` suffix, ruler, history heading, or extra clock label appears.
+2. Set Pulses/Beat to 48 and repeat with a valid and invalid selection. Confirm invalid length reads `Len --`; no decimal `b` suffix, ruler, history heading, or extra clock-status label appears. The configured-resolution text now uses the explicitly approved `48 PPQN` suffix instead of the superseded `48ppb` wording; this wording change does not create another physical evidence gate.
 3. During playback, confirm exactly one vertical head is visible only for an on-screen active pulse. Confirm selection brackets remain visually dominant at coincidence and their caps remain intact. Stop, arm, lose clock, and move the pulse offscreen; confirm no stale line, edge pin, arrow, or viewport following appears.
 4. Judge readability at the normal viewing distance and lighting used for the instrument. Synthetic cell budgets and native framebuffer pixels do not answer this physical legibility check.
 

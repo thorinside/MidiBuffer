@@ -1,5 +1,49 @@
 # Release readiness audit
 
+## MidiBuffer Three incremental traceability — 2026-09-14 UTC
+
+- Approved MidiBuffer Three Spec SHA-256: `aefc6eaf7fc3736d253e6b929e2efed368d2fe9076d0bd9fd1f189a89ec5d05b`
+- Implementation source tip reviewed: `a460387134ef225e6400d4feba962d2ea58e128d`
+- Pinned SDK: `5a4910d1d4233180114d6aee5ddaa4b8aec577e8` (`v1.18.0-1-g5a4910d`, API v13)
+- Rebuilt ARM object SHA-256: `d15ab42d2ebd9f53b6c7eadc81f52a4edffffc0063038df973ea7bf90b6967a2`
+
+**Automated delivery for the increment is complete, but this is not a public-release approval.** The original physical gate and the post-build UX physical gate remain pending as separate owner observations. No native, sanitizer, framebuffer-emulator, source-review, or ARM-inspection result below is physical disting NT evidence.
+
+### Inherited-contract checklist
+
+| Contract | Production/test/document trace | Review result |
+| --- | --- | --- |
+| Firmware and host boundary | `README.md`, API-v13 parameter/factory adapters in `src/midibuffer.cpp`, pinned SDK, strict ARM build and object inspection | **Retained:** firmware 1.18 and later only; older firmware remains unsupported. The support range is not a hardware-test claim. |
+| Local memory and valid presets | `src/midibuffer.cpp` serialization/reconciliation; preset images and 1–5 MB/full-5 MB round trips in `tests/callback_contract_test.cpp` | **Retained:** recorded MIDI stays in local rolling memory and ordinary NT presets. Parameters 0–9 keep their indices; Playback 10 and Clear Recording 11 are additive. Both restoration orders and legacy images pass without load-time output, erasure, or capture finalization. |
+| Routing and filtering | Production destination/channel/filter adapters and complete output/filter matrices in `tests/callback_contract_test.cpp`; `README.md` routing warnings | **Retained:** five destinations, Original/1–16 playback channels, Omni/1–16 recording channels, approved event exclusions, expression filters, and safety-output bypass are unchanged. |
+| Capture/playback rules | Production clock, selection, scheduler, cleanup, and capture-finalization paths; callback transport, ownership, cleanup, and draw-invariance traces | **Retained:** patched-clock acquisition/loss, capture/playback exclusion, pulse-relative playback, pending edits at wrap, ordered note/sustain cleanup, reset, panic, and explicit-only capture restart remain in force. Starting Playback pauses Capture; ordinary stopping does not restart it. Clear preserves the actual Capture state. |
+| Pot 3, navigation, and playback head | `src/range_motion.hpp`, production UI/draw callbacks, `tests/range_motion_test.cpp`, and callback/framebuffer traces | **Retained:** unpressed pot-3 fixed-length range movement, held relative zoom/takeover, Show All/manual scrolling, encoder Start/End/Range targeting, and clock-gated playback-head visibility/layering. |
+| Accepted post-build UX wording | The preserved historical report below and [`UX_REFINEMENT_VERIFICATION.md`](UX_REFINEMENT_VERIFICATION.md); current player wording in `README.md` | **Retained except only the explicit supersessions listed next.** Existing UX-AC identifiers and physical evidence boundary are unchanged. |
+
+### Explicitly superseded behavior only
+
+1. The left encoder's former invalid-selection no-op is superseded: it now toggles the shared host-managed **Playback** value. Playback may remain On without producing output, and a later valid selection starts through the inherited clock gate.
+2. Start/End remain the left/centre-pot functions, but their former non-zoom-aware adjustment is superseded by pulse-aligned viewport-scaled movement. An offscreen actual boundary has a directional edge handle; the first deliberate associated-pot movement retrieves it to the nearest legal visible pulse without scrolling, then later movement uses the zoom scale.
+3. The configured resolution suffix `ppb` is superseded by `PPQN`, for example `16 PPQN`. Duration conversion and clock timing are unchanged.
+4. **Clear Recording** is an additive recording-page Boolean and the specified exception to ordinary unavailable-playback behavior: an armed Off-to-On erases once, preserves Capture, performs playback cleanup, and sets Playback Off. It has no faceplate shortcut; restored On is consumed and cannot erase until Off rearms it.
+
+No other discovery or post-build UX behavior is superseded by this increment.
+
+### Scope and evidence boundary
+
+- Direct MIDI-file export, support before firmware 1.18, firmware-owned corrupt/incomplete-preset handling, publication, and an expanded physical-test programme remain excluded.
+- The original AC-001, AC-044, and AC-048 procedure remains [`HARDWARE_SMOKE_TEST.md`](HARDWARE_SMOKE_TEST.md).
+- UX-AC-002, UX-AC-008, and UX-AC-012 remain a separate unwaived gate under [`UX_REFINEMENT_HARDWARE_TEST.md`](UX_REFINEMENT_HARDWARE_TEST.md).
+- The two procedures retain separate result records. Passing one does not satisfy the other, and no current automated evidence is relabelled as physical evidence.
+
+### Increment verification
+
+`make clean && make verify` passed the complete native callback/range-motion suites, rebuilt both ARM objects, and passed ELF/export/undefined-symbol inspection. The candidate product is an ELF32 little-endian ARM EABI5 relocatable object exporting `pluginEntry`; all reported sections total 20,322 bytes (ordinary size summary: 19,593 text, 560 data, 0 BSS). The native traces reported zero deterministic scheduler-model sample error and an approximately 10.1 MB full-5 MB host-double JSON payload; neither observation is a firmware or physical guarantee. Sanitizer and focused static-analysis commands are recorded with this incremental audit's commit.
+
+Repository review found no MIDI-file/filesystem export implementation, no older-firmware compatibility path or claim, no plug-in-owned corrupt-preset recovery promise, and no new physical criterion. The current `README.md` describes the four changes while retaining the inherited routing, filtering, memory, preset, timeline, transport, capture, and cleanup contracts.
+
+## Preserved original v1 audit
+
 - Audit date: 2026-09-13 UTC
 - Approved Spec SHA-256: `921f5735e68d9667ac287438ce2959e4691e2acba70b307c62be54e666b23e62`
 - Integrated candidate before this audit: `52e2bcf2a552dd24c6ff178f38702c8edf4a93df`

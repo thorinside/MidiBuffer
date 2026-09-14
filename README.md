@@ -7,7 +7,7 @@ MidiBuffer is a rolling, clock-relative MIDI recorder and looper for the Expert 
 - **Supported target:** disting NT firmware **1.18 and later**.
 - Firmware earlier than 1.18 is unsupported.
 - The plug-in builds against the pinned API v13 SDK checkout. Native host-double tests and ARM object inspection pass, but those checks do not run firmware.
-- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. The original v1 pre-publication procedure remains in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md); the separate post-build UX control/display procedure is in [`docs/UX_REFINEMENT_HARDWARE_TEST.md`](docs/UX_REFINEMENT_HARDWARE_TEST.md).
+- No physical disting NT firmware version has yet been recorded as tested. In particular, the 1.18 minimum is a support target, not a claim that 1.18 has already been exercised on hardware, and compatibility with later firmware versions has not yet been verified. The original v1 pre-publication procedure remains in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md); the separate post-build UX control/display procedure is in [`docs/UX_REFINEMENT_HARDWARE_TEST.md`](docs/UX_REFINEMENT_HARDWARE_TEST.md). The original AC-001/AC-044/AC-048 gate and the UX-AC-002/UX-AC-008/UX-AC-012 gate remain separate, pending, and unwaived; native or framebuffer-emulator results do not satisfy either gate.
 
 ## Install
 
@@ -170,7 +170,7 @@ The retained history contains only supported channel messages, so the replay pat
 
 Conventional output-state interpretation follows the MIDI Manufacturers Association’s *MIDI 1.0 Detailed Specification*: `8n` is Note Off, `9n` with velocity zero is treated as Note Off, and CC64 values 0–63 are sustain off while 64–127 are sustain on. Separately, sending CC64 off to a whole output channel during transport cleanup is the approved MidiBuffer product tradeoff; it can also release live sustained notes sharing that channel.
 
-Packaging/publication, external-routing redesign, selection-context reconstruction, instrument-specific silencing guarantees, additional panic gestures, MIDI transport following, corrupt/incomplete preset recovery, and unsaved-change recovery remain outside this delivery slice. Physical power-cycle/hardware validation is the separate release gate documented in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md); it remains pending until that result record is completed on a supported disting NT.
+Packaging/publication, external-routing redesign, selection-context reconstruction, instrument-specific silencing guarantees, additional panic gestures, MIDI transport following, corrupt/incomplete preset recovery, and unsaved-change recovery remain outside this delivery slice. The inherited physical power-cycle gate in [`docs/HARDWARE_SMOKE_TEST.md`](docs/HARDWARE_SMOKE_TEST.md) and the post-build UX gate in [`docs/UX_REFINEMENT_HARDWARE_TEST.md`](docs/UX_REFINEMENT_HARDWARE_TEST.md) remain separate and pending until their own result records are completed on a supported disting NT.
 
 ## Timing method and measured precision
 
