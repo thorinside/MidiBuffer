@@ -2663,7 +2663,7 @@ bool draw(_NT_algorithm* self) {
     availabilityText.append(amount);
     availabilityText.append("  ");
     availabilityText.appendUnsigned64(observed.pulsesPerBeat);
-    availabilityText.append("ppb");
+    availabilityText.append(" PPQN");
     nt_host::drawTinyText(0, 7, availability);
 
     char length[32];

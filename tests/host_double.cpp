@@ -132,6 +132,9 @@ const uint8_t* tinyGlyph(char character) {
     static const uint8_t greater[] = {4U, 2U, 1U, 2U, 4U};
     static const uint8_t upperA[] = {2U, 5U, 7U, 5U, 5U};
     static const uint8_t upperL[] = {4U, 4U, 4U, 4U, 7U};
+    static const uint8_t upperN[] = {5U, 7U, 7U, 7U, 5U};
+    static const uint8_t upperP[] = {6U, 5U, 6U, 4U, 4U};
+    static const uint8_t upperQ[] = {2U, 5U, 5U, 3U, 1U};
     static const uint8_t lowerA[] = {0U, 3U, 5U, 7U, 5U};
     static const uint8_t lowerB[] = {4U, 4U, 6U, 5U, 6U};
     static const uint8_t lowerE[] = {0U, 2U, 5U, 6U, 3U};
@@ -158,6 +161,9 @@ const uint8_t* tinyGlyph(char character) {
     case '>': return greater;
     case 'A': return upperA;
     case 'L': return upperL;
+    case 'N': return upperN;
+    case 'P': return upperP;
+    case 'Q': return upperQ;
     case 'a': return lowerA;
     case 'b': return lowerB;
     case 'e': return lowerE;

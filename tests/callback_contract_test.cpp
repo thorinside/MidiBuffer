@@ -740,16 +740,108 @@ void verifyMusicalDurationFormattingAndReadouts() {
 
     midibuffer_test::HostDouble empty;
     expect(empty.instantiate(1) &&
-               drawReadouts(empty, "Avail 0:0:000  1ppb", "Len --"),
+               drawReadouts(empty, "Avail 0:0:000  1 PPQN", "Len --"),
            "before clock, empty readouts show exact zero availability and invalid Len");
     clockPulse(empty);
     expect(!snapshot(empty).clockRunning &&
-               drawReadouts(empty, "Avail 0:0:000  1ppb", "Len --"),
+               drawReadouts(empty, "Avail 0:0:000  1 PPQN", "Len --"),
            "during one-pulse clock acquisition, empty readouts stay zero and invalid");
     changeParameter(empty, kPulsesPerDisplayedBeatParameter, 6);
-    expect(drawReadouts(empty, "Avail 0:0:000  48ppb", "Len --") &&
+    expect(drawReadouts(empty, "Avail 0:0:000  48 PPQN", "Len --") &&
                !framebufferHasInk(0, 0, 255, 2),
-           "invalid Len and a normal zero Avail use the original tiny-font regions at 48ppb");
+           "invalid Len and a normal zero Avail use the original tiny-font regions at 48 PPQN");
+
+    midibuffer_test::HostDouble resolutionDisplay;
+    expect(installRangeFixture(resolutionDisplay, 100U, 164U, 108U, 124U),
+           "configured-resolution display fixture installs");
+    const HistoryImage resolutionHistory = captureHistory(resolutionDisplay);
+    bool allResolutionReadoutsAndConversionsMatch = true;
+    bool configuredSixteenObserved = false;
+    for (size_t index = 0;
+         index < ARRAY_SIZE(kPulsesPerDisplayedBeatValues); ++index) {
+        const uint32_t pulsesPerBeat =
+            kPulsesPerDisplayedBeatValues[index];
+        const uint64_t conversionPulses = 8U * pulsesPerBeat + 1U;
+        midibuffer::MusicalDuration beforeDuration = {};
+        uint64_t beforeInverse = 0U;
+        char beforeFormat[17] = {};
+        const bool beforeConversion =
+            midibuffer::musicalDurationFromPulses(
+                conversionPulses, pulsesPerBeat, beforeDuration) &&
+            midibuffer::pulsesFromMusicalDuration(
+                beforeDuration, pulsesPerBeat, beforeInverse) &&
+            midibuffer::formatMusicalDuration(
+                beforeFormat, sizeof(beforeFormat), conversionPulses,
+                pulsesPerBeat);
+        const midibuffer::CaptureSnapshot beforeOperation =
+            snapshot(resolutionDisplay);
+
+        changeParameter(resolutionDisplay,
+                        kPulsesPerDisplayedBeatParameter,
+                        static_cast<int16_t>(index));
+        char amount[17] = {};
+        char expectedAvailability[48] = {};
+        const bool expectedFormatted = midibuffer::formatMusicalDuration(
+            amount, sizeof(amount), 64U, pulsesPerBeat);
+        std::snprintf(expectedAvailability, sizeof(expectedAvailability),
+                      "Avail %s  %u PPQN", amount,
+                      static_cast<unsigned>(pulsesPerBeat));
+        char lengthAmount[17] = {};
+        char expectedLength[32] = {};
+        const bool lengthFormatted = midibuffer::formatMusicalDuration(
+            lengthAmount, sizeof(lengthAmount), 16U, pulsesPerBeat);
+        std::snprintf(expectedLength, sizeof(expectedLength), "Len %s",
+                      lengthAmount);
+        const bool rendered = drawReadouts(
+            resolutionDisplay, expectedAvailability, expectedLength);
+
+        midibuffer::MusicalDuration afterDuration = {};
+        uint64_t afterInverse = 0U;
+        char afterFormat[17] = {};
+        const bool afterConversion =
+            midibuffer::musicalDurationFromPulses(
+                conversionPulses, pulsesPerBeat, afterDuration) &&
+            midibuffer::pulsesFromMusicalDuration(
+                afterDuration, pulsesPerBeat, afterInverse) &&
+            midibuffer::formatMusicalDuration(
+                afterFormat, sizeof(afterFormat), conversionPulses,
+                pulsesPerBeat);
+        const midibuffer::CaptureSnapshot afterOperation =
+            snapshot(resolutionDisplay);
+        configuredSixteenObserved =
+            configuredSixteenObserved ||
+            (pulsesPerBeat == 16U &&
+             std::strcmp(expectedAvailability,
+                         "Avail 1:0:000  16 PPQN") == 0 && rendered);
+        allResolutionReadoutsAndConversionsMatch =
+            beforeConversion && expectedFormatted && lengthFormatted &&
+            rendered && afterConversion &&
+            beforeInverse == conversionPulses &&
+            afterInverse == conversionPulses &&
+            beforeDuration.bars == afterDuration.bars &&
+            beforeDuration.beats == afterDuration.beats &&
+            beforeDuration.ticks == afterDuration.ticks &&
+            std::strcmp(beforeFormat, afterFormat) == 0 &&
+            afterOperation.pulsesPerDisplayedBeat == pulsesPerBeat &&
+            beforeOperation.sampleCursor == afterOperation.sampleCursor &&
+            beforeOperation.currentPulse == afterOperation.currentPulse &&
+            beforeOperation.lastClockIntervalSamples ==
+                afterOperation.lastClockIntervalSamples &&
+            beforeOperation.predictedClockIntervalSamples ==
+                afterOperation.predictedClockIntervalSamples &&
+            beforeOperation.retainedPulseIntervals ==
+                afterOperation.retainedPulseIntervals &&
+            beforeOperation.timelineViewStartPulse ==
+                afterOperation.timelineViewStartPulse &&
+            beforeOperation.timelineViewEndPulse ==
+                afterOperation.timelineViewEndPulse &&
+            sameSelectionAndTransport(beforeOperation, afterOperation) &&
+            sameHistory(resolutionHistory, resolutionDisplay) &&
+            allResolutionReadoutsAndConversionsMatch;
+    }
+    expect(allResolutionReadoutsAndConversionsMatch &&
+               configuredSixteenObserved,
+           "production DrawCall text labels every supported configured resolution as PPQN, including 16 PPQN, without changing duration conversion or pulse state");
 
     const uint64_t retainedStart = 100U;
     const uint64_t retainedEnd = 164U;
@@ -767,24 +859,24 @@ void verifyMusicalDurationFormattingAndReadouts() {
     midibuffer_test::HostDouble restored;
     expect(restored.instantiate(1) && restored.loadPreset(image) &&
                !snapshot(restored).clockRunning &&
-               drawReadouts(restored, "Avail 4:0:000  4ppb",
+               drawReadouts(restored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "new valid saved durations render without a live clock");
     const HistoryImage restoredHistory = captureHistory(restored);
     clockPulse(restored);
     expect(!snapshot(restored).clockRunning &&
-               drawReadouts(restored, "Avail 4:0:000  4ppb",
+               drawReadouts(restored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "restored durations survive the first reacquisition pulse");
     clockPulse(restored);
     expect(snapshot(restored).clockRunning &&
-               drawReadouts(restored, "Avail 4:0:000  4ppb",
+               drawReadouts(restored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "restored durations survive completed clock reacquisition");
     noClockBlock(restored);
     noClockBlock(restored);
     expect(!snapshot(restored).clockRunning &&
-               drawReadouts(restored, "Avail 4:0:000  4ppb",
+               drawReadouts(restored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "retained and edited saved durations survive declared clock loss");
     clockPulse(restored);
@@ -792,7 +884,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
     noClockBlock(restored);
     clockPulse(restored);
     expect(snapshot(restored).clockRunning &&
-               drawReadouts(restored, "Avail 4:0:000  4ppb",
+               drawReadouts(restored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "different-tempo reacquisition does not alter pulse-derived readouts");
 
@@ -801,7 +893,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
     changeParameter(restored, kPulsesPerDisplayedBeatParameter, 6);
     const midibuffer::CaptureSnapshot afterPresentationChange =
         snapshot(restored);
-    expect(drawReadouts(restored, "Avail 0:1:160  48ppb",
+    expect(drawReadouts(restored, "Avail 0:1:160  48 PPQN",
                         "Len 0:0:160") &&
                afterPresentationChange.currentPulse ==
                    beforePresentationChange.currentPulse &&
@@ -828,7 +920,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
     expect(legacyRestored.instantiate(1) &&
                legacyRestored.loadPreset(legacyImage) &&
                !snapshot(legacyRestored).clockRunning &&
-               drawReadouts(legacyRestored, "Avail 4:0:000  4ppb",
+               drawReadouts(legacyRestored, "Avail 4:0:000  4 PPQN",
                             "Len 1:0:000"),
            "legacy valid saved durations remain visible without clock");
 
@@ -850,7 +942,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
                        pending.activeSelection.startPulse == 16U &&
                pending.selection.endPulse - pending.selection.startPulse ==
                    20U &&
-               drawReadouts(restored, "Avail 0:1:160  48ppb",
+               drawReadouts(restored, "Avail 0:1:160  48 PPQN",
                             "Len 0:0:200"),
            "Len reads edited E-S without +1 while the active range remains pending");
 
@@ -865,14 +957,14 @@ void verifyMusicalDurationFormattingAndReadouts() {
     const HistoryImage exactHistory = captureHistory(exactLayout);
     expect(drawReadouts(
                exactLayout,
-               "Avail 9999999999:3:470  48ppb",
+               "Avail 9999999999:3:470  48 PPQN",
                "Len 9999999999:3:470") &&
                framebufferHasInk(0, 0, 175, 7) &&
                framebufferHasInk(176, 0, 255, 7) &&
                midibuffer_test::framebufferPixel(254, 7) != 0U &&
                midibuffer_test::framebufferPixel(255, 7) == 0U &&
                !framebufferHasInk(0, 0, 255, 2) &&
-               !framebufferHasInk(115, 3, 175, 7) &&
+               !framebufferHasInk(123, 3, 175, 7) &&
                sameSelectionAndTransport(exactBefore,
                                          snapshot(exactLayout)) &&
                sameHistory(exactHistory, exactLayout),
@@ -886,7 +978,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
     const midibuffer::CaptureSnapshot overflowBefore = snapshot(overflowLayout);
     expect(drawReadouts(
                overflowLayout,
-               "Avail >9999999999bar  48ppb",
+               "Avail >9999999999bar  48 PPQN",
                "Len >9999999999bar") &&
                framebufferHasInk(0, 0, 175, 7) &&
                framebufferHasInk(176, 0, 255, 7) &&
@@ -903,7 +995,7 @@ void verifyMusicalDurationFormattingAndReadouts() {
     const midibuffer::CaptureSnapshot maximumBefore = snapshot(maximumLayout);
     expect(drawReadouts(
                maximumLayout,
-               "Avail >9999999999bar  48ppb",
+               "Avail >9999999999bar  48 PPQN",
                "Len >9999999999bar") &&
                snapshot(maximumLayout).retainedPulseIntervals ==
                    maximumBefore.retainedPulseIntervals &&
@@ -948,7 +1040,7 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
     midibuffer_test::resetTrace();
     expect(host.factory()->draw(host.algorithm()),
            "timeline draw owns the complete 256 by 64 display");
-    expect(drawContains("Avail 0:0:000  1ppb"),
+    expect(drawContains("Avail 0:0:000  1 PPQN"),
            "empty timeline reports exact zero musical availability");
     expect(drawContains("Len --"),
            "empty timeline reports no selected phrase length");
@@ -1332,7 +1424,7 @@ void verifyTimelineSelectionDisplayAndControls() {
     midibuffer_test::resetTrace();
     expect(host.factory()->draw(host.algorithm()),
            "capturing timeline draws through the production callback");
-    expect(drawContains("Avail 4:0:000  4ppb") && drawContains("Len --"),
+    expect(drawContains("Avail 4:0:000  4 PPQN") && drawContains("Len --"),
            "capturing timeline exposes exact musical availability and no phantom selection");
     expect(!drawContainsSubstring("History") &&
                !drawContainsSubstring("Oldest"),
@@ -1424,7 +1516,7 @@ void verifyTimelineSelectionDisplayAndControls() {
 
     midibuffer_test::resetTrace();
     host.factory()->draw(host.algorithm());
-    expect(drawContains("Avail 4:0:000  4ppb") &&
+    expect(drawContains("Avail 4:0:000  4 PPQN") &&
                drawContains("Len 1:0:000"),
            "selected timeline reports retained availability and zero-based phrase duration");
     expect(midibuffer_test::framebufferPixel(34, 16) == 15U &&
@@ -5573,12 +5665,27 @@ struct DrawCadenceResult {
     bool pendingObserved;
 };
 
-void runDrawCadenceScenario(DrawCadence cadence, DrawCadenceResult& result) {
+void runResolutionDisplayOperation(midibuffer_test::HostDouble& host,
+                                   int16_t configuredIndex) {
+    changeParameter(host, kPulsesPerDisplayedBeatParameter,
+                    configuredIndex);
+    expect(snapshot(host).pulsesPerDisplayedBeat ==
+               kPulsesPerDisplayedBeatValues[configuredIndex] &&
+               host.factory()->draw(host.algorithm()),
+           "timing-invariance scenario completes a configured PPQN draw");
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 0);
+}
+
+void runDrawCadenceScenario(DrawCadence cadence, DrawCadenceResult& result,
+                            bool exerciseResolutionDisplay = false) {
     midibuffer_test::HostDouble host;
     TransportFixture fixture = prepareTransportHistory(host);
     drawForCadence(host, cadence, 0U);
     beginTransportOnHeldFirstBeat(host, fixture);
     drawForCadence(host, cadence, 1U);
+    if (exerciseResolutionDisplay) {
+        runResolutionDisplayOperation(host, 4);
+    }
 
     resetPulse(host);
     drawForCadence(host, cadence, 2U);
@@ -5587,6 +5694,9 @@ void runDrawCadenceScenario(DrawCadence cadence, DrawCadenceResult& result) {
            "cadence scenario resumes from reset on an identical clock");
     stepThrough(host, fixture.lastClockSample + 8U);
     drawForCadence(host, cadence, 3U);
+    if (exerciseResolutionDisplay) {
+        runResolutionDisplayOperation(host, 6);
+    }
 
     _NT_float3 pots = {-1.0f, -1.0f, -1.0f};
     host.factory()->setupUi(host.algorithm(), pots);
@@ -5603,6 +5713,9 @@ void runDrawCadenceScenario(DrawCadence cadence, DrawCadenceResult& result) {
            "cadence scenario queues the same valid pending range");
     result.pendingObserved = snapshot(host).rangeTransitionPending;
     sendMidi(host, 0x94U, 72U, 96U);
+    if (exerciseResolutionDisplay) {
+        runResolutionDisplayOperation(host, 5);
+    }
     noClockBlock(host);
     drawForCadence(host, cadence, 6U);
 
@@ -5642,6 +5755,30 @@ void verifyDrawNoninterferenceAndIncrementalCost() {
                zero.state.eventCount == sparse.state.eventCount &&
                zero.state.eventCount == frequent.state.eventCount,
            "draw cadence preserves canonical capture, transport, pending range, scheduler, and retained-event state exactly");
+
+    midibuffer_test::resetTrace();
+    DrawCadenceResult resolutionDisplay = {};
+    runDrawCadenceScenario(kNoDraws, resolutionDisplay, true);
+    expect(sameExactMidiTrace(zero.trace, resolutionDisplay.trace),
+           "configured-resolution changes and PPQN draws preserve outgoing MIDI bytes, order, destinations, and exact step scheduler timestamps");
+    expect(zero.image.equals(resolutionDisplay.image) &&
+               sameSelectionAndTransport(zero.state,
+                                         resolutionDisplay.state) &&
+               zero.state.sampleCursor == resolutionDisplay.state.sampleCursor &&
+               zero.state.currentPulse == resolutionDisplay.state.currentPulse &&
+               zero.state.lastClockIntervalSamples ==
+                   resolutionDisplay.state.lastClockIntervalSamples &&
+               zero.state.predictedClockIntervalSamples ==
+                   resolutionDisplay.state.predictedClockIntervalSamples &&
+               zero.state.playbackIntervalStartSample ==
+                   resolutionDisplay.state.playbackIntervalStartSample &&
+               zero.state.playbackNextEventSample ==
+                   resolutionDisplay.state.playbackNextEventSample &&
+               zero.state.pendingNextEndingSample ==
+                   resolutionDisplay.state.pendingNextEndingSample &&
+               zero.state.eventCount == resolutionDisplay.state.eventCount &&
+               resolutionDisplay.state.pulsesPerDisplayedBeat == 1U,
+           "configured-resolution display operations leave final pulse, transport, retained-event, and step scheduling state identical to the no-operation baseline");
 
     midibuffer_test::HostDouble benchmark;
     expect(installRangeFixture(benchmark, 100U, 108U, 100U, 108U) &&
