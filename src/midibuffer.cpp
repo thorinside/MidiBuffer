@@ -98,6 +98,7 @@ const uint64_t kDefaultTimelineVisiblePulses = 64U;
 const uint64_t kTimelineMinimumVisiblePulses = 4U;
 const uint32_t kTimelineLegacyMaximumVisiblePulses = 256U;
 const uint32_t kTimelineCoordinateMaximum = 65535U;
+const uint32_t kClearHistoryMetadataOperations = 4U;
 
 static_assert(sizeof(RecordedEvent) == 24,
               "recording event size is part of capacity accounting");
@@ -199,8 +200,9 @@ struct Algorithm : public _NT_algorithm {
           timelineVisiblePulses(kDefaultTimelineVisiblePulses),
           zoomPressVisiblePulses(0), zoomPressManualVisiblePulses(0),
           rangeMotionHistoryStart(0), rangeMotionHistoryEnd(0),
-          zoomPressCoordinate(0),
-          captureEnabled(false), clockRunning(false),
+          zoomPressCoordinate(0), clearRecordingTransitions(0),
+          clearHistoryMetadataOperations(0), captureEnabled(false),
+          clearRecordingArmed(true), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
           rangeTransitionPending(false), playbackPositionValid(false),
@@ -248,8 +250,11 @@ struct Algorithm : public _NT_algorithm {
     uint64_t rangeMotionHistoryStart;
     uint64_t rangeMotionHistoryEnd;
     uint32_t zoomPressCoordinate;
+    uint32_t clearRecordingTransitions;
+    uint32_t clearHistoryMetadataOperations;
 
     bool captureEnabled;
+    bool clearRecordingArmed;
     bool clockRunning;
     bool haveAcquisitionPulse;
     bool clockHigh;
@@ -520,6 +525,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
 void finalizeCapture(Algorithm& algorithm);
 void clearPendingPlaybackEndings(Algorithm& algorithm);
 void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample);
+void clearRecording(_NT_algorithm* self, Algorithm& algorithm);
 
 void stopTransport(Algorithm& algorithm) {
     releasePlaybackOutput(algorithm, algorithm.sampleCursor);
@@ -552,6 +558,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
             algorithm->recordedState = RecordedState();
             algorithm->captureEnabled = true;
         }
+    } else if (parameter == kParameterClearRecording && algorithm->v != NULL) {
+        const bool requested = algorithm->v[kParameterClearRecording] != 0;
+        if (!requested) {
+            algorithm->clearRecordingArmed = true;
+        } else if (algorithm->clearRecordingArmed) {
+            algorithm->clearRecordingArmed = false;
+            clearRecording(self, *algorithm);
+        }
     } else if (parameter == kParameterClock) {
         // A newly routed input must acquire its own edge rather than inherit
         // the previous input's gate level.
@@ -577,6 +591,34 @@ void clearSelection(Algorithm& algorithm) {
     algorithm.selection.endPulse = 0;
     algorithm.activeSelection.startPulse = 0;
     algorithm.activeSelection.endPulse = 0;
+}
+
+void clearRecording(_NT_algorithm* self, Algorithm& algorithm) {
+    // Clear is a deliberate transport stop. Publish Playback Off through the
+    // host so mappings and UI observe the same state; the nested callback owns
+    // ordered note-off-then-sustain cleanup. The direct stop is a harmless
+    // fixed-work fallback when no host binding is available.
+    if (algorithm.v != NULL && algorithm.v[kParameterPlayback] != 0) {
+        nt_host::setParameterFromAudio(self, kParameterPlayback, 0);
+    }
+    stopTransport(algorithm);
+
+    // History invalidation is exactly four fixed metadata writes regardless
+    // of the configured event capacity. The backing event allocation is not
+    // scanned or overwritten. Resetting recorded ownership establishes the
+    // post-clear capture boundary without changing Capture itself.
+    algorithm.eventHead = 0;
+    algorithm.eventCount = 0;
+    algorithm.historyEndPulseExclusive = 0;
+    algorithm.recordedState = RecordedState();
+    algorithm.clearHistoryMetadataOperations =
+        kClearHistoryMetadataOperations;
+    ++algorithm.clearRecordingTransitions;
+
+    clearSelection(algorithm);
+    algorithm.playbackIntervalStartSample = 0;
+    algorithm.playbackIntervalOrdinal = 0;
+    algorithm.playbackNextEventSample = 0;
 }
 
 bool pulseInsideSelection(const Algorithm& algorithm, uint64_t pulse) {
@@ -3302,6 +3344,10 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
     snapshot.metadataBytes = sizeof(Algorithm);
     snapshot.eventCapacity = algorithm->eventCapacity;
     snapshot.eventCount = algorithm->eventCount;
+    snapshot.clearRecordingTransitions =
+        algorithm->clearRecordingTransitions;
+    snapshot.clearHistoryMetadataOperations =
+        algorithm->clearHistoryMetadataOperations;
     snapshot.sampleCursor = algorithm->sampleCursor;
     snapshot.currentPulse = algorithm->currentPulse;
     snapshot.lastClockIntervalSamples = algorithm->lastClockIntervalSamples;
@@ -3327,6 +3373,7 @@ CaptureSnapshot captureSnapshot(const _NT_algorithm* self) {
                        snapshot.timelineViewEndPulse);
     snapshot.timelineShowAll = algorithm->timelineShowAll;
     snapshot.captureEnabled = algorithm->captureEnabled;
+    snapshot.clearRecordingArmed = algorithm->clearRecordingArmed;
     snapshot.clockRunning = algorithm->clockRunning;
     snapshot.selectionValid = algorithm->selectionValid;
     snapshot.playbackArmed =

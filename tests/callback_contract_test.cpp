@@ -920,12 +920,12 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
     expect(pots[0] == 0.0f && pots[1] == 1.0f && pots[2] == 0.0f,
            "setupUi supplies deterministic start, end, and normal-range positions");
     const uint32_t customMask = host.factory()->hasCustomUi(host.algorithm());
-    expect((customMask & kNT_encoderL) != 0 &&
-               (customMask & kNT_encoderR) != 0 &&
-               (customMask & kNT_encoderButtonL) != 0 &&
-               (customMask & kNT_encoderButtonR) != 0 &&
-               (customMask & kNT_potButtonR) != 0,
-           "custom control mask includes rotation, held zoom, playback toggle, and panic hold");
+    const uint32_t expectedCustomMask =
+        kNT_potL | kNT_potC | kNT_potR | kNT_potButtonR |
+        kNT_encoderL | kNT_encoderR | kNT_encoderButtonL |
+        kNT_encoderButtonR;
+    expect(customMask == expectedCustomMask,
+           "custom control mask remains exactly the inherited timeline, playback-toggle, zoom, and panic mapping with no Clear Recording shortcut");
 
     midibuffer_test::resetTrace();
     expect(host.factory()->draw(host.algorithm()),
@@ -4085,6 +4085,210 @@ void verifySharedPlaybackParameter() {
            "successive left presses toggle one host value through offset API v13 UI setters without recursion or allocation");
 }
 
+void verifyOneShotClearRecording() {
+    midibuffer_test::HostDouble enabled;
+    expect(enabled.instantiate(1),
+           "enabled-clear host constructs at minimum capacity");
+    changeParameter(enabled, kRecordingChannelParameter, 3);
+    startCapture(enabled);
+    acquireClock(enabled);
+    const uint64_t erasedPulse = snapshot(enabled).currentPulse;
+    sendMidi(enabled, 0x92U, 60U, 100U);
+    expect(midibuffer::setPulseSelection(enabled.algorithm(), erasedPulse,
+                                         erasedPulse + 1U),
+           "small clear fixture has selected recorded history");
+
+    midibuffer_test::resetTrace();
+    const uint64_t allocationsBeforeSmall =
+        midibuffer_test::heapAllocationCount();
+    changeParameter(enabled, kClearRecordingParameter, 1);
+    const midibuffer::CaptureSnapshot cleared = snapshot(enabled);
+    midibuffer::RecordedEvent erased = {};
+    expect(enabled.parameter(kClearRecordingParameter) == 1 &&
+               enabled.parameter(kCaptureParameter) == 1 &&
+               cleared.clearRecordingTransitions == 1U &&
+               cleared.clearHistoryMetadataOperations == 4U &&
+               !cleared.clearRecordingArmed && cleared.eventCount == 0U &&
+               !midibuffer::recordedEventAt(enabled.algorithm(), 0U, erased) &&
+               cleared.captureEnabled && cleared.clockRunning &&
+               !cleared.selectionValid && !cleared.activeSelectionValid &&
+               !cleared.rangeTransitionPending &&
+               midibuffer_test::trace().midiCallCount == 0U &&
+               midibuffer_test::heapAllocationCount() == allocationsBeforeSmall,
+           "one armed On write invalidates small history in four metadata operations, stays consumed On, and preserves enabled Capture and clock state without allocation");
+
+    sendMidi(enabled, 0x91U, 61U, 100U);
+    expect(snapshot(enabled).eventCount == 0U,
+           "clear preserves the selected recording-channel eligibility gate");
+    sendMidi(enabled, 0x92U, 62U, 101U);
+    midibuffer::RecordedEvent fresh = {};
+    expect(snapshot(enabled).eventCount == 1U &&
+               midibuffer::recordedEventAt(enabled.algorithm(), 0U, fresh) &&
+               eventBytesMatch(fresh, 0x92U, 62U, 101U),
+           "enabled Capture immediately retains fresh eligible MIDI after clear");
+
+    moveUi(enabled, kNT_encoderR, 0.0f, 0.0f, 0.0f, 0, 1);
+    noClockBlock(enabled);
+    changeParameter(enabled, kClearRecordingParameter, 1);
+    midibuffer::RecordedEvent retainedFresh = {};
+    const midibuffer::CaptureSnapshot repeatedOn = snapshot(enabled);
+    expect(repeatedOn.clearRecordingTransitions == 1U &&
+               repeatedOn.eventCount == 1U && repeatedOn.captureEnabled &&
+               midibuffer::recordedEventAt(enabled.algorithm(), 0U,
+                                           retainedFresh) &&
+               eventBytesMatch(retainedFresh, 0x92U, 62U, 101U),
+           "production UI, step, and repeated On callbacks leave post-clear recording intact while Clear Recording remains consumed");
+
+    sendMidi(enabled, 0x82U, 62U, 0U);
+    stopCapture(enabled);
+    expect(midibuffer::setPulseSelection(enabled.algorithm(), fresh.pulse,
+                                         fresh.pulse + 1U),
+           "post-clear events form a new valid selection");
+    midibuffer_test::resetTrace();
+    clockPulse(enabled);
+    expect(midibuffer_test::trace().midiCallCount == 0U &&
+               enabled.parameter(kPlaybackParameter) == 0 &&
+               !snapshot(enabled).playbackActive,
+           "a new selection and later clock do not implicitly restart playback after clear");
+    changeParameter(enabled, kPlaybackParameter, 1);
+    clockPulse(enabled);
+    stepThrough(enabled, enabled.elapsedSamples() + 4U);
+    bool onlyFreshPlayback =
+        midibuffer_test::trace().midiCallCount != 0U;
+    for (size_t index = 0U;
+         index < midibuffer_test::trace().midiCallCount; ++index) {
+        const midibuffer_test::MidiCall& call =
+            midibuffer_test::trace().midiCalls[index];
+        const uint8_t type = call.bytes[0] & 0xf0U;
+        onlyFreshPlayback =
+            onlyFreshPlayback &&
+            ((type != 0x80U && type != 0x90U) || call.bytes[1] == 62U);
+    }
+    expect(snapshot(enabled).playbackActive && onlyFreshPlayback,
+           "an explicit Playback On action replays only newly selected post-clear events");
+
+    changeParameter(enabled, kClearRecordingParameter, 0);
+    expect(snapshot(enabled).clearRecordingArmed &&
+               snapshot(enabled).eventCount == 2U &&
+               enabled.parameter(kClearRecordingParameter) == 0,
+           "Off rearms Clear Recording without erasing retained fresh events");
+    changeParameter(enabled, kClearRecordingParameter, 1);
+    expect(snapshot(enabled).clearRecordingTransitions == 2U &&
+               snapshot(enabled).eventCount == 0U &&
+               !snapshot(enabled).clearRecordingArmed &&
+               !snapshot(enabled).captureEnabled &&
+               enabled.parameter(kPlaybackParameter) == 0,
+           "the next armed Off-to-On transition performs exactly one further erase while preserving stopped Capture");
+
+    midibuffer_test::HostDouble disabled;
+    expect(disabled.instantiate(1),
+           "disabled-clear host constructs");
+    startCapture(disabled);
+    acquireClock(disabled);
+    sendMidi(disabled, 0x90U, 48U, 100U);
+    stopCapture(disabled);
+    changeParameter(disabled, kClearRecordingParameter, 1);
+    expect(!snapshot(disabled).captureEnabled &&
+               disabled.parameter(kCaptureParameter) == 0 &&
+               snapshot(disabled).eventCount == 0U,
+           "clear preserves disabled Capture and does not implicitly restart it");
+
+    midibuffer_test::HostDouble playing;
+    TransportFixture fixture = prepareTransportHistory(playing);
+    changeParameter(playing, kPlaybackDestinationParameter, 1);
+    changeParameter(playing, kPlaybackChannelParameter, 5);
+    beginTransportOnHeldFirstBeat(playing, fixture, 16U, 4U);
+    expect(midibuffer::setPulseSelection(
+               playing.algorithm(), fixture.firstSelectedPulse,
+               fixture.firstSelectedPulse + 1U) &&
+               snapshot(playing).rangeTransitionPending,
+           "playing clear fixture includes active and pending ranges");
+
+    midibuffer_test::resetTrace();
+    const uint64_t allocationsBeforePlaying =
+        midibuffer_test::heapAllocationCount();
+    changeParameter(playing, kClearRecordingParameter, 1);
+    const midibuffer::CaptureSnapshot stopped = snapshot(playing);
+    const midibuffer_test::Trace& cleanup = midibuffer_test::trace();
+    expect(playing.parameter(kClearRecordingParameter) == 1 &&
+               playing.parameter(kPlaybackParameter) == 0 &&
+               cleanup.parameterSetCallCount == 1U &&
+               cleanup.parameterSetCalls[0].source ==
+                   midibuffer_test::kParameterSetFromAudio &&
+               cleanup.parameterSetCalls[0].parameter ==
+                   kPlaybackParameter + NT_parameterOffset() &&
+               cleanup.parameterSetCalls[0].value == 0 &&
+               cleanup.maximumParameterCallbackDepth == 1U &&
+               cleanup.midiCallCount == 2U &&
+               cleanup.midiCalls[0].destination == kNT_destinationUSB &&
+               cleanup.midiCalls[0].bytes[0] == 0x84U &&
+               cleanup.midiCalls[0].bytes[1] == 60U &&
+               cleanup.midiCalls[1].destination == kNT_destinationUSB &&
+               cleanup.midiCalls[1].bytes[0] == 0xB4U &&
+               cleanup.midiCalls[1].bytes[1] == 64U &&
+               cleanup.midiCalls[1].bytes[2] == 0U,
+           "clear publishes Playback Off and releases held note then sustain through the selected destination");
+    expect(stopped.eventCount == 0U && !stopped.selectionValid &&
+               !stopped.activeSelectionValid &&
+               !stopped.rangeTransitionPending &&
+               !stopped.playbackArmed && !stopped.playbackActive &&
+               !stopped.playbackClockLossPaused &&
+               !stopped.playbackIntervalOpen &&
+               !stopped.playbackNextEventScheduled &&
+               !stopped.pendingNextEndingScheduled &&
+               stopped.playbackPulse == 0U &&
+               stopped.playbackIntervalStartSample == 0U &&
+               stopped.playbackIntervalOrdinal == 0U &&
+               stopped.playbackNextEventSample == 0U &&
+               stopped.playbackEventIndex == 0U &&
+               stopped.pendingNextEndingSample == 0U &&
+               stopped.pendingNoteEndingCount == 0U &&
+               stopped.pendingSustainReleaseCount == 0U &&
+               !stopped.captureEnabled &&
+               midibuffer_test::heapAllocationCount() ==
+                   allocationsBeforePlaying,
+           "clear invalidates selected, active, pending, cursor, queued-event, and ending state without allocation or Capture restart");
+
+    midibuffer_test::resetTrace();
+    clockPulse(playing);
+    sendMidi(playing, 0x94U, 99U, 100U);
+    moveUi(playing, 0U, 0.0f, 0.0f, 0.0f);
+    expect(midibuffer_test::trace().midiCallCount == 0U &&
+               snapshot(playing).eventCount == 0U &&
+               !snapshot(playing).playbackActive &&
+               playing.parameter(kPlaybackParameter) == 0,
+           "post-clear production step, MIDI, and UI callbacks emit no erased events and do not restart playback");
+
+    midibuffer_test::HostDouble maximum;
+    expect(maximum.instantiate(5),
+           "full-capacity clear host constructs");
+    startCapture(maximum);
+    acquireClock(maximum);
+    const uint32_t capacity = snapshot(maximum).eventCapacity;
+    for (uint32_t index = 0; index < capacity; ++index) {
+        sendMidi(maximum, 0xB0U, 7U,
+                 static_cast<uint8_t>(index & 0x7fU));
+    }
+    expect(snapshot(maximum).eventCount == capacity,
+           "clear cost fixture fills the complete 5 MB event capacity");
+    midibuffer_test::resetTrace();
+    const uint64_t allocationsBeforeMaximum =
+        midibuffer_test::heapAllocationCount();
+    changeParameter(maximum, kClearRecordingParameter, 1);
+    midibuffer::RecordedEvent removedMaximum = {};
+    expect(snapshot(maximum).eventCount == 0U &&
+               snapshot(maximum).clearRecordingTransitions == 1U &&
+               snapshot(maximum).clearHistoryMetadataOperations ==
+                   cleared.clearHistoryMetadataOperations &&
+               !midibuffer::recordedEventAt(maximum.algorithm(), 0U,
+                                            removedMaximum) &&
+               snapshot(maximum).captureEnabled &&
+               snapshot(maximum).clockRunning &&
+               midibuffer_test::heapAllocationCount() ==
+                   allocationsBeforeMaximum,
+           "full 5 MB clear performs the same four metadata operations as small history, exposes no erased event, allocates nothing, and preserves live capture eligibility");
+}
+
 void verifyTimedRightEncoderPanic() {
     const uint32_t destinations[] = {
         kNT_destinationBreakout,
@@ -4987,6 +5191,7 @@ int main() {
     verifyLiveEmergencySilenceMatrix();
     verifyTimelinePlaybackToggle();
     verifySharedPlaybackParameter();
+    verifyOneShotClearRecording();
     verifyTimedRightEncoderPanic();
     verifyLegacyNavigationPresetCompatibility();
     verifyShowAllPresetPolicy();

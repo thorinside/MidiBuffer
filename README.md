@@ -30,6 +30,7 @@ Choose **Buffer MB** when creating the algorithm; the other controls are ordinar
 | Inputs | **Reset** | CV bus 1–64 | Input 2 | Immediately cleans up playback output and returns playback to the active range start. |
 | Capture | **Capture** | Stop Capture, Start Capture | Stop Capture | Explicitly enables or stops recording. |
 | Capture | **Record Ch** | Omni, 1–16 | Omni | Admits all channels or one selected incoming MIDI channel. |
+| Capture | **Clear Recording** | Off, On | Off | An armed Off-to-On change erases retained history once; return it to Off to rearm. |
 | Playback | **MIDI Out** | Breakout, USB, Select Bus, Internal, All | Breakout | Chooses the replay, cleanup, and panic destination. |
 | Playback | **Play Ch** | Original, 1–16 | Original | Preserves recorded channels or rewrites every replayed channel message to one channel. |
 | Playback | **Filter CC** | Off, On | Off | Suppresses eligible recorded CC during playback when On. |
@@ -62,6 +63,8 @@ The CV inputs respond to rising edges above 1 V. **Clock** and **Reset** require
 6. Touch a selection boundary control to create and trim a valid pulse-aligned range. Turn the unpressed right pot to move that fixed-length range. Hold the right pot while turning to zoom; release it to resume range movement. Fresh views use **Show All** and continue fitting retained history; zoom in before using the left encoder to inspect a narrower region. **Pulses/Beat**, zoom, and scroll never change recorded timing or the selection.
 7. Press the left encoder to play. If a clock interval is still known, playback begins on the next pulse; otherwise it waits for two fresh pulses. Starting playback also finalizes and pauses active capture.
 8. Press the left encoder again to stop. Playback position is preserved for continuation. Use **Reset** to clean up and return to the range start. Capture never restarts automatically; select **Start Capture** again when you want to record more.
+
+To deliberately erase the buffer, change **Clear Recording** from **Off** to **On** on the Capture parameter page. It stays On after erasing and ignores repeated On writes, so new eligible input is retained if Capture was already enabled. Return it to Off before requesting another erase. Clear has no custom faceplate shortcut. Clearing stops playback, releases its held notes and sustain through the selected destination, sets Playback Off, and discards every loop selection and playback position; playback then needs a new valid selection and explicit On action. Clear preserves the actual Capture enabled/disabled state and never starts Capture.
 
 Edits made while playing are adopted together at the next loop wrap. The current range finishes first, then held-note and sustain cleanup occurs before the new range emits anything.
 
@@ -112,6 +115,7 @@ Only valid saved state is in MidiBuffer's scope. If a preset is corrupt or incom
 MidiBuffer retains eligible channel MIDI as pulse-relative events in a fixed rolling history:
 
 - Capture starts stopped. Set **Capture** to **Start Capture** or **Stop Capture** explicitly.
+- **Clear Recording** erases once on an armed Off-to-On transition and remains On but consumed until returned to Off. It preserves Capture and clock/channel eligibility, while stopping Playback, performing ordered held-note/sustain cleanup, and invalidating all retained history, selections, pending ranges, playback position, queued events, and pending endings. There is no faceplate shortcut and erased events cannot replay.
 - The patched **Clock** input is tracked continuously, including while capture is stopped.
 - Capture waits for two clock pulses when no interval is known. After two last-measured intervals pass without a pulse, clock is considered lost; capture or playback waits for two fresh pulses to establish a new interval before resuming.
 - **Record Ch** selects **Omni** or one MIDI channel from 1 through 16.

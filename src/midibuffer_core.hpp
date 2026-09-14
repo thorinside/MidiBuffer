@@ -55,6 +55,8 @@ struct CaptureSnapshot {
     uint32_t metadataBytes;
     uint32_t eventCapacity;
     uint32_t eventCount;
+    uint32_t clearRecordingTransitions;
+    uint32_t clearHistoryMetadataOperations;
     uint64_t sampleCursor;
     uint64_t currentPulse;
     uint64_t oldestPulse;
@@ -78,6 +80,7 @@ struct CaptureSnapshot {
     uint64_t timelineViewEndPulse;
     bool timelineShowAll;
     bool captureEnabled;
+    bool clearRecordingArmed;
     bool clockRunning;
     bool selectionValid;
     bool playbackArmed;
