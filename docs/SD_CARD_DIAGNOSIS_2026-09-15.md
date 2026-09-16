@@ -90,3 +90,34 @@ for this isolation step. Reset preset is an alternative documented way to
 forget the last preset, but disabling automatic load preserves that reference.
 
 Source: https://www.expert-sleepers.co.uk/downloads/manuals/disting_NT_user_manual_1.18.pdf
+
+## Authorized repair and recovered object
+
+After the user supplied a writable mount and explicitly approved repair,
+`diskutil repairVolume '/Volumes/DISTING NT'` completed successfully with
+fsck exit code 0. A separate `diskutil verifyVolume` then reported
+`The volume DISTING NT appears to be OK`, also with exit code 0. Both commands
+restored the mounted state after their checks.
+
+The filesystem repair renamed the empty duplicate directory to `programs-1`.
+The original `programs` directory is now accessible, with `plug-ins` and `lua`
+subdirectories and 105 files. No files were manually removed or replaced.
+All 543 readable preset/configuration files backed up before repair matched
+their SHA-256 manifest afterward; none were missing or changed. This comparison
+does not establish the integrity of all samples or files inaccessible before
+repair.
+
+The recovered `programs/plug-ins/MidiBuffer.o` is 54,300 bytes and exactly
+matches the workspace object, with SHA-256:
+
+```text
+d15ab42d2ebd9f53b6c7eadc81f52a4edffffc0063038df973ea7bf90b6967a2
+```
+
+The recovered object is ELF32, little-endian, relocatable ARM, with the expected
+host API/JSON and memset imports. A backup is stored under
+`/Users/nealsanche/nosuch/midibuffer-diagnostics/2026-09-15/recovered/`.
+There is no evidence requiring replacement of the installed object.
+The next acceptance check is physical startup with the repaired card;
+filesystem repair success does not yet establish that the reported hang is
+resolved.
