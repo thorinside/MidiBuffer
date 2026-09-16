@@ -152,3 +152,25 @@ Next distinguish manual MidiBuffer addition to an empty preset from loading
 saved state. If manual addition works, compare the stopped diagnostic copy
 with the original on hardware before attributing the failure to a callback,
 serialization field, or firmware behavior.
+
+## Physical isolation results
+
+The user confirms fresh manual MidiBuffer instantiation succeeds. The
+MBdiag_Stop copy was installed beside the original, read back and verified,
+then the card was safely ejected. The user confirms this stopped diagnostic
+preset loads on hardware. Its recorded event payload is unchanged, so the
+recorded notes alone are insufficient to reproduce the hang. The differences
+still include Playback/Clear values and active scheduler/output ownership;
+none of these can yet be identified individually as the cause.
+
+Two further local diagnostic copies are ready for hardware comparison:
+
+- MBdiag_ClearOff: original preset with only Clear Off in generic parameters
+  and sharedControls, plus its diagnostic preset name. Playback and all saved
+  scheduling/output/recording data remain as in the failing original.
+- MBdiag_ClearOn: working stopped diagnostic with only Clear On restored in
+  generic parameters and sharedControls, plus its diagnostic name.
+
+The card was not mounted when these copies were prepared. They have not yet
+been installed or tested on hardware. Keep automatic last-preset loading
+disabled while comparing them.
