@@ -121,3 +121,34 @@ There is no evidence requiring replacement of the installed object.
 The next acceptance check is physical startup with the repaired card;
 filesystem repair success does not yet establish that the reported hang is
 resolved.
+
+## Hang persists on explicit preset load
+
+The user confirms that disabling Load last preset permits boot, but explicitly
+loading MBclk_A1 still hangs. Filesystem repair therefore did not resolve the
+reported preset-load failure. Successful boot without preset restoration does
+not yet demonstrate that manually instantiating MidiBuffer succeeds.
+
+ARM disassembly shows the deserialise callback reserves 252 bytes of local
+stack plus saved registers; construction has no large local stack allocation.
+This does not reveal a large plugin restoration stack frame. The native host
+still cannot reproduce the hardware failure.
+
+Two diagnostic copies are preserved in the external diagnostics directory:
+
+- MBdiag_Clock.json contains only the original built-in Clock slot.
+- MBdiag_Stop.json retains all original recorded events and selection, but
+  restores Playback and Clear Off, stopped transport, closed scheduling, and
+  empty playback-output/pending-ending ownership.
+
+The stopped copy loads through production callbacks under ASan/UBSan, accepts
+100,000 events with rollover, and accepts fresh recording after clear. It is a
+diagnostic comparison, not a confirmed fix. Neither original preset nor plugin
+was modified. At this follow-up the card was no longer mounted, no disting NT
+USB MIDI port was available, and the previous local MCP endpoint was not
+running, so hardware comparison could not be driven unattended.
+
+Next distinguish manual MidiBuffer addition to an empty preset from loading
+saved state. If manual addition works, compare the stopped diagnostic copy
+with the original on hardware before attributing the failure to a callback,
+serialization field, or firmware behavior.
