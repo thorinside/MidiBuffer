@@ -41,7 +41,7 @@ Choose **Buffer MB** when creating the algorithm; the other controls are ordinar
 
 The CV inputs respond to rising edges above 1 V. **Clock** and **Reset** require a routed bus; neither has a None setting.
 
-The timeline draws up to 256 of the newest note-ons in the visible range. Dense views can omit older note marks; this display limit does not limit recording or playback.
+Every recorded note-on in the visible range contributes to the timeline. Notes sharing a screen column merge into a stem reaching the highest pitch in that column, so dense recordings remain represented across the whole view. Zoom in to separate overlapping marks. This display merging does not limit recording or playback.
 
 ### Timeline controls
 

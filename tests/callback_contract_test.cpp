@@ -4788,14 +4788,16 @@ void verifyNewestCapturedNotesRemainVisible() {
     expect(host.instantiate(1), "dense live timeline host constructs");
     startCapture(host);
     acquireClock(host);
+    changeParameter(host, kPulsesPerDisplayedBeatParameter, 4); // 16 PPQN
     for (int pass = 0; pass < 2; ++pass) {
         if (pass != 0) {
             changeParameter(host, kClearRecordingParameter, 1);
         }
         for (uint32_t note = 0; note < 300U; ++note) {
             clockPulse(host);
-            sendMidi(host, 0x90U, 60U, 100U);
-            sendMidi(host, 0x80U, 60U, 0U);
+            const uint8_t pitch = note == 0U ? 127U : 60U;
+            sendMidi(host, 0x90U, pitch, 100U);
+            sendMidi(host, 0x80U, pitch, 0U);
         }
         clockPulse(host);
         sendMidi(host, 0x90U, 126U, 111U);
@@ -4803,21 +4805,56 @@ void verifyNewestCapturedNotesRemainVisible() {
         midibuffer_test::resetTrace();
         host.factory()->draw(host.algorithm());
         bool newestVisible = false;
+        bool oldestVisible = false;
         const midibuffer_test::Trace& drawn = midibuffer_test::trace();
+        int actualTop[248];
+        int expectedTop[248];
+        for (size_t column = 0; column < ARRAY_SIZE(actualTop); ++column) {
+            actualTop[column] = 52;
+            expectedTop[column] = 52;
+        }
         for (size_t index = 0; index < drawn.shapeCallCount; ++index) {
             const midibuffer_test::ShapeCall& line = drawn.shapeCalls[index];
             newestVisible = newestVisible ||
                 (line.colour == 9 && line.y0 == 24 && line.y1 == 51 &&
                  line.x0 == line.x1);
+            oldestVisible = oldestVisible ||
+                (line.colour == 9 && line.y0 == 23 && line.y1 == 51 &&
+                 line.x0 == line.x1);
+            if (line.colour == 9 && line.x0 >= 4 && line.x0 <= 251 &&
+                line.x0 == line.x1) {
+                actualTop[line.x0 - 4] = line.y0;
+            }
         }
+        // Independent all-note raster reference for this short, overflow-safe
+        // fixture: require every note's stem to survive pixel-column merging.
+        for (uint32_t index = 0; index < beforeDraw.eventCount; ++index) {
+            midibuffer::RecordedEvent event = {};
+            expect(midibuffer::recordedEventAt(host.algorithm(), index, event),
+                   "dense raster reference reads retained events");
+            if ((event.bytes[0] & 0xf0U) != 0x90U || event.bytes[2] == 0U) {
+                continue;
+            }
+            const size_t column = static_cast<size_t>(
+                (event.pulse - beforeDraw.timelineViewStartPulse) * 247U /
+                (beforeDraw.timelineViewEndPulse -
+                 beforeDraw.timelineViewStartPulse));
+            const int top = 47 - static_cast<int>(event.bytes[1]) * 24 / 127;
+            if (top < expectedTop[column]) {
+                expectedTop[column] = top;
+            }
+        }
+        expect(std::memcmp(actualTop, expectedTop, sizeof(actualTop)) == 0 &&
+                   beforeDraw.pulsesPerDisplayedBeat == 16U,
+               "dense 16-PPQN timeline equals the union of every recorded note's stem, with no event sampling");
         midibuffer::RecordedEvent newest = {};
         expect(beforeDraw.captureEnabled && beforeDraw.eventCount == 601U &&
                    midibuffer::recordedEventAt(host.algorithm(), 600U,
                                               newest) &&
                    eventBytesMatch(newest, 0x90U, 126U, 111U),
                "capture retains the distinctive newest note beyond the timeline's 256-note drawing budget");
-        expect(newestVisible && shapeColourCount(9) == 256U,
-               "live timeline draws the newest captured note after 300 older notes, including after clear");
+        expect(newestVisible && oldestVisible && shapeColourCount(9) <= 248U,
+               "dense timeline represents both oldest and newest notes beyond four bars at 16 PPQN with at most one stem per screen column, including after clear");
         expect(snapshot(host).eventCount == beforeDraw.eventCount,
                "dense timeline drawing does not mutate retained history");
     }

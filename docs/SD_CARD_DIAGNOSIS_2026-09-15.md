@@ -266,3 +266,26 @@ and ARM gate pass. Player documentation now explains the dense-view drawing
 limit. The patched object includes both this display correction and the
 previous startup Clear guard; physical installation and acceptance remain
 pending because the card is not mounted.
+
+## Complete visible-range representation
+
+The user prefers representation of all notes across the visible range rather
+than retaining only the latest 256 marks, and reports saturation around four
+bars at 16 PPQN. Four bars of four beats at 16 pulses per beat contain 256
+pulses; one attack per pulse would fill the old 256-note drawing budget at
+that point. This is consistent with the display defect, not evidence of a
+four-bar capture limit.
+
+The renderer now scans every visible note-on and merges overlapping vertical
+stems into 248 screen-column bins. Each bin retains the topmost stem endpoint;
+drawing it produces the exact union of all individual note stems in that
+column. Thus every visible attack contributes, including both earliest and
+latest notes, with at most 248 drawing calls and 248 bytes of fixed local
+aggregation storage. There is no note-count cutoff or event sampling. Zoom
+continues to separate events that overlap at a wider time scale.
+
+The dense-history regression now uses 16 PPQN and distinctive earliest/latest
+notes, before and after clear, and compares every rendered column with an
+independent raster union calculated from all actual retained note events.
+The earlier newest-only renderer fails these requirements. This change does
+not alter recording, playback timing, parameter indices, or preset encoding.

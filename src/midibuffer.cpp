@@ -2693,26 +2693,37 @@ bool draw(_NT_algorithm* self) {
 
     nt_host::drawShape(kNT_line, 4, 52, 251, 52, 5);
     if (observed.viewEnd > observed.viewStart) {
-        // Spend the fixed drawing budget on the newest visible attacks.
-        // Walking oldest-first hid all fresh capture after 256 visible notes.
-        uint32_t eventIndex = algorithm->eventCount;
-        uint32_t drawnNotes = 0;
-        while (eventIndex != 0U && drawnNotes < 256U) {
+        // All visible attacks contribute to the same vertical-stem image as
+        // individual drawing. Overlapping stems share a column, so keeping
+        // its highest pitch produces their exact union with bounded drawing.
+        uint8_t columnTop[248];
+        for (uint32_t column = 0; column < ARRAY_SIZE(columnTop); ++column) {
+            columnTop[column] = 52U;
+        }
+        uint32_t eventIndex =
+            findPlaybackEventIndex(*algorithm, observed.viewStart);
+        while (eventIndex < algorithm->eventCount) {
             const RecordedEvent* event = recordedEventByIndex(
-                *algorithm, --eventIndex);
-            if (event == NULL || event->pulse < observed.viewStart) {
+                *algorithm, eventIndex++);
+            if (event == NULL || event->pulse >= observed.viewEnd) {
                 break;
             }
-            if (event->pulse >= observed.viewEnd ||
-                (event->bytes[0] & 0xf0U) != 0x90U ||
+            if ((event->bytes[0] & 0xf0U) != 0x90U ||
                 event->bytes[2] == 0U) {
                 continue;
             }
             const int x = pulseTimelineX(event->pulse, observed.viewStart,
                                          observed.viewEnd);
             const int y = 47 - static_cast<int>(event->bytes[1]) * 24 / 127;
-            nt_host::drawShape(kNT_line, x, y, x, 51, 9);
-            ++drawnNotes;
+            if (y >= 0 && y < columnTop[x - 4]) {
+                columnTop[x - 4] = static_cast<uint8_t>(y);
+            }
+        }
+        for (uint32_t column = 0; column < ARRAY_SIZE(columnTop); ++column) {
+            if (columnTop[column] < 52U) {
+                const int x = static_cast<int>(column) + 4;
+                nt_host::drawShape(kNT_line, x, columnTop[column], x, 51, 9);
+            }
         }
         if (observed.headEligible &&
             observed.playbackPulse >= observed.viewStart &&
