@@ -56,6 +56,7 @@ struct Trace {
     ParameterSetCall parameterSetCalls[64];
     size_t parameterSetCallCount;
     uint32_t maximumParameterCallbackDepth;
+    uint32_t presetRestoreClearTransitions;
 };
 
 void resetTrace();

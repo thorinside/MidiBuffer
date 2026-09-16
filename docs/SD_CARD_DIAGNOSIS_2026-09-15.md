@@ -174,3 +174,41 @@ Two further local diagnostic copies are ready for hardware comparison:
 The card was not mounted when these copies were prepared. They have not yet
 been installed or tested on hardware. Keep automatic last-preset loading
 disabled while comparing them.
+
+## Clear restoration defect and loading-delay correction
+
+The user subsequently reports ClearOff loads and ClearOn initially appears
+to hang, then clarifies ClearOn eventually loaded. There is no measured loading
+time and no confirmed permanent hang for that diagnostic. The original active
+preset's eventual outcome remains unknown.
+
+Code inspection found that Clear is initially armed at construction, while
+its consumed preset latch is only restored in deserialise. Generic parameters
+arriving first therefore execute a live clear when Clear On is restored.
+The old native tests masked that action because deserialise resets the clear
+diagnostics. A new host trace observes clear transitions before that reset;
+the shared-control restoration test failed before the fix:
+
+```text
+FAIL: restoring Clear On must not execute a live clear before custom state is loaded
+```
+
+The plugin now distinguishes initialization from running controls using a
+non-persisted processingStarted flag. Until the first valid audio block,
+Clear callbacks only initialize its armed/consumed latch; they do not clear
+history, stop transport, or invoke a Playback setter. Once processing starts,
+the existing synchronous live Off-to-On clear behavior is unchanged. Parameter
+indices and preset representation remain unchanged.
+
+The regression and all existing native, ASan/UBSan, static/realtime,
+traceability, and ARM object-inspection checks pass with this fix. This proves
+the unwanted startup action is removed, not that the hardware loading delay
+is resolved. No patched plugin has yet been installed on the module/card.
+
+Validation command used the direct CommandLineTools make and linker paths
+because the default Apple shims are blocked by the unaccepted Xcode license:
+
+```sh
+/Library/Developer/CommandLineTools/usr/bin/make verify \
+  NATIVE_CXX='/opt/homebrew/opt/llvm/bin/clang++ -B/Library/Developer/CommandLineTools/usr/bin -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk'
+```

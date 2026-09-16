@@ -4839,6 +4839,8 @@ void verifySharedControlPresetRestoration() {
                    ? "new shared controls load with generic parameters before custom state"
                    : "new shared controls load with generic parameters after custom state");
         const midibuffer::CaptureSnapshot loaded = snapshot(restored);
+        expect(midibuffer_test::trace().presetRestoreClearTransitions == 0U,
+               "restoring Clear On must not execute a live clear before custom state is loaded");
         expect(restored.parameter(kPlaybackParameter) == 1 &&
                    restored.parameter(kClearRecordingParameter) == 1 &&
                    !loaded.clearRecordingArmed &&

@@ -1,4 +1,5 @@
 #include "host_double.hpp"
+#include "../src/midibuffer_core.hpp"
 
 #include <distingnt/serialisation.h>
 
@@ -968,6 +969,9 @@ bool HostDouble::loadPreset(const PresetImage& image,
             values_[index] = document->parameters[index];
             factory_->parameterChanged(algorithm_, static_cast<int>(index));
         }
+        // Observe destructive actions before deserialise resets diagnostics.
+        gTrace.presetRestoreClearTransitions +=
+            midibuffer::captureSnapshot(algorithm_).clearRecordingTransitions;
     }
     JsonParseState state = {&document->root, std::vector<JsonParseFrame>()};
     _NT_jsonParse parse(&state, 0);

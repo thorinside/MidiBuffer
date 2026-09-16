@@ -204,7 +204,8 @@ struct Algorithm : public _NT_algorithm {
           zoomPressCoordinate(0), clearRecordingTransitions(0),
           clearHistoryMetadataOperations(0), restoredPlaybackValue(0),
           restoredClearRecordingValue(0), captureEnabled(false),
-          clearRecordingArmed(true), playbackRestorePending(false),
+          clearRecordingArmed(true), processingStarted(false),
+          playbackRestorePending(false),
           clearRecordingRestorePending(false), clockRunning(false),
           haveAcquisitionPulse(false), clockHigh(false), resetHigh(false),
           selectionValid(false), activeSelectionValid(false),
@@ -264,6 +265,7 @@ struct Algorithm : public _NT_algorithm {
 
     bool captureEnabled;
     bool clearRecordingArmed;
+    bool processingStarted;
     bool playbackRestorePending;
     bool clearRecordingRestorePending;
     bool clockRunning;
@@ -587,6 +589,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
         }
     } else if (parameter == kParameterClearRecording && algorithm->v != NULL) {
         const bool requested = algorithm->v[kParameterClearRecording] != 0;
+        // Before the first audio block these are host initialization/restore
+        // callbacks, not physical clear gestures. In particular, generic
+        // Clear On may arrive before deserialise can restore its consumed
+        // latch. Never clear or call a host setter during that phase.
+        if (!algorithm->processingStarted) {
+            algorithm->clearRecordingArmed = !requested;
+            return;
+        }
         if (!requested) {
             algorithm->clearRecordingArmed = true;
         } else if (algorithm->clearRecordingArmed) {
@@ -1767,6 +1777,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
 
     const int numFrames = numFramesBy4 * 4;
+    algorithm->processingStarted = true;
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
     const float* clockFrames = clockBus >= 1 && clockBus <= kNT_lastBus
