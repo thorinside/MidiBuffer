@@ -212,3 +212,32 @@ because the default Apple shims are blocked by the unaccepted Xcode license:
 /Library/Developer/CommandLineTools/usr/bin/make verify \
   NATIVE_CXX='/opt/homebrew/opt/llvm/bin/clang++ -B/Library/Developer/CommandLineTools/usr/bin -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk'
 ```
+
+## Recording beyond a previous cleared length
+
+Source tracing found no admission/stop condition comparing incoming MIDI
+against the previous recording end or selected loop end. Clear invalidates the
+event head/count and history end, clears selection and output ownership, and
+preserves the actual Capture and clock state. The pulse counter remains an
+absolute clock identity; it is not a maximum recording duration. Incoming
+events update the history end, and a full ring replaces its oldest events
+instead of refusing new events.
+
+The added production-callback regression
+`verifyRecordingBeyondPreviousLengthAfterClear` exercises all five buffer
+sizes. It records 32 pulses, installs a loop selection and a narrow/scrolled
+manual viewport, clears while Capture is enabled, and records 104 fresh
+pulses. It checks that the new history exceeds three times the old duration
+and crosses the old absolute endpoint. It also repeats Clear On at the former
+duration boundary without a new Off-to-On gesture, fills and wraps the real
+event ring, clears the wrapped full ring, fills/wraps again, and verifies a
+distinctive newly admitted MIDI note at the newest clock pulse.
+
+The focused native test passes. This has not reproduced the user's reported
+hardware stop and does not prove actual hardware capture remains active.
+Clear preserves manual zoom and scroll, so a narrow timeline view can retain
+its width while history grows. Starting playback or panic stops actual
+capture, and clearing such a paused instance does not restart capture. The
+user was asked whether Avail, timeline notes, or replayed MIDI stops changing
+to distinguish these cases before making any production change for this
+symptom.

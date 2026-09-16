@@ -4783,6 +4783,88 @@ void verifyOneShotClearRecording() {
            "full 5 MB clear performs the same four history metadata operations as small history and bounds ordered cleanup at 2,048 note slots plus 16 sustain slots without allocation");
 }
 
+void verifyRecordingBeyondPreviousLengthAfterClear() {
+    for (int megabytes = 1; megabytes <= 5; ++megabytes) {
+        midibuffer_test::HostDouble host;
+        expect(host.instantiate(megabytes),
+               "post-clear continuation host constructs at every supported capacity");
+        changeParameter(host, kRecordingChannelParameter, 3);
+        startCapture(host);
+        acquireClock(host);
+        for (uint32_t pulse = 0; pulse < 32U; ++pulse) {
+            clockPulse(host);
+            sendMidi(host, 0x92U, 60U, 100U);
+            sendMidi(host, 0x82U, 60U, 0U);
+        }
+        const midibuffer::CaptureSnapshot old = snapshot(host);
+        expect(midibuffer::setPulseSelection(host.algorithm(), old.oldestPulse,
+                                             old.newestPulse + 1U) &&
+                   midibuffer::setTimelineNavigationFixture(
+                       host.algorithm(), false, 16U, 8U,
+                       midibuffer::kSelectionFineTargetEnd),
+               "old recording has a selected endpoint and a scrolled manual viewport");
+        changeParameter(host, kClearRecordingParameter, 1);
+        const uint64_t freshStart = snapshot(host).currentPulse + 1U;
+        const uint32_t longerPulses =
+            static_cast<uint32_t>(old.retainedPulseIntervals * 3U + 8U);
+        for (uint32_t pulse = 0; pulse < longerPulses; ++pulse) {
+            clockPulse(host);
+            sendMidi(host, 0x92U, 62U, 101U);
+            sendMidi(host, 0x82U, 62U, 0U);
+            if (pulse == old.retainedPulseIntervals) {
+                // A consumed On cannot erase or stop the new recording when
+                // it reaches the former recording's duration.
+                changeParameter(host, kClearRecordingParameter, 1);
+            }
+        }
+        const midibuffer::CaptureSnapshot longer = snapshot(host);
+        expect(longer.captureEnabled && longer.clockRunning &&
+                   !longer.selectionValid && !longer.activeSelectionValid &&
+                   longer.eventCount == longerPulses * 2U &&
+                   longer.oldestPulse == freshStart &&
+                   longer.newestPulse > old.newestPulse &&
+                   longer.retainedPulseIntervals >
+                       old.retainedPulseIntervals * 3U &&
+                   longer.timelineViewEndPulse -
+                           longer.timelineViewStartPulse == 16U &&
+                   longer.retainedPulseIntervals > 16U,
+               "after clear real MIDI recording crosses the old endpoint and duration despite the unchanged manual zoom/scroll");
+
+        // Fill and wrap the real ring, then clear and fill/wrap it again.
+        // Inspect the newest actual MIDI event rather than mistaking a
+        // constant retained event count or view width for stopped capture.
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass != 0) {
+                changeParameter(host, kClearRecordingParameter, 0);
+                changeParameter(host, kClearRecordingParameter, 1);
+                expect(snapshot(host).eventCount == 0U &&
+                           snapshot(host).captureEnabled,
+                       "clearing a wrapped full buffer preserves live capture");
+            }
+            const uint32_t incoming = snapshot(host).eventCapacity + 64U;
+            for (uint32_t event = 0; event < incoming; ++event) {
+                if (event % 32U == 0U) {
+                    clockPulse(host);
+                }
+                sendMidi(host, event % 2U == 0U ? 0x92U : 0x82U, 64U,
+                         event % 2U == 0U ? 100U : 0U);
+            }
+            clockPulse(host);
+            sendMidi(host, 0x92U, 126U, 111U);
+            const midibuffer::CaptureSnapshot full = snapshot(host);
+            midibuffer::RecordedEvent newest = {};
+            expect(full.captureEnabled && full.clockRunning &&
+                       full.eventCount == full.eventCapacity &&
+                       full.oldestPulse > freshStart &&
+                       midibuffer::recordedEventAt(
+                           host.algorithm(), full.eventCount - 1U, newest) &&
+                       newest.pulse == full.currentPulse &&
+                       eventBytesMatch(newest, 0x92U, 126U, 111U),
+                   "new MIDI still enters a full rolling ring before and after clear at every supported buffer size");
+        }
+    }
+}
+
 void verifySharedControlPresetRestoration() {
     midibuffer_test::HostDouble source;
     expect(source.instantiate(1),
@@ -5943,6 +6025,7 @@ int main() {
     verifyTimelinePlaybackToggle();
     verifySharedPlaybackParameter();
     verifyOneShotClearRecording();
+    verifyRecordingBeyondPreviousLengthAfterClear();
     verifySharedControlPresetRestoration();
     verifyLegacySharedControlPresetMigration();
     verifyTimedRightEncoderPanic();
