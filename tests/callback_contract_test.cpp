@@ -4783,6 +4783,46 @@ void verifyOneShotClearRecording() {
            "full 5 MB clear performs the same four history metadata operations as small history and bounds ordered cleanup at 2,048 note slots plus 16 sustain slots without allocation");
 }
 
+void verifyNewestCapturedNotesRemainVisible() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "dense live timeline host constructs");
+    startCapture(host);
+    acquireClock(host);
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass != 0) {
+            changeParameter(host, kClearRecordingParameter, 1);
+        }
+        for (uint32_t note = 0; note < 300U; ++note) {
+            clockPulse(host);
+            sendMidi(host, 0x90U, 60U, 100U);
+            sendMidi(host, 0x80U, 60U, 0U);
+        }
+        clockPulse(host);
+        sendMidi(host, 0x90U, 126U, 111U);
+        const midibuffer::CaptureSnapshot beforeDraw = snapshot(host);
+        midibuffer_test::resetTrace();
+        host.factory()->draw(host.algorithm());
+        bool newestVisible = false;
+        const midibuffer_test::Trace& drawn = midibuffer_test::trace();
+        for (size_t index = 0; index < drawn.shapeCallCount; ++index) {
+            const midibuffer_test::ShapeCall& line = drawn.shapeCalls[index];
+            newestVisible = newestVisible ||
+                (line.colour == 9 && line.y0 == 24 && line.y1 == 51 &&
+                 line.x0 == line.x1);
+        }
+        midibuffer::RecordedEvent newest = {};
+        expect(beforeDraw.captureEnabled && beforeDraw.eventCount == 601U &&
+                   midibuffer::recordedEventAt(host.algorithm(), 600U,
+                                              newest) &&
+                   eventBytesMatch(newest, 0x90U, 126U, 111U),
+               "capture retains the distinctive newest note beyond the timeline's 256-note drawing budget");
+        expect(newestVisible && shapeColourCount(9) == 256U,
+               "live timeline draws the newest captured note after 300 older notes, including after clear");
+        expect(snapshot(host).eventCount == beforeDraw.eventCount,
+               "dense timeline drawing does not mutate retained history");
+    }
+}
+
 void verifyRecordingBeyondPreviousLengthAfterClear() {
     for (int megabytes = 1; megabytes <= 5; ++megabytes) {
         midibuffer_test::HostDouble host;
@@ -6026,6 +6066,7 @@ int main() {
     verifySharedPlaybackParameter();
     verifyOneShotClearRecording();
     verifyRecordingBeyondPreviousLengthAfterClear();
+    verifyNewestCapturedNotesRemainVisible();
     verifySharedControlPresetRestoration();
     verifyLegacySharedControlPresetMigration();
     verifyTimedRightEncoderPanic();

@@ -241,3 +241,28 @@ capture, and clearing such a paused instance does not restart capture. The
 user was asked whether Avail, timeline notes, or replayed MIDI stops changing
 to distinguish these cases before making any production change for this
 symptom.
+
+## Reproduced display saturation and fix
+
+The user clarifies that the observation was new note marks no longer
+appearing on the display; Avail/replayed MIDI was not established to stop.
+The renderer iterated oldest-first and stopped after drawing 256 visible
+note-ons. Once that budget was occupied by old notes, newly captured notes
+were never drawn. The original preset contains 331 note-ons, enough to
+trigger this saturation in a view covering the whole recording.
+
+The new `verifyNewestCapturedNotesRemainVisible` regression records 300
+ordinary note attacks and then a distinctive high note through real MIDI and
+clock callbacks. It verifies the distinctive note is stored, and separately
+checks for its actual draw call. Before the rendering fix the drawing
+assertion failed twice, once with fresh history and once after clear, while
+the recording assertion passed. The renderer now walks newest-first and
+draws the newest 256 visible attacks. It preserves viewport bounds and the
+draw-call budget; dense views may omit older marks rather than newly arriving
+notes. Recording and replay contents are untouched.
+
+The regression and complete native, sanitizer, static/realtime, traceability,
+and ARM gate pass. Player documentation now explains the dense-view drawing
+limit. The patched object includes both this display correction and the
+previous startup Clear guard; physical installation and acceptance remain
+pending because the card is not mounted.

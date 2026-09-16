@@ -2693,16 +2693,18 @@ bool draw(_NT_algorithm* self) {
 
     nt_host::drawShape(kNT_line, 4, 52, 251, 52, 5);
     if (observed.viewEnd > observed.viewStart) {
-        uint32_t eventIndex =
-            findPlaybackEventIndex(*algorithm, observed.viewStart);
+        // Spend the fixed drawing budget on the newest visible attacks.
+        // Walking oldest-first hid all fresh capture after 256 visible notes.
+        uint32_t eventIndex = algorithm->eventCount;
         uint32_t drawnNotes = 0;
-        while (eventIndex < algorithm->eventCount && drawnNotes < 256U) {
+        while (eventIndex != 0U && drawnNotes < 256U) {
             const RecordedEvent* event = recordedEventByIndex(
-                *algorithm, eventIndex++);
-            if (event == NULL || event->pulse >= observed.viewEnd) {
+                *algorithm, --eventIndex);
+            if (event == NULL || event->pulse < observed.viewStart) {
                 break;
             }
-            if ((event->bytes[0] & 0xf0U) != 0x90U ||
+            if (event->pulse >= observed.viewEnd ||
+                (event->bytes[0] & 0xf0U) != 0x90U ||
                 event->bytes[2] == 0U) {
                 continue;
             }
