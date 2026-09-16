@@ -65,3 +65,28 @@ playback, capture, clear, or save) and a readable installed object.
 
 The original preset, probe source, and results are preserved at
 `/Users/nealsanche/nosuch/midibuffer-diagnostics/2026-09-15/`.
+
+## Hardware trigger clarified
+
+The user reports startup stops at `loading plugin:midibuffer.o`, with the
+module configured to load its last preset. The official 1.18 manual (Startup
+and Plug-ins sections) confirms that preset loading automatically loads any
+required plugins. This makes automatic restoration a plausible trigger for
+the plugin load, but does not establish that the saved recording state causes
+the failure. The screen message alone does not identify the failing loader
+operation or callback.
+
+The current workspace ARM object has 20,322 bytes of sections, no `.bss`, and
+no static recording buffer. Its entry point only reports API v13 and factory
+metadata; recording allocation happens separately at instance construction.
+This does not validate the unreadable installed object.
+
+A useful hardware isolation step is to power off, remove the card, boot, and
+disable Settings / Startup / Load last preset if the menu is accessible. Then
+power off, reinsert the card, and boot again. If startup succeeds, manually
+adding MidiBuffer without restoring the preset distinguishes a plugin-load
+failure from a preset-restoration failure. No card modification is required
+for this isolation step. Reset preset is an alternative documented way to
+forget the last preset, but disabling automatic load preserves that reference.
+
+Source: https://www.expert-sleepers.co.uk/downloads/manuals/disting_NT_user_manual_1.18.pdf
