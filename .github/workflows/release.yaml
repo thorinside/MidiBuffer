@@ -1,0 +1,76 @@
+name: Build and release MidiBuffer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tagged source and pinned SDK
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-dev zip unzip
+
+      - name: Build and inspect hardware object
+        run: |
+          make ARM_CXX=arm-none-eabi-g++ hardware inspect
+
+      - name: Package and verify installable object
+        run: |
+          mkdir -p programs/plug-ins
+          cp plugins/MidiBuffer.o programs/plug-ins/MidiBuffer.o
+          zip -q "MidiBuffer-${GITHUB_REF_NAME}.zip" programs/plug-ins/MidiBuffer.o
+          unzip -Z -1 "MidiBuffer-${GITHUB_REF_NAME}.zip" | grep -Fx 'programs/plug-ins/MidiBuffer.o'
+          cmp plugins/MidiBuffer.o <(unzip -p "MidiBuffer-${GITHUB_REF_NAME}.zip" programs/plug-ins/MidiBuffer.o)
+          sha256sum plugins/MidiBuffer.o "MidiBuffer-${GITHUB_REF_NAME}.zip"
+
+      - name: Retain verified build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MidiBuffer-${{ github.ref_name }}
+          path: MidiBuffer-${{ github.ref_name }}.zip
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MidiBuffer-${{ github.ref_name }}
+
+      - name: Refuse to replace an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          case "$status" in
+            404) ;;
+            200) echo 'Release already exists; refusing to replace it'; exit 1 ;;
+            *) echo "Release lookup failed (HTTP $status); refusing to publish"; exit 1 ;;
+          esac
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MidiBuffer-${{ github.ref_name }}.zip
+          fail_on_unmatched_files: true
