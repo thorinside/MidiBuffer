@@ -3401,7 +3401,7 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
 }
 
 static const _NT_factory kFactory = {
-    .guid = NT_MULTICHAR('M', 'd', 'B', 'f'),
+    .guid = NT_MULTICHAR('T', 'h', 'M', 'b'),
     .name = "MidiBuffer",
     .description = "Clocked MIDI history buffer",
     .numSpecifications = kNumSpecifications,

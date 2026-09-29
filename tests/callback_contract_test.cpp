@@ -412,6 +412,8 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
     expect(host.instantiate(3),
            "instance constructs through pluginEntry factory");
     expect(host.factory() != NULL, "factory is registered");
+    expect(host.factory()->guid == NT_MULTICHAR('T', 'h', 'M', 'b'),
+           "factory GUID is ThMb in the thorinside namespace");
     expect(std::strcmp(host.factory()->name, "MidiBuffer") == 0,
            "factory name is MidiBuffer");
     expect(host.factory()->numSpecifications == 1,

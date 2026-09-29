@@ -19,6 +19,10 @@ Build or obtain `MidiBuffer.o`, then place it at:
 
 Load **MidiBuffer** using the disting NT's normal plug-in loading workflow. The repository build product is `plugins/MidiBuffer.o`.
 
+The algorithm GUID is `ThMb` (`Th` is the thorinside namespace). The corrected
+v0.5.0 release replaces the initial `MdBf` GUID; presets saved with that initial
+GUID are not supported.
+
 ## Controls and defaults
 
 Choose **Buffer MB** when creating the algorithm; the other controls are ordinary run-time parameters.
