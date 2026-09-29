@@ -1,5 +1,23 @@
 # MidiBuffer v0.5.0 — public release evidence
 
+## Current publication: owner-requested GUID correction
+
+After the initial release, the owner identified the incorrect `MdBf` GUID,
+explicitly said "No preset compat needed", and requested "Replace 0.5.0".
+The corrected factory GUID is **`ThMb`**, using the `Th` developer namespace.
+No legacy factory or preset migration was added. The callback factory regression
+test failed against `MdBf`, then passed with `ThMb`; the complete `make verify`
+gate passed. No MIDI, DSP, control, or serialization behavior changed.
+
+- Replacement release commit: `75b998674b3de8315e5953513cd550aa36141d95`; annotated tag object: `7609f55bfd12bea69c072844ae68faf246774fc2`.
+- [Replacement Actions run 36501917649](https://github.com/thorinside/MidiBuffer/actions/runs/36501917649): **success**. Retained artifact ID `11005528262`; wrapper SHA-256 `cf34a82a6f696fceaf7df39b09da53ea125e5e12f5d1850ecd7babbe0788868a`.
+- [Current public release](https://github.com/thorinside/MidiBuffer/releases/tag/v0.5.0): release ID `398722819`, asset ID `596750345`. [Download MidiBuffer-v0.5.0.zip](https://github.com/thorinside/MidiBuffer/releases/download/v0.5.0/MidiBuffer-v0.5.0.zip).
+- Public archive SHA-256: `21ccb6abb0454ca9b47b086311df6b4f06393e916f43a8c76da0316e4d2cff32`. The unauthenticated download is byte-identical to the retained CI artifact's inner archive and contains exactly `programs/plug-ins/MidiBuffer.o`.
+- Shipped object SHA-256: `c34ad6af0054dea3d207a2c600526db564cead919f759cad2bdc5f0caadc1613`. The downloaded object is ELF32 little-endian ARM relocatable with exported `pluginEntry`; the first four bytes of its factory section were extracted and asserted equal to `ThMb`.
+- The original release and tag below were replaced only under the owner's explicit instruction, with an exact remote-tag lease. Their original build evidence remains historical. No new physical test is claimed for the GUID correction.
+
+## Initial publication (superseded by the correction above)
+
 This is release delivery evidence, not a new physical measurement or a replacement for the historical procedure documents. The approved Spec revision is `b3f6147cb54fb81b2e98a4bfbc72bc279cad33f47dc0d3865e4d49f537b52a4f`.
 
 ## Authorization and source
