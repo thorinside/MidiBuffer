@@ -25,7 +25,7 @@ SANITIZER_FLAGS := $(COMMON_FLAGS) -O1 -g -fsanitize=address,undefined -fno-omit
 ARM_FLAGS := $(COMMON_FLAGS) -Os -fPIC -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb \
 	-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-.PHONY: all test sanitize static-check traceability hardware inspect verify clean
+.PHONY: all test dylib sanitize static-check traceability hardware inspect verify clean
 
 all: verify
 
@@ -47,6 +47,24 @@ static-check:
 
 traceability: $(TRACEABILITY_MANIFEST) $(TRACEABILITY_CHECK)
 	$(PYTHON) $(TRACEABILITY_CHECK) $(TRACEABILITY_MANIFEST)
+
+# Native host build for nt_emu / VCV Rack (not part of the hardware build)
+HOST_OS := $(shell uname -s)
+ifeq ($(HOST_OS),Darwin)
+	HOST_DYLIB_EXT := dylib
+	HOST_DYLIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup
+else
+	HOST_DYLIB_EXT := so
+	HOST_DYLIB_LDFLAGS := -shared
+endif
+HOST_DYLIB := plugins/$(PLUGIN_NAME).$(HOST_DYLIB_EXT)
+
+dylib: $(HOST_DYLIB)
+
+$(HOST_DYLIB): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp
+	mkdir -p plugins
+	$(NATIVE_CXX) $(COMMON_FLAGS) -O2 -fPIC $(HOST_DYLIB_LDFLAGS) -o $@ $(SOURCE)
+	@echo "Built host plugin: $@"
 
 hardware: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 
