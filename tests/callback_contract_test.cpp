@@ -6054,6 +6054,19 @@ void verifyDrawNoninterferenceAndIncrementalCost() {
         static_cast<unsigned long long>(sizeof(midibuffer::RangeMotionState)));
 }
 
+void verifyMaximumFrameClockDelivery() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "maximum-frame clock host constructs");
+    startCapture(host);
+    host.clearFrames();
+    host.bus(1)[0] = 2.0f;
+    host.bus(1)[NT_globals.maxFramesPerStep - 1] = 2.0f;
+    host.step(static_cast<int>(NT_globals.maxFramesPerStep / 4U));
+    expect(snapshot(host).currentPulse == 2U &&
+               host.elapsedSamples() == NT_globals.maxFramesPerStep,
+           "maximum-frame step delivers the last clock edge");
+}
+
 void verifyHostOutputTrace() {
     midibuffer_test::resetTrace();
     for (size_t i = 0; i < 10496U; ++i) {
@@ -6149,6 +6162,7 @@ int main() {
     verifyInflightPresetSchedulingContinuation();
     verifyPresetSupportedBufferRangeAndCost();
     verifyDrawNoninterferenceAndIncrementalCost();
+    verifyMaximumFrameClockDelivery();
     verifyHostOutputTrace();
 
     if (gFailures != 0) {

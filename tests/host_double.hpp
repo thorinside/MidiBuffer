@@ -119,7 +119,8 @@ class HostDouble {
     uint8_t* sram_;
     uint8_t* dram_;
     int16_t values_[16];
-    float frames_[kNT_lastBus * 8];
+    float* frames_;
+    float* packedFrames_;
     uint64_t hostAllocatedBytes_;
     uint64_t elapsedSamples_;
 };

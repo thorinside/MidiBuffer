@@ -593,7 +593,7 @@ void midibufferTestSetDispatchSample(uint64_t sample) {
 
 const _NT_globals NT_globals = {
     48000,
-    8,
+    64,
     NULL,
     0,
     0,
@@ -852,7 +852,8 @@ HostDouble::HostDouble()
       sram_(NULL),
       dram_(NULL),
       values_(),
-      frames_(),
+      frames_(static_cast<float*>(std::calloc(kNT_lastBus * NT_globals.maxFramesPerStep, sizeof(float)))),
+      packedFrames_(static_cast<float*>(std::calloc(kNT_lastBus * NT_globals.maxFramesPerStep, sizeof(float)))),
       hostAllocatedBytes_(0),
       elapsedSamples_(0) {}
 
@@ -860,10 +861,12 @@ HostDouble::~HostDouble() {
     unregisterBinding(algorithm_);
     std::free(sram_);
     std::free(dram_);
+    std::free(frames_);
+    std::free(packedFrames_);
 }
 
 bool HostDouble::instantiate(int32_t bufferMegabytes) {
-    if (algorithm_ != NULL) {
+    if (algorithm_ != NULL || frames_ == NULL || packedFrames_ == NULL) {
         return false;
     }
     if (pluginEntry(kNT_selector_version, 0) != kNT_apiVersion13 ||
@@ -998,21 +1001,33 @@ bool HostDouble::loadPreset(const PresetImage& image,
 }
 
 void HostDouble::clearFrames() {
-    std::memset(frames_, 0, sizeof(frames_));
+    std::memset(frames_, 0, kNT_lastBus * NT_globals.maxFramesPerStep * sizeof(float));
 }
 
 float* HostDouble::bus(size_t oneBasedBus) {
     if (oneBasedBus == 0 || oneBasedBus > kNT_lastBus) {
         return NULL;
     }
-    return frames_ + (oneBasedBus - 1) * 8;
+    return frames_ + (oneBasedBus - 1) * NT_globals.maxFramesPerStep;
 }
 
 void HostDouble::step(int numFramesBy4) {
-    factory_->step(algorithm_, frames_, numFramesBy4);
-    if (numFramesBy4 > 0) {
-        elapsedSamples_ += static_cast<uint64_t>(numFramesBy4) * 4U;
+    if (numFramesBy4 <= 0 || static_cast<uint32_t>(numFramesBy4) > NT_globals.maxFramesPerStep / 4U) {
+        std::fprintf(stderr, "invalid host frame count\n");
+        std::abort();
     }
+    const size_t count = static_cast<size_t>(numFramesBy4) * 4U;
+    for (size_t busIndex = 0; busIndex < kNT_lastBus; ++busIndex) {
+        std::memcpy(packedFrames_ + busIndex * count,
+                    frames_ + busIndex * NT_globals.maxFramesPerStep,
+                    count * sizeof(float));
+    }
+    factory_->step(algorithm_, packedFrames_, numFramesBy4);
+    for (size_t busIndex = 0; busIndex < kNT_lastBus; ++busIndex) {
+        std::memcpy(frames_ + busIndex * NT_globals.maxFramesPerStep,
+                    packedFrames_ + busIndex * count, count * sizeof(float));
+    }
+    elapsedSamples_ += count;
 }
 
 }  // namespace midibuffer_test
