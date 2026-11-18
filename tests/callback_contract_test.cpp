@@ -1070,26 +1070,341 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
         "real-time, MIDI, UI, and draw callbacks perform no heap allocation");
 }
 
-void verifySetupSelectorsAreIndependentBeforeClock() {
+// ac-004: the production midiMessage setup observer, read through a bounded
+// snapshot copy. Each row starts from a fresh, unclocked, non-capturing host.
+typedef midibuffer::SetupObserver Setup;
+
+Setup setupState(midibuffer_test::HostDouble& host) {
+    Setup state = {};
+    expect(midibuffer::setupObserverSnapshot(host.algorithm(), state),
+           "setup observer snapshot is readable");
+    return state;
+}
+
+void selectRpn(midibuffer_test::HostDouble& host, uint8_t ch, uint8_t msb, uint8_t lsb) {
+    sendMidi(host, 0xb0 | ch, 101, msb);
+    sendMidi(host, 0xb0 | ch, 100, lsb);
+}
+
+void mcm(midibuffer_test::HostDouble& host, uint8_t ch, uint8_t count) {
+    selectRpn(host, ch, 0, 6);
+    sendMidi(host, 0xb0 | ch, 6, count);
+}
+
+void bend(midibuffer_test::HostDouble& host, uint8_t ch, int msb, int lsb = -1) {
+    selectRpn(host, ch, 0, 0);
+    if (msb >= 0) sendMidi(host, 0xb0 | ch, 6, static_cast<uint8_t>(msb));
+    if (lsb >= 0) sendMidi(host, 0xb0 | ch, 38, static_cast<uint8_t>(lsb));
+}
+
+bool value(const midibuffer::SetupValue& v, uint8_t state, uint16_t cents = 0) {
+    return v.state == state && v.cents == cents;
+}
+
+bool zone(const Setup& s, unsigned z, uint8_t state, uint8_t count) {
+    return s.zones[z].countState == state && s.zones[z].count == count;
+}
+
+struct SetupRow {
+    const char* requirement;
+    void (*drive)(midibuffer_test::HostDouble&);
+    bool (*holds)(const Setup&, const Setup& before);
+};
+
+const SetupRow kSetupRows[] = {
+    {"every channel keeps an independent complete selector",
+     [](midibuffer_test::HostDouble& h) {
+         for (uint8_t ch = 0; ch < 16; ++ch) selectRpn(h, ch, 0, ch);
+     },
+     [](const Setup& s, const Setup&) {
+         for (uint8_t ch = 0; ch < 16; ++ch) {
+             const midibuffer::SetupSelector& sel = s.selectors[ch];
+             if (sel.family != 1 || sel.validMask != 3 || sel.lsb != ch) return false;
+         }
+         return true;
+     }},
+    {"interleaved channels retain independent partial selectors",
+     [](midibuffer_test::HostDouble& h) {
+         sendMidi(h, 0xb0, 101, 0);
+         sendMidi(h, 0xb1, 100, 6);
+         sendMidi(h, 0xb0, 100, 6);
+         sendMidi(h, 0xb1, 6, 9);
+         sendMidi(h, 0xb0, 6, 4);
+     },
+     [](const Setup& s, const Setup&) {
+         return s.selectors[0].dataValid && s.selectors[1].validMask == 2 &&
+                !s.selectors[1].dataValid && zone(s, 0, midibuffer::kSetupKnown, 4) &&
+                zone(s, 1, midibuffer::kSetupUnknown, 0);
+     }},
+    {"null 127/127 selection disables RPN writes",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         selectRpn(h, 0, 127, 127);
+         sendMidi(h, 0xb0, 6, 9);
+         sendMidi(h, 0xb0, 38, 9);
+         sendMidi(h, 0xb0, 96, 0);
+     },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 0, midibuffer::kSetupKnown, 3) &&
+                value(s.zones[0].manager, midibuffer::kSetupKnown, 200);
+     }},
+    {"NRPN and fresh one-byte RPN family entry disable writes",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         sendMidi(h, 0xb0, 99, 0);
+         sendMidi(h, 0xb0, 98, 0);
+         sendMidi(h, 0xb0, 6, 10);
+         sendMidi(h, 0xb0, 101, 0);  // RPN MSB only after NRPN
+         sendMidi(h, 0xb0, 6, 11);
+         sendMidi(h, 0xb0, 97, 0);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].manager, midibuffer::kSetupKnown, 200) &&
+                s.selectors[0].validMask == 1 && !s.selectors[0].dataValid;
+     }},
+    {"LSB before MSB after a selection change cannot reuse old data",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         bend(h, 1, 2, 50);
+         selectRpn(h, 1, 0, 1);
+         selectRpn(h, 1, 0, 0);
+         sendMidi(h, 0xb1, 38, 10);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].member, midibuffer::kSetupIndeterminate) &&
+                value(s.zones[0].manager, midibuffer::kSetupKnown, 200);
+     }},
+    {"MSB after reset commits whole semitones with zero cents",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         bend(h, 1, 2, 50);
+         selectRpn(h, 1, 0, 1);
+         bend(h, 1, 3);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].member, midibuffer::kSetupKnown, 300);
+     }},
+    {"count 0 disables the zone and resets its sensitivities",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 15, 0); mcm(h, 0, 0); },
+     [](const Setup& s, const Setup&) {
+         for (uint8_t ch = 0; ch < 16; ++ch)
+             if (s.roles[ch] != midibuffer::kSetupRoleNone) return false;
+         return zone(s, 0, midibuffer::kSetupKnown, 0) &&
+                value(s.zones[0].member, midibuffer::kSetupKnown, 4800);
+     }},
+    {"count 1 assigns manager 1 and member 2 only",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 0, 1); },
+     [](const Setup& s, const Setup&) {
+         return s.roles[0] == midibuffer::kSetupRoleLowerManager &&
+                s.roles[1] == midibuffer::kSetupRoleLowerMember &&
+                s.roles[2] == midibuffer::kSetupRoleUnknown &&
+                zone(s, 1, midibuffer::kSetupUnknown, 0);
+     }},
+    {"count 14 disables the unknown opposite zone",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 15, 14); },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 0, midibuffer::kSetupKnown, 0) &&
+                s.roles[0] == midibuffer::kSetupRoleNone &&
+                s.roles[1] == midibuffer::kSetupRoleUpperMember &&
+                s.roles[15] == midibuffer::kSetupRoleUpperManager;
+     }},
+    {"count 15 claims every other channel",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 15, 3); mcm(h, 0, 15); },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 1, midibuffer::kSetupKnown, 0) &&
+                s.roles[15] == midibuffer::kSetupRoleLowerMember;
+     }},
+    {"invalid count 16 makes the target and active opposite indeterminate",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 0, 3); mcm(h, 15, 3); mcm(h, 0, 16); },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 0, midibuffer::kSetupIndeterminate, 3) &&
+                value(s.zones[0].member, midibuffer::kSetupIndeterminate, 4800) &&
+                s.zones[1].countState == midibuffer::kSetupIndeterminate &&
+                value(s.zones[1].manager, midibuffer::kSetupKnown, 200) &&
+                s.roles[1] == midibuffer::kSetupRoleUnknown;
+     }},
+    {"MCM on non-manager channels and CC38 have no MCM meaning",
+     [](midibuffer_test::HostDouble& h) {
+         for (uint8_t ch = 1; ch < 15; ++ch) mcm(h, ch, 5);
+         selectRpn(h, 0, 0, 6);
+         sendMidi(h, 0xb0, 38, 4);
+     },
+     [](const Setup& s, const Setup& before) {
+         return std::memcmp(s.zones, before.zones, sizeof(s.zones)) == 0 &&
+                std::memcmp(s.roles, before.roles, sizeof(s.roles)) == 0;
+     }},
+    {"overlapping latest MCM shrinks the opposite zone to fit",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 0, 10); mcm(h, 15, 7); },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 0, midibuffer::kSetupKnown, 7) &&
+                zone(s, 1, midibuffer::kSetupKnown, 7) &&
+                s.roles[7] == midibuffer::kSetupRoleLowerMember &&
+                s.roles[8] == midibuffer::kSetupRoleUpperMember;
+     }},
+    {"disabling one zone leaves the other configuration intact",
+     [](midibuffer_test::HostDouble& h) { mcm(h, 0, 10); mcm(h, 15, 7); mcm(h, 15, 0); },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 0, midibuffer::kSetupKnown, 7) &&
+                zone(s, 1, midibuffer::kSetupKnown, 0) &&
+                s.roles[8] == midibuffer::kSetupRoleNone;
+     }},
+    {"repeated equal-count MCM resets sensitivities after a range change",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         bend(h, 0, 12);
+         bend(h, 2, 24);
+         mcm(h, 0, 3);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].manager, midibuffer::kSetupKnown, 200) &&
+                value(s.zones[0].member, midibuffer::kSetupKnown, 4800);
+     }},
+    {"latest member receipt wins regardless of channel order",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 5);
+         bend(h, 3, 12);
+         bend(h, 2, 24);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].member, midibuffer::kSetupKnown, 2400) &&
+                value(s.zones[0].manager, midibuffer::kSetupKnown, 200);
+     }},
+    {"manager sensitivity stays independent of member receipts",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 15, 4);
+         bend(h, 15, 1, 0);
+         bend(h, 11, 2, 0);
+         bend(h, 14, 3, 0);
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[1].manager, midibuffer::kSetupKnown, 100) &&
+                value(s.zones[1].member, midibuffer::kSetupKnown, 300);
+     }},
+    {"relative RPN0/0 invalidates only the targeted sensitivity",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         mcm(h, 15, 3);
+         selectRpn(h, 2, 0, 0);
+         sendMidi(h, 0xb2, 96, 0);
+         sendMidi(h, 0xb2, 38, 5);  // relative data cannot be completed
+     },
+     [](const Setup& s, const Setup&) {
+         return value(s.zones[0].member, midibuffer::kSetupIndeterminate) &&
+                value(s.zones[0].manager, midibuffer::kSetupKnown, 200) &&
+                value(s.zones[1].member, midibuffer::kSetupKnown, 4800) &&
+                zone(s, 0, midibuffer::kSetupKnown, 3);
+     }},
+    {"relative RPN6 invalidates the targeted zone without writing a count",
+     [](midibuffer_test::HostDouble& h) {
+         mcm(h, 0, 3);
+         mcm(h, 15, 3);
+         selectRpn(h, 15, 0, 6);
+         sendMidi(h, 0xbf, 97, 0);
+         selectRpn(h, 5, 0, 6);
+         sendMidi(h, 0xb5, 96, 0);  // non-manager relative MCM: no meaning
+     },
+     [](const Setup& s, const Setup&) {
+         return zone(s, 1, midibuffer::kSetupIndeterminate, 3) &&
+                value(s.zones[1].member, midibuffer::kSetupIndeterminate, 4800) &&
+                s.zones[0].countState == midibuffer::kSetupIndeterminate &&
+                value(s.zones[0].member, midibuffer::kSetupKnown, 4800);
+     }},
+};
+
+void verifySetupObserverTransactionsAndZones() {
+    for (const SetupRow& row : kSetupRows) {
+        midibuffer_test::HostDouble host;
+        expect(host.instantiate(1), "setup observer host constructs");
+        const Setup before = setupState(host);
+        row.drive(host);
+        if (!row.holds(setupState(host), before)) {
+            std::fprintf(stderr, "FAIL: setup row: %s\n", row.requirement);
+            ++gFailures;
+        }
+        expect(snapshot(host).eventCount == 0, "setup never enters the performance ring");
+    }
+}
+
+// ac-004: exact cents and unsupported encodings, applied to a known member.
+void verifySetupSensitivityEncodings() {
+    struct Encoding { int msb, lsb; uint8_t state; uint16_t cents; const char* name; };
+    const Encoding rows[] = {
+        {0, 1, midibuffer::kSetupKnown, 1, "0.01 semitone is exact"},
+        {2, 50, midibuffer::kSetupKnown, 250, "2.50 semitones are exact"},
+        {95, 99, midibuffer::kSetupKnown, 9599, "95.99 semitones are exact"},
+        {96, 0, midibuffer::kSetupKnown, 9600, "96.00 semitones are exact"},
+        {96, 1, midibuffer::kSetupUnsupported, 0, "96.01 semitones are unsupported"},
+        {0, 100, midibuffer::kSetupUnsupported, 0, "LSB 100 is unsupported"},
+        {97, -1, midibuffer::kSetupUnsupported, 0, "MSB 97 is unsupported"},
+    };
+    for (const Encoding& row : rows) {
+        midibuffer_test::HostDouble host;
+        expect(host.instantiate(1), "sensitivity host constructs");
+        mcm(host, 0, 4);
+        bend(host, 2, row.msb, row.lsb);
+        const Setup s = setupState(host);
+        expect(value(s.zones[0].member, row.state, row.cents) &&
+                   value(s.zones[0].manager, midibuffer::kSetupKnown, 200) &&
+                   zone(s, 0, midibuffer::kSetupKnown, 4),
+               row.name);
+    }
+}
+
+// ac-004: membership changes advance only affected channels' generations.
+void verifySetupMembershipInvalidationIsTargeted() {
     midibuffer_test::HostDouble host;
-    expect(host.instantiate(1), "selector host constructs");
-    midibuffer::SetupSelectorSnapshot first = {}, second = {};
-    sendMidi(host, 0xb0, 101, 0);
-    sendMidi(host, 0xb1, 100, 6);
-    sendMidi(host, 0xb0, 100, 0);
-    sendMidi(host, 0xb0, 6, 2);
-    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 0, first) &&
-           first.family == 1 && first.validMask == 3 && first.dataValid &&
-           first.dataMsb == 2, "complete selector accepts data before clock");
-    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 1, second) &&
-           second.validMask == 2 && !second.dataValid,
-           "interleaved channels retain independent partial selectors");
-    sendMidi(host, 0xb0, 99, 0);
-    sendMidi(host, 0xb0, 101, 0);
-    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 0, first) &&
-           first.validMask == 1 && !first.dataValid,
-           "family changes require both fresh selector bytes");
-    expect(snapshot(host).eventCount == 0, "setup does not enter the performance ring");
+    expect(host.instantiate(1), "membership host constructs");
+    mcm(host, 0, 10);
+    mcm(host, 15, 3);
+    const Setup before = setupState(host);
+    mcm(host, 15, 7);  // lower shrinks 10 -> 7; upper grows 3 -> 7
+    const Setup after = setupState(host);
+    bool targeted = true;
+    for (uint8_t ch = 0; ch < 16; ++ch) {
+        const bool changed = ch >= 8 && ch <= 11;
+        targeted = targeted && ((after.membershipGeneration[ch] !=
+                                 before.membershipGeneration[ch]) == changed);
+    }
+    expect(targeted, "only channels whose zone role changed lose expression knownness");
+}
+
+// ac-004: observation is admitted per recording channel while capture is Off
+// and before clock, and setup bytes never alter ordinary capture or output.
+void verifySetupObservedBeforeCaptureWithoutChangingOrdinaryBytes() {
+    midibuffer_test::HostDouble filtered;
+    expect(filtered.instantiate(1), "admission host constructs");
+    changeParameter(filtered, kRecordingChannelParameter, 3);
+    mcm(filtered, 0, 4);
+    expect(zone(setupState(filtered), 0, midibuffer::kSetupUnknown, 0),
+           "non-admitted channels are not observed");
+    changeParameter(filtered, kRecordingChannelParameter, 1);
+    midibuffer_test::resetTrace();
+    mcm(filtered, 0, 4);
+    expect(zone(setupState(filtered), 0, midibuffer::kSetupKnown, 4) &&
+               midibuffer_test::trace().midiCallCount == 0,
+           "admitted setup is observed while Off and pre-clock without output");
+
+    midibuffer_test::HostDouble plain, observed;
+    expect(plain.instantiate(1) && observed.instantiate(1), "comparison hosts construct");
+    midibuffer_test::HostDouble* hosts[] = {&plain, &observed};
+    for (midibuffer_test::HostDouble* host : hosts) {
+        if (host == &observed) mcm(*host, 0, 3);  // before capture and clock
+        startCapture(*host);
+        acquireClock(*host);
+        sendMidi(*host, 0x91, 60, 100);
+        if (host == &observed) {
+            bend(*host, 1, 2, 50);
+            sendMidi(*host, 0xb1, 96, 0);
+        }
+        sendMidi(*host, 0xe1, 0, 72);
+        sendMidi(*host, 0xb1, 74, 30);
+        clockPulse(*host);
+        sendMidi(*host, 0x81, 60, 0);
+        clockPulse(*host);
+    }
+    const HistoryImage expected = captureHistory(plain);
+    expect(expected.count == 4 && sameHistory(expected, observed),
+           "setup observation leaves ordinary admitted bytes unchanged");
 }
 
 void verifyClockedCaptureAndReacquisition() {
@@ -6154,7 +6469,10 @@ int main() {
     if (host.algorithm() != NULL) {
         verifyBoundaryCallbacks(host);
     }
-    verifySetupSelectorsAreIndependentBeforeClock();
+    verifySetupObserverTransactionsAndZones();
+    verifySetupSensitivityEncodings();
+    verifySetupMembershipInvalidationIsTargeted();
+    verifySetupObservedBeforeCaptureWithoutChangingOrdinaryBytes();
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();

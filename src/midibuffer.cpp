@@ -182,12 +182,6 @@ struct PendingPlaybackEndings {
     uint16_t sustainActiveChannels;
 };
 
-struct SetupSelector {
-    uint8_t family, msb, lsb, validMask, dataMsb;
-    bool dataValid;
-    uint32_t generation;
-};
-
 struct Algorithm : public _NT_algorithm {
     Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
         : _NT_algorithm(),
@@ -527,8 +521,8 @@ struct MpeArenaReservation {
     uint8_t checkpoints[409U * 536U];
     uint8_t journal[256U * 640U];
     uint8_t contexts[4U * 512U];
-    SetupSelector selectors[16];
-    uint8_t ownersAndControl[104416U - sizeof(SetupSelector) * 16U];
+    SetupObserver setup;
+    uint8_t ownersAndControl[104416U - sizeof(SetupObserver)];
     uint8_t alignmentAndSlack[34760U];
 };
 static_assert(sizeof(MpeArenaReservation) == kMpeArenaBytes,
@@ -557,8 +551,9 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
         new (memory.sram) Algorithm(memory.dram, recordingBytes);
     MpeArenaReservation* arena = reinterpret_cast<MpeArenaReservation*>(
         memory.dram + recordingBytes);
-    for (unsigned i = 0; i < 16; ++i) {
-        new (&arena->selectors[i]) SetupSelector();
+    new (&arena->setup) SetupObserver();
+    for (unsigned channel = 0; channel < 16; ++channel) {
+        arena->setup.roles[channel] = kSetupRoleUnknown;
     }
     algorithm->parameters = kParameters;
     algorithm->parameterPages = &kParameterPages;
@@ -1902,21 +1897,103 @@ void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     algorithm->state.lastRealtime = byte;
 }
 
-void observeSetupSelector(Algorithm& algorithm, uint8_t status,
-                          uint8_t controller, uint8_t value) {
-    if ((status & 0xf0U) != 0xb0U || value > 127U) return;
+SetupObserver& setupObserver(Algorithm& algorithm) {
+    return reinterpret_cast<MpeArenaReservation*>(
+               reinterpret_cast<uint8_t*>(algorithm.recordingEvents) +
+               algorithm.recordingBufferBytes)
+        ->setup;
+}
+
+bool zoneActive(const SetupZone& zone) {
+    return zone.countState == kSetupKnown && zone.count > 0U;
+}
+
+uint8_t setupRole(const SetupObserver& setup, uint8_t channel) {
+    const SetupZone& lower = setup.zones[0];
+    const SetupZone& upper = setup.zones[1];
+    if (zoneActive(lower) && channel <= lower.count) {
+        return channel == 0U ? kSetupRoleLowerManager : kSetupRoleLowerMember;
+    }
+    if (zoneActive(upper) && channel >= 15U - upper.count) {
+        return channel == 15U ? kSetupRoleUpperManager : kSetupRoleUpperMember;
+    }
+    if (lower.countState != kSetupKnown || upper.countState != kSetupKnown) {
+        return kSetupRoleUnknown;
+    }
+    return kSetupRoleNone;
+}
+
+// Channels whose zone membership changed (including to unknown) advance their
+// generation so downstream expression context is invalidated, never neutralized.
+void refreshSetupRoles(SetupObserver& setup) {
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        const uint8_t role = setupRole(setup, channel);
+        if (role != setup.roles[channel]) {
+            setup.roles[channel] = role;
+            ++setup.membershipGeneration[channel];
+        }
+    }
+}
+
+void applyManagerConfiguration(SetupObserver& setup, unsigned zoneIndex,
+                               uint8_t count) {
+    SetupZone& zone = setup.zones[zoneIndex];
+    SetupZone& opposite = setup.zones[1U - zoneIndex];
+    zone.count = count;
+    zone.countState = kSetupKnown;
+    zone.manager = {200U, kSetupKnown};
+    zone.member = {4800U, kSetupKnown};
+    if (count >= 14U) {
+        opposite.count = 0;
+        opposite.countState = kSetupKnown;
+    } else if (zoneActive(opposite) && count + opposite.count > 14U) {
+        opposite.count = static_cast<uint8_t>(14U - count);
+    }
+    refreshSetupRoles(setup);
+}
+
+// The receiver's result of a relative or out-of-range MCM cannot be known.
+// An active opposite zone could have been shrunk or disabled by it.
+void invalidateManagerConfiguration(SetupObserver& setup, unsigned zoneIndex) {
+    SetupZone& zone = setup.zones[zoneIndex];
+    SetupZone& opposite = setup.zones[1U - zoneIndex];
+    zone.countState = kSetupIndeterminate;
+    zone.manager.state = kSetupIndeterminate;
+    zone.member.state = kSetupIndeterminate;
+    if (zoneActive(opposite)) {
+        opposite.countState = kSetupIndeterminate;
+    }
+    refreshSetupRoles(setup);
+}
+
+void writeSensitivity(SetupObserver& setup, uint8_t channel, uint16_t cents,
+                      uint8_t state) {
+    SetupValue value = {state == kSetupKnown ? cents : uint16_t(0), state};
+    switch (setup.roles[channel]) {
+    case kSetupRoleLowerManager: setup.zones[0].manager = value; break;
+    case kSetupRoleLowerMember: setup.zones[0].member = value; break;
+    case kSetupRoleUpperManager: setup.zones[1].manager = value; break;
+    case kSetupRoleUpperMember: setup.zones[1].member = value; break;
+    default: break;
+    }
+}
+
+// Observes only absolute MCM (RPN 0/6) and Pitch Bend Sensitivity (RPN 0/0)
+// before capture/clock gating, under the recording-channel admission rule.
+void observeSetup(Algorithm& algorithm, uint8_t status, uint8_t controller,
+                  uint8_t value) {
+    if ((status & 0xf0U) != 0xb0U || controller > 127U || value > 127U) return;
     const uint8_t channel = status & 15U;
     int admitted = algorithm.v == NULL ? 0 : algorithm.v[kParameterRecordingChannel];
     if (admitted < 0 || admitted > 16) admitted = 0;
     if (admitted != 0 && admitted != channel + 1) return;
-    MpeArenaReservation* arena = reinterpret_cast<MpeArenaReservation*>(
-        reinterpret_cast<uint8_t*>(algorithm.recordingEvents) + algorithm.recordingBufferBytes);
-    SetupSelector& selector = arena->selectors[channel];
-    uint8_t family = 0, mask = 0;
+    SetupObserver& setup = setupObserver(algorithm);
+    SetupSelector& selector = setup.selectors[channel];
+    uint8_t family = 0;
     if (controller == 101U || controller == 100U) family = 1;
     if (controller == 99U || controller == 98U) family = 2;
     if (family != 0) {
-        mask = (controller == 101U || controller == 99U) ? 1U : 2U;
+        const uint8_t mask = (controller == 101U || controller == 99U) ? 1U : 2U;
         if (selector.family != family) {
             selector.family = family;
             selector.validMask = 0;
@@ -1930,12 +2007,49 @@ void observeSetupSelector(Algorithm& algorithm, uint8_t status,
         }
         part = value;
         selector.validMask |= mask;
-    } else if (controller == 6U) {
-        selector.dataValid = selector.family == 1U && selector.validMask == 3U &&
-                             !(selector.msb == 127U && selector.lsb == 127U);
+        return;
+    }
+    if (controller != 6U && controller != 38U && controller != 96U &&
+        controller != 97U) {
+        return;
+    }
+    const bool rpnSelected = selector.family == 1U && selector.validMask == 3U &&
+                             selector.msb == 0U;
+    const bool sensitivity = rpnSelected && selector.lsb == 0U;
+    const bool manager = channel == 0U || channel == 15U;
+    const bool configuration = rpnSelected && selector.lsb == 6U && manager;
+    const unsigned zoneIndex = channel == 0U ? 0U : 1U;
+    if (controller == 6U) {
+        selector.dataValid = rpnSelected;
         selector.dataMsb = value;
-    } else if (controller == 96U || controller == 97U) {
+        if (sensitivity) {
+            writeSensitivity(setup, channel, static_cast<uint16_t>(value * 100U),
+                             value <= 96U ? kSetupKnown : kSetupUnsupported);
+        } else if (configuration) {
+            if (value <= 15U) {
+                applyManagerConfiguration(setup, zoneIndex, value);
+            } else {
+                invalidateManagerConfiguration(setup, zoneIndex);
+            }
+        }
+    } else if (controller == 38U) {
+        if (!sensitivity) return;  // CC38 carries no MCM meaning.
+        if (!selector.dataValid) {
+            // LSB before MSB combines with receiver data we must not reuse.
+            writeSensitivity(setup, channel, 0, kSetupIndeterminate);
+            return;
+        }
+        const uint16_t cents = static_cast<uint16_t>(selector.dataMsb * 100U + value);
+        const bool supported = selector.dataMsb <= 96U && value <= 99U && cents <= 9600U;
+        writeSensitivity(setup, channel, cents,
+                         supported ? kSetupKnown : kSetupUnsupported);
+    } else {
         selector.dataValid = false;
+        if (sensitivity) {
+            writeSensitivity(setup, channel, 0, kSetupIndeterminate);
+        } else if (configuration) {
+            invalidateManagerConfiguration(setup, zoneIndex);
+        }
     }
 }
 
@@ -1950,7 +2064,7 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     algorithm->state.lastMidi[1] = byte1;
     algorithm->state.lastMidi[2] = byte2;
 
-    observeSetupSelector(*algorithm, byte0, byte1, byte2);
+    observeSetup(*algorithm, byte0, byte1, byte2);
 
     const bool emergencyController =
         (byte0 & 0xf0U) == 0xb0U && (byte1 == 120U || byte1 == 123U);
@@ -3505,14 +3619,12 @@ Algorithm* asAlgorithm(_NT_algorithm* self) {
 } // namespace
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
-bool setupSelectorSnapshot(const _NT_algorithm* self, uint8_t channel,
-                           SetupSelectorSnapshot& snapshot) {
-    if (self == NULL || channel >= 16U) return false;
+bool setupObserverSnapshot(const _NT_algorithm* self, SetupObserver& snapshot) {
+    if (self == NULL) return false;
     const Algorithm* algorithm = static_cast<const Algorithm*>(self);
-    const MpeArenaReservation* arena = reinterpret_cast<const MpeArenaReservation*>(
-        reinterpret_cast<const uint8_t*>(algorithm->recordingEvents) + algorithm->recordingBufferBytes);
-    const SetupSelector& s = arena->selectors[channel];
-    snapshot = {s.family, s.msb, s.lsb, s.validMask, s.dataMsb, s.dataValid, s.generation};
+    snapshot = reinterpret_cast<const MpeArenaReservation*>(
+        reinterpret_cast<const uint8_t*>(algorithm->recordingEvents) +
+        algorithm->recordingBufferBytes)->setup;
     return true;
 }
 #endif

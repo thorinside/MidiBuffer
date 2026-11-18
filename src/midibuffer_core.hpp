@@ -101,19 +101,58 @@ struct CaptureSnapshot {
     PulseRange activeSelection;
 };
 
+// Per-channel absolute RPN0/0 and MCM RPN0/6 observer state. It lives in the
+// separately reserved DRAM sidecar and is never part of the performance ring.
+enum SetupKnowledge : uint8_t {
+    kSetupUnknown = 0,
+    kSetupKnown = 1,
+    kSetupUnsupported = 2,     // received encoding outside 0..9600 cents
+    kSetupIndeterminate = 3,   // relative, LSB-before-MSB or invalid MCM count
+};
+
+enum SetupRole : uint8_t {
+    kSetupRoleUnknown = 0,
+    kSetupRoleNone,
+    kSetupRoleLowerManager,
+    kSetupRoleLowerMember,
+    kSetupRoleUpperManager,
+    kSetupRoleUpperMember,
+};
+
+struct SetupSelector {
+    uint8_t family;      // 0 none, 1 RPN, 2 NRPN
+    uint8_t msb, lsb, validMask, dataMsb;
+    bool dataValid;      // CC6 received for the current selection
+    uint32_t generation; // increments whenever the selection changes
+};
+
+struct SetupValue {
+    uint16_t cents;
+    uint8_t state;       // SetupKnowledge
+};
+
+struct SetupZone {
+    uint8_t count;       // member channels, 0 = disabled
+    uint8_t countState;  // SetupKnowledge
+    SetupValue manager;
+    SetupValue member;   // latest supported member receipt, zone-wide
+};
+
+struct SetupObserver {
+    SetupSelector selectors[16];
+    SetupZone zones[2];  // 0 lower (manager channel 1), 1 upper (channel 16)
+    uint8_t roles[16];   // SetupRole
+    uint32_t membershipGeneration[16];
+};
+
 // Read-only seams used by the timeline/playback layers and native host tests.
 CaptureSnapshot captureSnapshot(const _NT_algorithm* self);
 bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
                      RecordedEvent& event);
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
-struct SetupSelectorSnapshot {
-    uint8_t family, msb, lsb, validMask, dataMsb;
-    bool dataValid;
-    uint32_t generation;
-};
-bool setupSelectorSnapshot(const _NT_algorithm* self, uint8_t channel,
-                           SetupSelectorSnapshot& snapshot);
+// Bounded read-only copy of the production setup observer state.
+bool setupObserverSnapshot(const _NT_algorithm* self, SetupObserver& snapshot);
 // Installs one synthetic retained interval envelope without iterating through
 // its pulse span. This keeps wide-span callback tests practical while using
 // the production view/navigation implementation.
