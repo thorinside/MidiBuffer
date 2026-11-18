@@ -182,6 +182,12 @@ struct PendingPlaybackEndings {
     uint16_t sustainActiveChannels;
 };
 
+struct SetupSelector {
+    uint8_t family, msb, lsb, validMask, dataMsb;
+    bool dataValid;
+    uint32_t generation;
+};
+
 struct Algorithm : public _NT_algorithm {
     Algorithm(uint8_t* recordingBuffer, uint32_t recordingBufferBytesValue)
         : _NT_algorithm(),
@@ -521,7 +527,8 @@ struct MpeArenaReservation {
     uint8_t checkpoints[409U * 536U];
     uint8_t journal[256U * 640U];
     uint8_t contexts[4U * 512U];
-    uint8_t ownersAndControl[104416U];
+    SetupSelector selectors[16];
+    uint8_t ownersAndControl[104416U - sizeof(SetupSelector) * 16U];
     uint8_t alignmentAndSlack[34760U];
 };
 static_assert(sizeof(MpeArenaReservation) == kMpeArenaBytes,
@@ -548,6 +555,11 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
 
     Algorithm* algorithm =
         new (memory.sram) Algorithm(memory.dram, recordingBytes);
+    MpeArenaReservation* arena = reinterpret_cast<MpeArenaReservation*>(
+        memory.dram + recordingBytes);
+    for (unsigned i = 0; i < 16; ++i) {
+        new (&arena->selectors[i]) SetupSelector();
+    }
     algorithm->parameters = kParameters;
     algorithm->parameterPages = &kParameterPages;
     return algorithm;
@@ -1890,6 +1902,43 @@ void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     algorithm->state.lastRealtime = byte;
 }
 
+void observeSetupSelector(Algorithm& algorithm, uint8_t status,
+                          uint8_t controller, uint8_t value) {
+    if ((status & 0xf0U) != 0xb0U || value > 127U) return;
+    const uint8_t channel = status & 15U;
+    int admitted = algorithm.v == NULL ? 0 : algorithm.v[kParameterRecordingChannel];
+    if (admitted < 0 || admitted > 16) admitted = 0;
+    if (admitted != 0 && admitted != channel + 1) return;
+    MpeArenaReservation* arena = reinterpret_cast<MpeArenaReservation*>(
+        reinterpret_cast<uint8_t*>(algorithm.recordingEvents) + algorithm.recordingBufferBytes);
+    SetupSelector& selector = arena->selectors[channel];
+    uint8_t family = 0, mask = 0;
+    if (controller == 101U || controller == 100U) family = 1;
+    if (controller == 99U || controller == 98U) family = 2;
+    if (family != 0) {
+        mask = (controller == 101U || controller == 99U) ? 1U : 2U;
+        if (selector.family != family) {
+            selector.family = family;
+            selector.validMask = 0;
+            selector.dataValid = false;
+            ++selector.generation;
+        }
+        uint8_t& part = mask == 1U ? selector.msb : selector.lsb;
+        if ((selector.validMask & mask) == 0 || part != value) {
+            selector.dataValid = false;
+            ++selector.generation;
+        }
+        part = value;
+        selector.validMask |= mask;
+    } else if (controller == 6U) {
+        selector.dataValid = selector.family == 1U && selector.validMask == 3U &&
+                             !(selector.msb == 127U && selector.lsb == 127U);
+        selector.dataMsb = value;
+    } else if (controller == 96U || controller == 97U) {
+        selector.dataValid = false;
+    }
+}
+
 void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
                  uint8_t byte2) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
@@ -1900,6 +1949,8 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
     algorithm->state.lastMidi[0] = byte0;
     algorithm->state.lastMidi[1] = byte1;
     algorithm->state.lastMidi[2] = byte2;
+
+    observeSetupSelector(*algorithm, byte0, byte1, byte2);
 
     const bool emergencyController =
         (byte0 & 0xf0U) == 0xb0U && (byte1 == 120U || byte1 == 123U);
@@ -3452,6 +3503,19 @@ Algorithm* asAlgorithm(_NT_algorithm* self) {
 }
 
 } // namespace
+
+#if defined(MIDIBUFFER_NATIVE_TEST)
+bool setupSelectorSnapshot(const _NT_algorithm* self, uint8_t channel,
+                           SetupSelectorSnapshot& snapshot) {
+    if (self == NULL || channel >= 16U) return false;
+    const Algorithm* algorithm = static_cast<const Algorithm*>(self);
+    const MpeArenaReservation* arena = reinterpret_cast<const MpeArenaReservation*>(
+        reinterpret_cast<const uint8_t*>(algorithm->recordingEvents) + algorithm->recordingBufferBytes);
+    const SetupSelector& s = arena->selectors[channel];
+    snapshot = {s.family, s.msb, s.lsb, s.validMask, s.dataMsb, s.dataValid, s.generation};
+    return true;
+}
+#endif
 
 bool musicalDurationFromPulses(uint64_t pulseIntervals,
                                uint32_t pulsesPerBeat,

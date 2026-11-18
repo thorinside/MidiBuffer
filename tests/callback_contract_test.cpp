@@ -1070,6 +1070,28 @@ void verifyBoundaryCallbacks(midibuffer_test::HostDouble& host) {
         "real-time, MIDI, UI, and draw callbacks perform no heap allocation");
 }
 
+void verifySetupSelectorsAreIndependentBeforeClock() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "selector host constructs");
+    midibuffer::SetupSelectorSnapshot first = {}, second = {};
+    sendMidi(host, 0xb0, 101, 0);
+    sendMidi(host, 0xb1, 100, 6);
+    sendMidi(host, 0xb0, 100, 0);
+    sendMidi(host, 0xb0, 6, 2);
+    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 0, first) &&
+           first.family == 1 && first.validMask == 3 && first.dataValid &&
+           first.dataMsb == 2, "complete selector accepts data before clock");
+    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 1, second) &&
+           second.validMask == 2 && !second.dataValid,
+           "interleaved channels retain independent partial selectors");
+    sendMidi(host, 0xb0, 99, 0);
+    sendMidi(host, 0xb0, 101, 0);
+    expect(midibuffer::setupSelectorSnapshot(host.algorithm(), 0, first) &&
+           first.validMask == 1 && !first.dataValid,
+           "family changes require both fresh selector bytes");
+    expect(snapshot(host).eventCount == 0, "setup does not enter the performance ring");
+}
+
 void verifyClockedCaptureAndReacquisition() {
     midibuffer_test::HostDouble host;
     expect(host.instantiate(1), "clock/capture trace host constructs");
@@ -6132,6 +6154,7 @@ int main() {
     if (host.algorithm() != NULL) {
         verifyBoundaryCallbacks(host);
     }
+    verifySetupSelectorsAreIndependentBeforeClock();
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();

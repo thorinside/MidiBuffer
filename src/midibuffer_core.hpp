@@ -107,6 +107,13 @@ bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
                      RecordedEvent& event);
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
+struct SetupSelectorSnapshot {
+    uint8_t family, msb, lsb, validMask, dataMsb;
+    bool dataValid;
+    uint32_t generation;
+};
+bool setupSelectorSnapshot(const _NT_algorithm* self, uint8_t channel,
+                           SetupSelectorSnapshot& snapshot);
 // Installs one synthetic retained interval envelope without iterating through
 // its pulse span. This keeps wide-span callback tests practical while using
 // the production view/navigation implementation.
