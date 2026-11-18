@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -4538,6 +4540,11 @@ void verifySharedPlaybackParameter() {
            "successive left presses toggle one host value through offset API v13 UI setters without recursion or allocation");
 }
 
+size_t drainedMidiCalls = 0;
+void countDrainedMidiCalls(const midibuffer_test::MidiCall*, size_t count) {
+    drainedMidiCalls += count;
+}
+
 void verifyOneShotClearRecording() {
     midibuffer_test::HostDouble enabled;
     expect(enabled.instantiate(1),
@@ -4743,8 +4750,15 @@ void verifyOneShotClearRecording() {
                                              ownedPulse + 1U),
            "full-capacity fixture keeps generated endings outside the selected attack interval");
     changeParameter(maximum, kPlaybackParameter, 1);
+    midibuffer_test::resetTrace();
+    drainedMidiCalls = 0;
+    midibuffer_test::setMidiTraceDrain(countDrainedMidiCalls);
     clockPulse(maximum);
     noClockBlock(maximum);
+    midibuffer_test::setMidiTraceDrain(NULL);
+    expect(drainedMidiCalls + midibuffer_test::trace().midiCallCount ==
+               capacity - maximumOwnedOutputs,
+           "full-capacity fixture drains every playback output");
     expect(snapshot(maximum).playbackActive &&
                snapshot(maximum).pendingNoteEndingCount == maximumOwnedNotes &&
                snapshot(maximum).pendingSustainReleaseCount ==
@@ -6041,6 +6055,26 @@ void verifyDrawNoninterferenceAndIncrementalCost() {
 }
 
 void verifyHostOutputTrace() {
+    midibuffer_test::resetTrace();
+    for (size_t i = 0; i < 10496U; ++i) {
+        midibuffer::nt_host::sendMidi3(kNT_destinationUSB, 0xB0, 7,
+                                      static_cast<uint8_t>(i & 127U));
+    }
+    const midibuffer_test::Trace& full = midibuffer_test::trace();
+    bool ordered = full.midiCallCount == 10496U;
+    for (size_t i = 0; i < full.midiCallCount; ++i) {
+        ordered = ordered && full.midiCalls[i].bytes[2] == (i & 127U);
+    }
+    expect(ordered, "trace retains the complete ordered 10496-call envelope");
+    const pid_t child = fork();
+    if (child == 0) {
+        midibuffer::nt_host::sendMidiByte(kNT_destinationUSB, 0xF8);
+        _exit(0);
+    }
+    int status = 0;
+    expect(child > 0 && waitpid(child, &status, 0) == child &&
+               WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+           "trace overflow fails explicitly rather than silently truncating");
     midibuffer_test::resetTrace();
     midibuffer::nt_host::sendMidiByte(kNT_destinationInternal, 0xF8);
     midibuffer::nt_host::sendMidi2(kNT_destinationUSB, 0xD0, 64);

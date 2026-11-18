@@ -16,6 +16,7 @@ uint64_t gHeapAllocationCount = 0;
 uint64_t gPendingDispatchSample = 0;
 uint32_t gParameterCallbackDepth = 0;
 midibuffer_test::Trace gTrace;
+midibuffer_test::MidiTraceDrain gMidiTraceDrain = NULL;
 
 const uint32_t kHostParameterOffset = 3U;
 
@@ -224,7 +225,12 @@ void drawFramebufferLine(int x0, int y0, int x1, int y1, int colour) {
 void recordMidi(uint32_t destination, uint8_t size, uint8_t byte0,
                 uint8_t byte1, uint8_t byte2) {
     if (gTrace.midiCallCount >= ARRAY_SIZE(gTrace.midiCalls)) {
-        return;
+        if (gMidiTraceDrain == NULL) {
+            std::fprintf(stderr, "MIDI trace capacity exceeded; drain before continuing\n");
+            std::abort();
+        }
+        gMidiTraceDrain(gTrace.midiCalls, gTrace.midiCallCount);
+        gTrace.midiCallCount = 0;
     }
     midibuffer_test::MidiCall& call =
         gTrace.midiCalls[gTrace.midiCallCount++];
@@ -680,6 +686,10 @@ void NT_setParameterFromUi(uint32_t algorithmIndex, uint32_t parameter,
 }  // extern "C"
 
 namespace midibuffer_test {
+
+void setMidiTraceDrain(MidiTraceDrain drain) {
+    gMidiTraceDrain = drain;
+}
 
 void resetTrace() {
     std::memset(&gTrace, 0, sizeof(gTrace));

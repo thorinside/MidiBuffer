@@ -49,9 +49,8 @@ struct Trace {
     size_t drawCallCount;
     ShapeCall shapeCalls[512];
     size_t shapeCallCount;
-    // Large enough to observe the complete fixed playback-ownership cleanup:
-    // 16 channels * 128 notes, followed by sustain-off on all 16 channels.
-    MidiCall midiCalls[4096];
+    // Normal output plus the approved worst-case cleanup in one step.
+    MidiCall midiCalls[10496];
     size_t midiCallCount;
     ParameterSetCall parameterSetCalls[64];
     size_t parameterSetCallCount;
@@ -59,6 +58,9 @@ struct Trace {
     uint32_t presetRestoreClearTransitions;
 };
 
+// A drain receives each complete full batch before recording resumes.
+typedef void (*MidiTraceDrain)(const MidiCall*, size_t);
+void setMidiTraceDrain(MidiTraceDrain drain);
 void resetTrace();
 const Trace& trace();
 uint8_t framebufferPixel(int x, int y);
