@@ -510,11 +510,15 @@ uint32_t requestedRecordingBytes(const int32_t* specifications) {
            kBytesPerMegabyte;
 }
 
+// The event ring retains its decimal capacity; the trailing DRAM arena is
+// reserved independently for MPE history, contexts, ownership, and parser data.
+const uint32_t kMpeArenaBytes = 524288U;
+
 void calculateRequirements(_NT_algorithmRequirements& requirements,
                            const int32_t* specifications) {
     requirements.numParameters = kNumParameters;
     requirements.sram = sizeof(Algorithm);
-    requirements.dram = requestedRecordingBytes(specifications);
+    requirements.dram = requestedRecordingBytes(specifications) + kMpeArenaBytes;
     requirements.dtc = 0;
     requirements.itc = 0;
 }
@@ -525,7 +529,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
     const uint32_t recordingBytes = requestedRecordingBytes(specifications);
     if (memory.sram == NULL || memory.dram == NULL ||
         requirements.sram < sizeof(Algorithm) ||
-        requirements.dram < recordingBytes) {
+        requirements.dram < recordingBytes + kMpeArenaBytes) {
         return NULL;
     }
 

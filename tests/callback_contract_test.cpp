@@ -435,17 +435,26 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
     host.factory()->calculateRequirements(minimumRequirements, belowMinimum);
     host.factory()->calculateRequirements(maximumRequirements, aboveMaximum);
     expect(
-        defaultRequirements.dram == 1000000U &&
-            minimumRequirements.dram == 1000000U &&
-            maximumRequirements.dram == 5000000U,
+        defaultRequirements.dram == 1524288U &&
+            minimumRequirements.dram == 1524288U &&
+            maximumRequirements.dram == 5524288U,
         "allocation requirements default and clamp to the approved byte range");
+    const uint32_t capacities[] = {41666U, 83333U, 125000U, 166666U, 208333U};
+    for (int32_t mb = 1; mb <= 5; ++mb) {
+        _NT_algorithmRequirements requirements = {};
+        host.factory()->calculateRequirements(requirements, &mb);
+        expect(requirements.dram == static_cast<uint32_t>(mb) * 1000000U + 524288U &&
+                   (requirements.dram - 524288U) / sizeof(midibuffer::RecordedEvent) ==
+                       capacities[mb - 1],
+               "MPE arena preserves each decimal event capacity");
+    }
     expect(host.requirements().numParameters == 12,
            "indices 0 through 9 stay stable and Playback/Clear Recording append at 10 and 11");
-    expect(host.requirements().dram == 3000000U,
-           "selected recording bytes are requested from DRAM");
+    expect(host.requirements().dram == 3524288U,
+           "selected recording bytes and separate MPE arena are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
-               static_cast<uint64_t>(host.requirements().sram) + 3000000U,
-           "host allocation accounting includes separate metadata and events");
+               static_cast<uint64_t>(host.requirements().sram) + 3524288U,
+           "host allocation accounting includes metadata, events and MPE arena");
 
     const midibuffer::CaptureSnapshot initial = snapshot(host);
     expect(initial.recordingAllocationBytes == 3000000U,
