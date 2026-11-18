@@ -51,11 +51,22 @@ traceability: $(TRACEABILITY_MANIFEST) $(TRACEABILITY_CHECK)
 # Native host build for nt_emu / VCV Rack (not part of the hardware build)
 HOST_OS := $(shell uname -s)
 ifeq ($(HOST_OS),Darwin)
-	HOST_DYLIB_EXT := dylib
-	HOST_DYLIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup
+test: vital-receiver-smoke
+
+.PHONY: vital-receiver-smoke
+vital-receiver-smoke: build/vital_receiver_smoke
+	./build/vital_receiver_smoke
+	$(PYTHON) tests/verify_vital_state.py
+
+build/vital_receiver_smoke: tests/vital_receiver_smoke.cpp tests/vital-smoke-state.plist | build
+	$(NATIVE_CXX) -std=c++11 $(COMMON_WARNINGS) -Wno-multichar -Wno-deprecated-declarations $< \
+		-framework AudioToolbox -framework CoreMIDI -framework CoreFoundation -o $@
+
+HOST_DYLIB_EXT := dylib
+HOST_DYLIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup
 else
-	HOST_DYLIB_EXT := so
-	HOST_DYLIB_LDFLAGS := -shared
+HOST_DYLIB_EXT := so
+HOST_DYLIB_LDFLAGS := -shared
 endif
 HOST_DYLIB := plugins/$(PLUGIN_NAME).$(HOST_DYLIB_EXT)
 
