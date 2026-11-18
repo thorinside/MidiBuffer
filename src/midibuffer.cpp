@@ -514,6 +514,19 @@ uint32_t requestedRecordingBytes(const int32_t* specifications) {
 // reserved independently for MPE history, contexts, ownership, and parser data.
 const uint32_t kMpeArenaBytes = 524288U;
 
+// Byte regions avoid imposing an ABI layout on the future history wire data.
+// Owner keys and control/parser state share the remaining planned budget;
+// their internal representation is reserved for their implementation.
+struct MpeArenaReservation {
+    uint8_t checkpoints[409U * 536U];
+    uint8_t journal[256U * 640U];
+    uint8_t contexts[4U * 512U];
+    uint8_t ownersAndControl[104416U];
+    uint8_t alignmentAndSlack[34760U];
+};
+static_assert(sizeof(MpeArenaReservation) == kMpeArenaBytes,
+              "MPE reservation must fit the separately accounted DRAM arena");
+
 void calculateRequirements(_NT_algorithmRequirements& requirements,
                            const int32_t* specifications) {
     requirements.numParameters = kNumParameters;
