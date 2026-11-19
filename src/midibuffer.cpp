@@ -121,6 +121,10 @@ enum Parameter {
     kParameterPulsesPerDisplayedBeat,
     kParameterPlayback,
     kParameterClearRecording,
+    kParameterMpeMode,
+    kParameterMpeSetupSource,
+    kParameterLowerMembers,
+    kParameterUpperMembers,
     kNumParameters,
 };
 
@@ -128,6 +132,10 @@ static_assert(kParameterPulsesPerDisplayedBeat == 9 &&
                   kParameterPlayback == 10 &&
                   kParameterClearRecording == 11,
               "appended controls must not renumber inherited parameters");
+static_assert(kParameterMpeMode == 12 && kParameterMpeSetupSource == 13 &&
+                  kParameterLowerMembers == 14 &&
+                  kParameterUpperMembers == 15,
+              "MPE controls append after the existing twelve parameters");
 
 enum Specification {
     kSpecificationBufferMegabytes,
@@ -316,6 +324,11 @@ static const char* const kBooleanStrings[] = {
     "On",
 };
 
+static const char* const kMpeSetupSourceStrings[] = {
+    "Observed",
+    "Manual",
+};
+
 static const char* const kPulsesPerDisplayedBeatStrings[] = {
     "1", "2", "4", "8", "16", "24", "48",
 };
@@ -419,6 +432,42 @@ static const _NT_parameter kParameters[] = {
         .scaling = kNT_scalingNone,
         .enumStrings = kBooleanStrings,
     },
+    {
+        .name = "MPE Mode",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kBooleanStrings,
+    },
+    {
+        .name = "MPE Setup",
+        .min = 0,
+        .max = 1,
+        .def = 0,
+        .unit = kNT_unitEnum,
+        .scaling = kNT_scalingNone,
+        .enumStrings = kMpeSetupSourceStrings,
+    },
+    {
+        .name = "Lower Members",
+        .min = 0,
+        .max = 15,
+        .def = 0,
+        .unit = kNT_unitNone,
+        .scaling = kNT_scalingNone,
+        .enumStrings = NULL,
+    },
+    {
+        .name = "Upper Members",
+        .min = 0,
+        .max = 15,
+        .def = 0,
+        .unit = kNT_unitNone,
+        .scaling = kNT_scalingNone,
+        .enumStrings = NULL,
+    },
 };
 // clang-format on
 
@@ -444,6 +493,13 @@ static const uint8_t kPlaybackPageParameters[] = {
 
 static const uint8_t kTimelinePageParameters[] = {
     kParameterPulsesPerDisplayedBeat,
+};
+
+static const uint8_t kMpePageParameters[] = {
+    kParameterMpeMode,
+    kParameterMpeSetupSource,
+    kParameterLowerMembers,
+    kParameterUpperMembers,
 };
 
 static const _NT_parameterPage kParameterPageDefinitions[] = {
@@ -474,6 +530,13 @@ static const _NT_parameterPage kParameterPageDefinitions[] = {
         .group = 0,
         .unused = {0, 0},
         .params = kTimelinePageParameters,
+    },
+    {
+        .name = "MPE",
+        .numParams = ARRAY_SIZE(kMpePageParameters),
+        .group = 0,
+        .unused = {0, 0},
+        .params = kMpePageParameters,
     },
 };
 
@@ -628,16 +691,84 @@ struct HistoryControl {
     uint8_t reserved[1];
 };
 
-// Owner keys and parser state share the remaining planned budget; their
-// internal representation is reserved for their implementation.
+// MPE playback ownership uses 2,096 indexed keys: 16x128 notes, then
+// CC64/66/69 per channel. Each key latches the route it was emitted on and
+// may own one pending recorded ending in a fixed binary heap.
+const uint32_t kMpeNoteKeys = 16U * 128U;
+const uint32_t kMpeOwnerKeys = kMpeNoteKeys + 16U * 3U;
+static_assert(kMpeOwnerKeys == 2096U, "approved indexed owner/heap keys");
+const uint16_t kMpeNoSlot = 0xffffU;
+const uint32_t kMpeNoEnding = 0xffffffffU;
+const uint32_t kMpeStepVisits = 32768U;
+const uint32_t kMpeStepSends = 8192U;
+const uint32_t kMpeStepFanout = 32768U;
+const uint32_t kMpeStepHeap = 262144U;
+const uint32_t kMpeCleanupCalls = 2304U;
+const uint32_t kMpeCleanupFanout = 9216U;
+// Cleanup visits each owned key once and sends one ending per key, to at
+// most four destinations, so prior-ownership cleanup always fits the reserve.
+static_assert(kMpeOwnerKeys <= kMpeCleanupCalls &&
+                  kMpeOwnerKeys * 4U <= kMpeCleanupFanout,
+              "owned note/hold cleanup fits the separate reserve");
+// A 2,096-entry heap has 12 levels. A push sifts up (one comparison and one
+// move per level); a removal may sift up and then down (two comparisons and
+// one move per level), so these are upper bounds for admission preflight.
+const uint32_t kMpeHeapLevels = 12U;
+const uint32_t kMpeHeapPushCost = 2U * kMpeHeapLevels;
+const uint32_t kMpeHeapRemoveCost = 5U * kMpeHeapLevels;
+
+struct MpeOwner {
+    uint64_t dueInterval;
+    uint32_t endingIndex;   // pending recorded ending, kMpeNoEnding if none
+    uint16_t heapPosition;  // kMpeNoSlot when no ending is pending
+    uint16_t ownedPosition; // owned-note list position, kMpeNoSlot if free
+    uint8_t destination;    // route latched when ownership was emitted
+    uint8_t reserved[7];
+};
+
+struct MpePlayback {
+    MpeOwner owners[kMpeOwnerKeys];
+    uint16_t heap[kMpeOwnerKeys];
+    uint16_t ownedNotes[kMpeNoteKeys];
+    uint16_t scratch[kMpeOwnerKeys]; // admission preflight heap traversal
+    MpeWorkCounters step;
+    MpeWorkCounters lastStep;
+    MpeWorkCounters maximum;
+    uint64_t holdMask; // owned hold keys, bit = key - kMpeNoteKeys
+    uint64_t admittedSample;
+    uint32_t heapSize;
+    uint32_t ownedNoteCount;
+    uint32_t rejectedClusters;
+    uint32_t generatedSetup;
+    uint32_t generatedContext;
+    uint32_t generatedCleanup;
+    int16_t controls[kNumParameters]; // last observed MPE-relevant values
+    uint16_t scopeMask;
+    uint8_t lower;
+    uint8_t upper;
+    uint8_t status;
+    bool engaged;         // the active playback uses MPE semantics
+    bool deliberate;      // ephemeral capability from a fresh live On
+    bool entryPending;    // Finalizing/Preparing toward Armed
+    bool fault;           // overload latched until a fresh Off/On
+    bool restartRequired; // incompatible candidate kept the active range
+    bool contextPending;  // send known context before the next pass
+    bool admittedValid;
+    bool setupIncomplete;
+    bool contextIncomplete;
+    bool restoreWindow;   // host restore callbacks are action-free
+};
+
+// Parser state shares the remaining planned budget.
 struct MpeArenaReservation {
     HistoryCheckpoint checkpoints[kHistoryMaximumCheckpoints];
     HistoryJournalEntry journal[kHistoryJournalEntries];
     HistoryState contexts[4];
     HistoryControl history;
+    MpePlayback mpe; // 8-byte aligned directly after the history control
     SetupObserver setup;
     uint8_t ownersAndControl[104416U - sizeof(SetupObserver) -
-                             sizeof(HistoryControl)];
+                             sizeof(HistoryControl) - sizeof(MpePlayback)];
     uint8_t alignmentAndSlack[34760U];
 };
 static_assert(sizeof(MpeArenaReservation) == kMpeArenaBytes,
@@ -651,6 +782,10 @@ MpeArenaReservation& mpeArena(const Algorithm& algorithm) {
 
 HistoryControl& historyControl(const Algorithm& algorithm) {
     return mpeArena(algorithm).history;
+}
+
+MpePlayback& mpeState(const Algorithm& algorithm) {
+    return mpeArena(algorithm).mpe;
 }
 
 void calculateRequirements(_NT_algorithmRequirements& requirements,
@@ -686,6 +821,15 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
             kHistoryCheckpointInterval + 2U;
     history->admission = -1;
     history->seedValid = true;
+    MpePlayback* mpe = new (&arena->mpe) MpePlayback();
+    for (uint32_t key = 0; key < kMpeOwnerKeys; ++key) {
+        mpe->owners[key].endingIndex = kMpeNoEnding;
+        mpe->owners[key].heapPosition = kMpeNoSlot;
+        mpe->owners[key].ownedPosition = kMpeNoSlot;
+    }
+    for (uint32_t parameter = 0; parameter < kNumParameters; ++parameter) {
+        mpe->controls[parameter] = kParameters[parameter].def;
+    }
     algorithm->parameters = kParameters;
     algorithm->parameterPages = &kParameterPages;
     return algorithm;
@@ -701,9 +845,19 @@ void cancelHistoryCandidate(Algorithm& algorithm);
 void clearPendingPlaybackEndings(Algorithm& algorithm);
 void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample);
 void clearRecording(_NT_algorithm* self, Algorithm& algorithm);
+void mpeReleaseOwned(Algorithm& algorithm, uint64_t sample, bool cleanup,
+                     uint16_t channelMask);
+void mpeForgetOwners(Algorithm& algorithm);
+void mpeControlChanged(_NT_algorithm* self, Algorithm& algorithm,
+                       int parameter);
+bool sameHistoryRange(const PulseRange& left, const PulseRange& right);
+void requestHistoryCandidate(Algorithm& algorithm, const PulseRange& range);
 
 void stopTransport(Algorithm& algorithm) {
     releasePlaybackOutput(algorithm, algorithm.sampleCursor);
+    mpeState(algorithm).engaged = false;
+    mpeState(algorithm).entryPending = false;
+    mpeState(algorithm).contextPending = false;
     algorithm.transportState = kTransportStopped;
     algorithm.playbackIntervalOpen = false;
     algorithm.playbackNextEventScheduled = false;
@@ -733,7 +887,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
         algorithm->clearRecordingRestorePending = false;
     } else if (parameter == kParameterPlayback && algorithm->v != NULL) {
         const bool requested = algorithm->v[kParameterPlayback] != 0;
+        MpePlayback& mpe = mpeState(*algorithm);
+        // Only a fresh live On creates the ephemeral deliberate-entry
+        // capability; it also clears a latched overload.
+        mpe.deliberate = requested;
         if (requested) {
+            mpe.fault = false;
+            mpe.status = kMpeStatusReady;
+            mpe.restartRequired = false;
             startPlayback(self);
         } else {
             stopTransport(*algorithm);
@@ -774,10 +935,14 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
     } else if (parameter == kParameterReset) {
         algorithm->resetHigh = false;
     }
+    mpeControlChanged(self, *algorithm, parameter);
 }
 
 void clearSelection(Algorithm& algorithm) {
     cancelHistoryCandidate(algorithm);
+    mpeForgetOwners(algorithm);
+    mpeState(algorithm).engaged = false;
+    mpeState(algorithm).entryPending = false;
     algorithm.selectionValid = false;
     algorithm.activeSelectionValid = false;
     algorithm.rangeTransitionPending = false;
@@ -931,6 +1096,9 @@ void copyHistorySetup(HistoryState& state, const SetupObserver& setup) {
     }
     for (unsigned channel = 0; channel < 16U; ++channel) {
         state.roles[channel] = setup.roles[channel];
+        state.channelCents[channel] = setup.channelSensitivity[channel].cents;
+        state.channelCentsState[channel] =
+            setup.channelSensitivity[channel].state;
     }
 }
 
@@ -1555,6 +1723,8 @@ void emitRecordedEvent(Algorithm& algorithm, const RecordedEvent& event,
 }
 
 void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample) {
+    // MPE ownership is cleaned on its latched routes from the cleanup reserve.
+    mpeReleaseOwned(algorithm, dispatchSample, true, 0xffffU);
     const uint32_t destination = playbackDestinationMask(algorithm);
     for (uint8_t channel = 0; channel < 16U; ++channel) {
         for (uint8_t note = 0; note < 128U; ++note) {
@@ -1672,16 +1842,22 @@ uint64_t multiplyDivideRounded(uint32_t left, uint32_t right,
     return quotient;
 }
 
-uint64_t eventDispatchSample(const Algorithm& algorithm,
-                             const RecordedEvent& event) {
+uint64_t dispatchSampleFrom(const Algorithm& algorithm,
+                            const RecordedEvent& event,
+                            uint64_t intervalStart) {
     const uint32_t prediction = boundedInterval(
         predictedClockInterval(algorithm));
     const uint64_t scaledOffset = multiplyDivideRounded(
         event.offsetSamples, prediction, event.sourceIntervalSamples);
     const uint64_t maximum = ~static_cast<uint64_t>(0);
-    return scaledOffset > maximum - algorithm.playbackIntervalStartSample
-               ? maximum
-               : algorithm.playbackIntervalStartSample + scaledOffset;
+    return scaledOffset > maximum - intervalStart ? maximum
+                                                  : intervalStart + scaledOffset;
+}
+
+uint64_t eventDispatchSample(const Algorithm& algorithm,
+                             const RecordedEvent& event) {
+    return dispatchSampleFrom(algorithm, event,
+                              algorithm.playbackIntervalStartSample);
 }
 
 RecordedEvent* recordedEventByIndex(Algorithm& algorithm,
@@ -2125,6 +2301,1098 @@ void scheduleNextPlaybackEvent(Algorithm& algorithm) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MPE playback: indexed ownership, bounded pending heap and cluster admission.
+// Ordinary mode never enters these paths.
+
+bool mpeModeOn(const Algorithm& algorithm) {
+    return algorithm.v != NULL && algorithm.v[kParameterMpeMode] != 0;
+}
+
+uint32_t destinationFanout(uint32_t destination) {
+    uint32_t count = 0U;
+    for (uint32_t bit = 1U; bit <= 8U; bit <<= 1U) {
+        if ((destination & bit) != 0U) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void noteMpeMaximum(MpePlayback& mpe) {
+    noteMaximum(mpe.maximum.visits, mpe.step.visits);
+    noteMaximum(mpe.maximum.sends, mpe.step.sends);
+    noteMaximum(mpe.maximum.fanout, mpe.step.fanout);
+    noteMaximum(mpe.maximum.heap, mpe.step.heap);
+    noteMaximum(mpe.maximum.cleanupCalls, mpe.step.cleanupCalls);
+    noteMaximum(mpe.maximum.cleanupFanout, mpe.step.cleanupFanout);
+}
+
+void mpeSend(Algorithm& algorithm, uint32_t destination, uint8_t status,
+             uint8_t data1, uint8_t data2, uint8_t size, uint64_t sample,
+             bool cleanup) {
+    MpePlayback& mpe = mpeState(algorithm);
+    if (size == 2U) {
+        nt_host::sendMidi2(destination, status, data1, sample);
+    } else {
+        nt_host::sendMidi3(destination, status, data1, data2, sample);
+    }
+    const uint32_t fanout = destinationFanout(destination);
+    if (cleanup) {
+        ++mpe.step.cleanupCalls;
+        mpe.step.cleanupFanout += fanout;
+    } else {
+        ++mpe.step.sends;
+        mpe.step.fanout += fanout;
+    }
+    noteMpeMaximum(mpe);
+}
+
+bool mpeHoldController(uint8_t controller) {
+    return controller == 64U || controller == 66U || controller == 69U;
+}
+
+uint16_t mpeNoteKey(uint8_t channel, uint8_t note) {
+    return static_cast<uint16_t>(channel * 128U + (note & 0x7fU));
+}
+
+uint16_t mpeHoldKey(uint8_t channel, uint8_t controller) {
+    const uint8_t pedal = controller == 64U ? 0U : controller == 66U ? 1U : 2U;
+    return static_cast<uint16_t>(kMpeNoteKeys + channel * 3U + pedal);
+}
+
+uint8_t mpeKeyChannel(uint16_t key) {
+    return static_cast<uint8_t>(key < kMpeNoteKeys ? key / 128U
+                                                   : (key - kMpeNoteKeys) / 3U);
+}
+
+uint8_t mpeHoldKeyController(uint16_t key) {
+    static const uint8_t kControllers[3] = {64U, 66U, 69U};
+    return kControllers[(key - kMpeNoteKeys) % 3U];
+}
+
+bool mpeOwned(const MpePlayback& mpe, uint16_t key) {
+    return key < kMpeNoteKeys
+               ? mpe.owners[key].ownedPosition != kMpeNoSlot
+               : ((mpe.holdMask >> (key - kMpeNoteKeys)) & 1U) != 0U;
+}
+
+void mpeOwn(MpePlayback& mpe, uint16_t key, uint32_t destination) {
+    MpeOwner& owner = mpe.owners[key];
+    owner.destination = static_cast<uint8_t>(destination);
+    if (key >= kMpeNoteKeys) {
+        mpe.holdMask |= static_cast<uint64_t>(1U) << (key - kMpeNoteKeys);
+    } else if (owner.ownedPosition == kMpeNoSlot) {
+        owner.ownedPosition = static_cast<uint16_t>(mpe.ownedNoteCount);
+        mpe.ownedNotes[mpe.ownedNoteCount++] = key;
+    }
+}
+
+void mpeDisown(MpePlayback& mpe, uint16_t key) {
+    if (key >= kMpeNoteKeys) {
+        mpe.holdMask &= ~(static_cast<uint64_t>(1U) << (key - kMpeNoteKeys));
+        return;
+    }
+    MpeOwner& owner = mpe.owners[key];
+    if (owner.ownedPosition == kMpeNoSlot) {
+        return;
+    }
+    const uint16_t last = mpe.ownedNotes[--mpe.ownedNoteCount];
+    mpe.ownedNotes[owner.ownedPosition] = last;
+    mpe.owners[last].ownedPosition = owner.ownedPosition;
+    owner.ownedPosition = kMpeNoSlot;
+}
+
+uint32_t mpeOwnedCount(const MpePlayback& mpe) {
+    uint32_t holds = 0U;
+    for (uint64_t mask = mpe.holdMask; mask != 0U; mask &= mask - 1U) {
+        ++holds;
+    }
+    return mpe.ownedNoteCount + holds;
+}
+
+// Pending endings order by due interval, then the exact recorded phase
+// offset/sourceInterval (cross-multiplied), then receipt index and key.
+bool mpeEarlier(Algorithm& algorithm, uint16_t left, uint16_t right) {
+    MpePlayback& mpe = mpeState(algorithm);
+    ++mpe.step.heap;
+    const MpeOwner& a = mpe.owners[left];
+    const MpeOwner& b = mpe.owners[right];
+    if (a.dueInterval != b.dueInterval) {
+        return a.dueInterval < b.dueInterval;
+    }
+    const RecordedEvent* ea = recordedEventByIndex(algorithm, a.endingIndex);
+    const RecordedEvent* eb = recordedEventByIndex(algorithm, b.endingIndex);
+    if (ea != NULL && eb != NULL) {
+        const uint64_t na = ea->sourceIntervalSamples == 0U ? 0U : ea->offsetSamples;
+        const uint64_t da = ea->sourceIntervalSamples == 0U ? 1U : ea->sourceIntervalSamples;
+        const uint64_t nb = eb->sourceIntervalSamples == 0U ? 0U : eb->offsetSamples;
+        const uint64_t db = eb->sourceIntervalSamples == 0U ? 1U : eb->sourceIntervalSamples;
+        if (na * db != nb * da) {
+            return na * db < nb * da;
+        }
+    }
+    if (a.endingIndex != b.endingIndex) {
+        return a.endingIndex < b.endingIndex;
+    }
+    return left < right;
+}
+
+void mpeHeapSet(MpePlayback& mpe, uint32_t position, uint16_t key) {
+    mpe.heap[position] = key;
+    mpe.owners[key].heapPosition = static_cast<uint16_t>(position);
+}
+
+void mpeHeapUp(Algorithm& algorithm, uint32_t position) {
+    MpePlayback& mpe = mpeState(algorithm);
+    const uint16_t key = mpe.heap[position];
+    while (position != 0U) {
+        const uint32_t parent = (position - 1U) / 2U;
+        if (!mpeEarlier(algorithm, key, mpe.heap[parent])) {
+            break;
+        }
+        mpeHeapSet(mpe, position, mpe.heap[parent]);
+        ++mpe.step.heap;
+        position = parent;
+    }
+    mpeHeapSet(mpe, position, key);
+}
+
+void mpeHeapDown(Algorithm& algorithm, uint32_t position) {
+    MpePlayback& mpe = mpeState(algorithm);
+    const uint16_t key = mpe.heap[position];
+    while (true) {
+        uint32_t child = position * 2U + 1U;
+        if (child >= mpe.heapSize) {
+            break;
+        }
+        if (child + 1U < mpe.heapSize &&
+            mpeEarlier(algorithm, mpe.heap[child + 1U], mpe.heap[child])) {
+            ++child;
+        }
+        if (!mpeEarlier(algorithm, mpe.heap[child], key)) {
+            break;
+        }
+        mpeHeapSet(mpe, position, mpe.heap[child]);
+        ++mpe.step.heap;
+        position = child;
+    }
+    mpeHeapSet(mpe, position, key);
+}
+
+void mpeCancelPending(Algorithm& algorithm, uint16_t key) {
+    MpePlayback& mpe = mpeState(algorithm);
+    MpeOwner& owner = mpe.owners[key];
+    if (owner.heapPosition == kMpeNoSlot) {
+        return;
+    }
+    const uint32_t position = owner.heapPosition;
+    owner.heapPosition = kMpeNoSlot;
+    owner.endingIndex = kMpeNoEnding;
+    --mpe.heapSize;
+    if (position == mpe.heapSize) {
+        return;
+    }
+    const uint16_t moved = mpe.heap[mpe.heapSize];
+    mpeHeapSet(mpe, position, moved);
+    mpeHeapUp(algorithm, position);
+    mpeHeapDown(algorithm, mpe.owners[moved].heapPosition);
+}
+
+void mpeSchedulePending(Algorithm& algorithm, uint16_t key,
+                        const RecordedEvent& beginning) {
+    uint32_t endingIndex = 0U;
+    if (!findRecordedEnding(algorithm, beginning, endingIndex)) {
+        return;
+    }
+    const RecordedEvent* ending = recordedEventByIndex(algorithm, endingIndex);
+    MpePlayback& mpe = mpeState(algorithm);
+    mpeCancelPending(algorithm, key);
+    MpeOwner& owner = mpe.owners[key];
+    owner.endingIndex = endingIndex;
+    owner.dueInterval =
+        algorithm.playbackIntervalOrdinal + ending->pulse - beginning.pulse;
+    mpeHeapSet(mpe, mpe.heapSize, key);
+    ++mpe.heapSize;
+    mpeHeapUp(algorithm, mpe.heapSize - 1U);
+}
+
+// Ends latched ownership on its original channel and emitted route. Cleanup
+// bypasses filters/remapping and discards pending endings without heap work.
+// Notes end before CC64/66/69 holds.
+void mpeReleaseOwned(Algorithm& algorithm, uint64_t sample, bool cleanup,
+                     uint16_t channelMask) {
+    MpePlayback& mpe = mpeState(algorithm);
+    for (uint32_t index = mpe.ownedNoteCount; index-- > 0U;) {
+        const uint16_t key = mpe.ownedNotes[index];
+        const uint8_t channel = mpeKeyChannel(key);
+        if (((channelMask >> channel) & 1U) == 0U) {
+            continue;
+        }
+        MpeOwner& owner = mpe.owners[key];
+        if (cleanup) {
+            owner.heapPosition = kMpeNoSlot;
+            owner.endingIndex = kMpeNoEnding;
+        } else {
+            mpeCancelPending(algorithm, key);
+        }
+        mpeSend(algorithm, owner.destination,
+                static_cast<uint8_t>(0x80U | channel),
+                static_cast<uint8_t>(key % 128U), 0U, 3U, sample, cleanup);
+        ++mpe.generatedCleanup;
+        mpeDisown(mpe, key);
+    }
+    for (uint32_t bit = 0; bit < 48U; ++bit) {
+        if (((mpe.holdMask >> bit) & 1U) == 0U) {
+            continue;
+        }
+        const uint16_t key = static_cast<uint16_t>(kMpeNoteKeys + bit);
+        const uint8_t channel = mpeKeyChannel(key);
+        if (((channelMask >> channel) & 1U) == 0U) {
+            continue;
+        }
+        MpeOwner& owner = mpe.owners[key];
+        if (cleanup) {
+            owner.heapPosition = kMpeNoSlot;
+            owner.endingIndex = kMpeNoEnding;
+        } else {
+            mpeCancelPending(algorithm, key);
+        }
+        mpeSend(algorithm, owner.destination,
+                static_cast<uint8_t>(0xb0U | channel),
+                mpeHoldKeyController(key), 0U, 3U, sample, cleanup);
+        ++mpe.generatedCleanup;
+        mpeDisown(mpe, key);
+    }
+    if (cleanup) {
+        // Pending endings exist only for owned keys, all discarded above.
+        mpe.heapSize = 0U;
+    }
+}
+
+// Silent forgetting for discarded state (load/clear). No output is sent.
+void mpeForgetOwners(Algorithm& algorithm) {
+    MpePlayback& mpe = mpeState(algorithm);
+    for (uint32_t index = 0; index < mpe.ownedNoteCount; ++index) {
+        mpe.owners[mpe.ownedNotes[index]].ownedPosition = kMpeNoSlot;
+    }
+    for (uint32_t index = 0; index < mpe.heapSize; ++index) {
+        mpe.owners[mpe.heap[index]].heapPosition = kMpeNoSlot;
+        mpe.owners[mpe.heap[index]].endingIndex = kMpeNoEnding;
+    }
+    mpe.ownedNoteCount = 0U;
+    mpe.heapSize = 0U;
+    mpe.holdMask = 0U;
+}
+
+// Binary search over the pulse-ordered ring (<= 18 visits for 208,333).
+uint32_t mpeLowerBound(Algorithm& algorithm, uint64_t pulse) {
+    MpePlayback& mpe = mpeState(algorithm);
+    uint32_t low = 0U;
+    uint32_t high = algorithm.eventCount;
+    while (low < high) {
+        const uint32_t middle = low + (high - low) / 2U;
+        ++mpe.step.visits;
+        if (recordedEventByIndex(algorithm, middle)->pulse < pulse) {
+            low = middle + 1U;
+        } else {
+            high = middle;
+        }
+    }
+    noteMpeMaximum(mpe);
+    return low;
+}
+
+uint8_t mpeControlStatus(const Algorithm& algorithm) {
+    const int16_t* v = algorithm.v;
+    if (v == NULL) {
+        return kMpeStatusInvalidScope;
+    }
+    if (v[kParameterRecordingChannel] != 0) {
+        return kMpeStatusRecordChannel;
+    }
+    if (v[kParameterPlaybackChannel] != 0) {
+        return kMpeStatusPlayChannel;
+    }
+    if (v[kParameterFilterControlChange] != 0 ||
+        v[kParameterFilterPitchBend] != 0 ||
+        v[kParameterFilterAftertouch] != 0) {
+        return kMpeStatusFilters;
+    }
+    if (v[kParameterMpeSetupSource] != 0) {
+        const int lower = v[kParameterLowerMembers];
+        const int upper = v[kParameterUpperMembers];
+        if (lower < 0 || lower > 15 || upper < 0 || upper > 15 ||
+            (lower == 0 && upper == 0) ||
+            (lower != 0 && upper != 0 && lower + upper > 14)) {
+            return kMpeStatusInvalidScope;
+        }
+    }
+    return kMpeStatusReady;
+}
+
+// Observed scope uses known historical counts; Manual is a receiver-matching
+// assertion that must agree with every known (including disabled) zone.
+uint8_t mpeResolveScope(const Algorithm& algorithm, const HistoryState& context,
+                        uint8_t& lower, uint8_t& upper) {
+    const uint8_t status = mpeControlStatus(algorithm);
+    if (status != kMpeStatusReady) {
+        return status;
+    }
+    if (algorithm.v[kParameterMpeSetupSource] != 0) {
+        lower = static_cast<uint8_t>(algorithm.v[kParameterLowerMembers]);
+        upper = static_cast<uint8_t>(algorithm.v[kParameterUpperMembers]);
+        const uint8_t manual[2] = {lower, upper};
+        for (unsigned zone = 0; zone < 2U; ++zone) {
+            if (context.zoneCountState[zone] == kSetupKnown &&
+                context.zoneCount[zone] != manual[zone]) {
+                return kMpeStatusMismatch;
+            }
+        }
+        return kMpeStatusReady;
+    }
+    lower = context.zoneCountState[0] == kSetupKnown ? context.zoneCount[0] : 0U;
+    upper = context.zoneCountState[1] == kSetupKnown ? context.zoneCount[1] : 0U;
+    return lower == 0U && upper == 0U ? kMpeStatusScopeUnknown
+                                      : kMpeStatusReady;
+}
+
+uint16_t mpeScopeMask(uint8_t lower, uint8_t upper) {
+    uint16_t mask = 0U;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        if ((lower != 0U && channel <= lower) ||
+            (upper != 0U && channel >= 15U - upper)) {
+            mask = static_cast<uint16_t>(mask | (1U << channel));
+        }
+    }
+    return mask;
+}
+
+// Generated setup/context output. With emit=false it only counts sends so
+// admission can preflight the identical sequence.
+struct MpeEmitter {
+    Algorithm* algorithm;
+    uint32_t destination;
+    uint64_t sample;
+    uint32_t* generated;
+    uint32_t count;
+    bool emit;
+};
+
+void mpeEmit(MpeEmitter& out, uint8_t status, uint8_t data1, uint8_t data2,
+             uint8_t size = 3U) {
+    if (out.emit) {
+        mpeSend(*out.algorithm, out.destination, status, data1, data2, size,
+                out.sample, false);
+        ++*out.generated;
+    }
+    ++out.count;
+}
+
+// Absolute RPN 0/x transaction with explicit selectors and null hygiene.
+void mpeRpn(MpeEmitter& out, uint8_t channel, uint8_t parameter, uint8_t msb,
+            int lsb) {
+    const uint8_t status = static_cast<uint8_t>(0xb0U | channel);
+    mpeEmit(out, status, 101U, 0U);
+    mpeEmit(out, status, 100U, parameter);
+    mpeEmit(out, status, 6U, msb);
+    if (lsb >= 0) {
+        mpeEmit(out, status, 38U, static_cast<uint8_t>(lsb));
+    }
+    mpeEmit(out, status, 101U, 127U);
+    mpeEmit(out, status, 100U, 127U);
+}
+
+void mpeRange(MpeEmitter& out, uint8_t channel, uint16_t cents) {
+    mpeRpn(out, channel, 0U, static_cast<uint8_t>(cents / 100U),
+           cents % 100U);
+}
+
+void mpeMemberRanges(MpeEmitter& out, unsigned zone, uint8_t count,
+                     uint16_t cents) {
+    for (uint8_t member = 1; member <= count; ++member) {
+        mpeRange(out, static_cast<uint8_t>(zone == 0U ? member : 15U - member),
+                 cents);
+    }
+}
+
+// Restores each independently safe known zone of the selected take. An MCM
+// is sent only when it cannot reset an indeterminate range; Manual scope
+// never sends MCM and restores only unambiguous known RPN0 ranges.
+uint32_t mpeSetupPlan(Algorithm& algorithm, const HistoryState& context,
+                      bool emit, uint64_t sample, bool& incomplete) {
+    MpePlayback& mpe = mpeState(algorithm);
+    MpeEmitter out = {&algorithm, playbackDestinationMask(algorithm), sample,
+                      &mpe.generatedSetup, 0U, emit};
+    incomplete = false;
+    if (algorithm.v[kParameterMpeSetupSource] == 0) {
+        // Disabled zones first, so no later MCM can shrink a restored zone.
+        for (unsigned pass = 0; pass < 2U; ++pass) {
+            for (unsigned zone = 0; zone < 2U; ++zone) {
+                if (context.zoneCountState[zone] != kSetupKnown) {
+                    incomplete = incomplete ||
+                                 (pass == 0U && context.zoneCountState[zone] ==
+                                                    kSetupIndeterminate);
+                    continue;
+                }
+                const uint8_t count = context.zoneCount[zone];
+                if ((count != 0U) != (pass == 1U)) {
+                    continue;
+                }
+                const uint8_t manager = zone == 0U ? 0U : 15U;
+                if (count == 0U) {
+                    // Implied by an opposite count of 14/15, whose MCM follows.
+                    const unsigned opposite = 1U - zone;
+                    if (context.zoneCountState[opposite] != kSetupKnown ||
+                        context.zoneCount[opposite] < 14U) {
+                        mpeRpn(out, manager, 6U, 0U, -1);
+                    }
+                    continue;
+                }
+                const bool managerKnown = context.managerState[zone] == kSetupKnown;
+                const bool memberKnown = context.memberState[zone] == kSetupKnown;
+                if (managerKnown && memberKnown) {
+                    mpeRpn(out, manager, 6U, count, -1);
+                } else {
+                    incomplete = true;
+                }
+                if (managerKnown) {
+                    mpeRange(out, manager, context.managerCents[zone]);
+                }
+                if (memberKnown) {
+                    mpeMemberRanges(out, zone, count, context.memberCents[zone]);
+                }
+            }
+        }
+        return out.count;
+    }
+    for (unsigned zone = 0; zone < 2U; ++zone) {
+        const uint8_t count = static_cast<uint8_t>(
+            algorithm.v[zone == 0U ? kParameterLowerMembers
+                                   : kParameterUpperMembers]);
+        if (count == 0U) {
+            continue;
+        }
+        const uint8_t manager = zone == 0U ? 0U : 15U;
+        bool managerKnown = false;
+        bool memberKnown = false;
+        uint16_t managerCents = 0U;
+        uint16_t memberCents = 0U;
+        if (context.zoneCountState[zone] == kSetupKnown) {
+            managerKnown = context.managerState[zone] == kSetupKnown;
+            memberKnown = context.memberState[zone] == kSetupKnown;
+            managerCents = context.managerCents[zone];
+            memberCents = context.memberCents[zone];
+        } else if (context.zoneCountState[zone] == kSetupUnknown) {
+            managerKnown = context.channelCentsState[manager] == kSetupKnown;
+            managerCents = context.channelCents[manager];
+            bool conflict = false;
+            for (uint8_t member = 1; member <= count; ++member) {
+                const uint8_t channel =
+                    static_cast<uint8_t>(zone == 0U ? member : 15U - member);
+                if (context.channelCentsState[channel] != kSetupKnown) {
+                    continue;
+                }
+                if (memberKnown && context.channelCents[channel] != memberCents) {
+                    conflict = true;
+                }
+                memberKnown = true;
+                memberCents = context.channelCents[channel];
+            }
+            memberKnown = memberKnown && !conflict;
+        }
+        incomplete = incomplete || !managerKnown || !memberKnown;
+        if (managerKnown) {
+            mpeRange(out, manager, managerCents);
+        }
+        if (memberKnown) {
+            mpeMemberRanges(out, zone, count, memberCents);
+        }
+    }
+    return out.count;
+}
+
+bool historyKnown(const HistoryState& state, uint8_t channel, HistoryValue value) {
+    return ((state.known[channel] >> value) & 1U) != 0U;
+}
+
+// Known starting context for in-scope channels. Partial 14-bit bend is never
+// sent; an LSB is sent only after its known MSB. Known pressed holds latch
+// ownership so the next boundary releases them.
+uint32_t mpeContextPlan(Algorithm& algorithm, const HistoryState& context,
+                        const HistoryContextMeta& meta, bool emit,
+                        uint64_t sample, bool& incomplete) {
+    MpePlayback& mpe = mpeState(algorithm);
+    MpeEmitter out = {&algorithm, playbackDestinationMask(algorithm), sample,
+                      &mpe.generatedContext, 0U, emit};
+    incomplete = !meta.coverageComplete;
+    static const uint8_t kControllers[4][2] = {
+        {74U, kHistoryTimbre}, {1U, kHistoryModulationMsb},
+        {33U, kHistoryModulationLsb}, {11U, kHistoryExpressionMsb}};
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        if (((mpe.scopeMask >> channel) & 1U) == 0U) {
+            continue;
+        }
+        const uint8_t* values = context.values[channel];
+        const uint8_t control = static_cast<uint8_t>(0xb0U | channel);
+        const bool bend = historyKnown(context, channel, kHistoryBendLsb) &&
+                          historyKnown(context, channel, kHistoryBendMsb);
+        const bool pressure =
+            historyKnown(context, channel, kHistoryChannelPressure);
+        if (bend) {
+            mpeEmit(out, static_cast<uint8_t>(0xe0U | channel),
+                    values[kHistoryBendLsb], values[kHistoryBendMsb]);
+        }
+        if (pressure) {
+            mpeEmit(out, static_cast<uint8_t>(0xd0U | channel),
+                    values[kHistoryChannelPressure], 0U, 2U);
+        }
+        for (unsigned index = 0; index < 4U; ++index) {
+            const HistoryValue value =
+                static_cast<HistoryValue>(kControllers[index][1]);
+            const bool lsbWithoutMsb =
+                value == kHistoryModulationLsb &&
+                !historyKnown(context, channel, kHistoryModulationMsb);
+            if (historyKnown(context, channel, value) && !lsbWithoutMsb) {
+                mpeEmit(out, control, kControllers[index][0], values[value]);
+            }
+        }
+        if (historyKnown(context, channel, kHistoryExpressionMsb) &&
+            historyKnown(context, channel, kHistoryExpressionLsb)) {
+            mpeEmit(out, control, 43U, values[kHistoryExpressionLsb]);
+        }
+        static const uint8_t kHolds[3][2] = {
+            {64U, kHistorySustain}, {66U, kHistorySostenuto}, {69U, kHistoryHold2}};
+        for (unsigned index = 0; index < 3U; ++index) {
+            const HistoryValue value = static_cast<HistoryValue>(kHolds[index][1]);
+            if (historyKnown(context, channel, value) && values[value] >= 64U) {
+                mpeEmit(out, control, kHolds[index][0], values[value]);
+                if (emit) {
+                    const uint16_t key = mpeHoldKey(channel, kHolds[index][0]);
+                    mpeCancelPending(algorithm, key);
+                    mpeOwn(mpe, key, out.destination);
+                }
+            }
+        }
+        incomplete = incomplete || !bend || !pressure ||
+                     !historyKnown(context, channel, kHistoryTimbre);
+    }
+    return out.count;
+}
+
+uint64_t dispatchSampleFrom(const Algorithm& algorithm,
+                            const RecordedEvent& event, uint64_t intervalStart);
+
+// A rejected cluster emits none of its normal bytes: prior emitted ownership
+// is cleaned on latched routes within the reserve, pending/attacks are
+// cancelled, Playback is set Off and the overload stays visible until a fresh
+// Off/On.
+void mpeRejectCluster(Algorithm& algorithm, uint64_t sample) {
+    MpePlayback& mpe = mpeState(algorithm);
+    ++mpe.rejectedClusters;
+    mpe.fault = true;
+    mpe.status = kMpeStatusOverload;
+    mpeReleaseOwned(algorithm, sample, true, 0xffffU);
+    algorithm.transportState = kTransportStopped;
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+    mpe.engaged = false;
+    mpe.deliberate = false;
+    mpe.entryPending = false;
+    mpe.contextPending = false;
+    if (algorithm.v != NULL && algorithm.v[kParameterPlayback] != 0) {
+        nt_host::setParameterFromAudio(&algorithm, kParameterPlayback, 0);
+    }
+}
+
+// Preflights one due-frame cluster (plus its entry/wrap work) against the
+// remaining step budgets before any output or cursor consumption. Costs are
+// upper bounds; source and heap visits made here are charged once.
+bool mpeAdmitCluster(Algorithm& algorithm, uint64_t sample, bool force,
+                     uint32_t cursor, uint64_t pulse, const PulseRange& range,
+                     uint64_t intervalStart, uint64_t ordinal,
+                     uint64_t extraSends, uint64_t extraHeap) {
+    MpePlayback& mpe = mpeState(algorithm);
+    uint64_t sends = extraSends;
+    uint64_t heap = extraHeap;
+    bool fits = true;
+    for (uint32_t index = cursor; fits; ++index) {
+        const RecordedEvent* event = recordedEventByIndex(algorithm, index);
+        if (event == NULL || event->pulse != pulse || pulse >= range.endPulse ||
+            (!force && dispatchSampleFrom(algorithm, *event, intervalStart) >
+                           sample)) {
+            break;
+        }
+        if (mpe.step.visits >= kMpeStepVisits) {
+            fits = false;
+            break;
+        }
+        ++mpe.step.visits;
+        const uint8_t type = event->bytes[0] & 0xf0U;
+        const bool hold = type == 0xb0U && mpeHoldController(event->bytes[1]);
+        if (type == 0x90U && event->bytes[2] != 0U) {
+            sends += 2U; // collision ending plus attack
+            heap += kMpeHeapRemoveCost + kMpeHeapPushCost;
+        } else if (hold && event->bytes[2] >= 64U) {
+            sends += 1U;
+            heap += kMpeHeapRemoveCost + kMpeHeapPushCost;
+        } else if (type == 0x80U || type == 0x90U || hold) {
+            sends += 1U;
+            heap += kMpeHeapRemoveCost;
+        } else {
+            sends += 1U;
+        }
+        fits = mpe.step.sends + sends <= kMpeStepSends;
+    }
+    // Due pending endings form a heap prefix: visit only due nodes and their
+    // immediate children.
+    uint32_t top = 0U;
+    if (fits && mpe.heapSize != 0U) {
+        mpe.scratch[top++] = 0U;
+    }
+    while (fits && top != 0U) {
+        const uint32_t position = mpe.scratch[--top];
+        if (mpe.step.heap >= kMpeStepHeap) {
+            fits = false;
+            break;
+        }
+        ++mpe.step.heap;
+        const MpeOwner& owner = mpe.owners[mpe.heap[position]];
+        const RecordedEvent* ending =
+            recordedEventByIndex(algorithm, owner.endingIndex);
+        const bool due =
+            owner.dueInterval < ordinal ||
+            (owner.dueInterval == ordinal &&
+             (force || ending == NULL ||
+              dispatchSampleFrom(algorithm, *ending, intervalStart) <= sample));
+        if (!due) {
+            continue;
+        }
+        sends += 1U;
+        heap += kMpeHeapRemoveCost;
+        for (uint32_t child = position * 2U + 1U;
+             child <= position * 2U + 2U && child < mpe.heapSize; ++child) {
+            mpe.scratch[top++] = static_cast<uint16_t>(child);
+        }
+    }
+    const uint64_t fanout =
+        sends * destinationFanout(playbackDestinationMask(algorithm));
+    fits = fits && mpe.step.sends + sends <= kMpeStepSends &&
+           mpe.step.fanout + fanout <= kMpeStepFanout &&
+           mpe.step.heap + heap <= kMpeStepHeap;
+    noteMpeMaximum(mpe);
+    if (!fits) {
+        mpeRejectCluster(algorithm, sample);
+    }
+    return fits;
+}
+
+void mpeEmitSelectedEvent(Algorithm& algorithm, const RecordedEvent& event,
+                          uint32_t eventIndex, uint64_t sample) {
+    if (!recordedEventPassesPlaybackFilters(algorithm, event)) {
+        return;
+    }
+    MpePlayback& mpe = mpeState(algorithm);
+    const uint32_t destination = playbackDestinationMask(algorithm);
+    const uint8_t type = event.bytes[0] & 0xf0U;
+    const uint8_t channel = event.bytes[0] & 0x0fU;
+    if (type == 0x80U || type == 0x90U) {
+        const uint16_t key = mpeNoteKey(channel, event.bytes[1]);
+        MpeOwner& owner = mpe.owners[key];
+        if (type == 0x80U || event.bytes[2] == 0U) {
+            // Only the ending owned by an emitted in-range attack sounds.
+            if (owner.heapPosition != kMpeNoSlot &&
+                owner.endingIndex == eventIndex &&
+                owner.dueInterval == algorithm.playbackIntervalOrdinal) {
+                mpeCancelPending(algorithm, key);
+                mpeSend(algorithm, owner.destination, event.bytes[0],
+                        event.bytes[1], event.bytes[2], 3U, sample, false);
+                mpeDisown(mpe, key);
+            }
+            return;
+        }
+        if (mpeOwned(mpe, key)) {
+            // A same-key retrigger ends the older occurrence first; it cannot
+            // inherit the older occurrence's delayed ending.
+            mpeCancelPending(algorithm, key);
+            mpeSend(algorithm, owner.destination,
+                    static_cast<uint8_t>(0x80U | channel), event.bytes[1], 0U,
+                    3U, sample, false);
+            ++mpe.generatedCleanup;
+            mpeDisown(mpe, key);
+        }
+        mpeSend(algorithm, destination, event.bytes[0], event.bytes[1],
+                event.bytes[2], 3U, sample, false);
+        mpeOwn(mpe, key, destination);
+        mpeSchedulePending(algorithm, key, event);
+        return;
+    }
+    if (type == 0xb0U && mpeHoldController(event.bytes[1])) {
+        const uint16_t key = mpeHoldKey(channel, event.bytes[1]);
+        MpeOwner& owner = mpe.owners[key];
+        if (event.bytes[2] >= 64U) {
+            // A newer press silently takes release ownership.
+            mpeCancelPending(algorithm, key);
+            mpeSend(algorithm, destination, event.bytes[0], event.bytes[1],
+                    event.bytes[2], 3U, sample, false);
+            mpeOwn(mpe, key, destination);
+            mpeSchedulePending(algorithm, key, event);
+            return;
+        }
+        if (owner.heapPosition != kMpeNoSlot) {
+            if (owner.endingIndex == eventIndex &&
+                owner.dueInterval == algorithm.playbackIntervalOrdinal) {
+                mpeCancelPending(algorithm, key);
+                mpeSend(algorithm, owner.destination, event.bytes[0],
+                        event.bytes[1], event.bytes[2], 3U, sample, false);
+                mpeDisown(mpe, key);
+            }
+            // Otherwise this stale release belongs to a cancelled older press
+            // and cannot release the newer owner.
+            return;
+        }
+        mpeSend(algorithm,
+                mpeOwned(mpe, key) ? owner.destination : destination,
+                event.bytes[0], event.bytes[1], event.bytes[2], 3U, sample,
+                false);
+        mpeDisown(mpe, key);
+        return;
+    }
+    mpeSend(algorithm, destination, event.bytes[0], event.bytes[1],
+            event.bytes[2], event.size, sample, false);
+}
+
+bool mpePendingDue(Algorithm& algorithm, uint64_t sample, bool force,
+                   uint64_t& dueSample) {
+    const MpePlayback& mpe = mpeState(algorithm);
+    if (mpe.heapSize == 0U) {
+        return false;
+    }
+    const MpeOwner& owner = mpe.owners[mpe.heap[0]];
+    if (owner.dueInterval > algorithm.playbackIntervalOrdinal) {
+        return false;
+    }
+    const RecordedEvent* ending =
+        recordedEventByIndex(algorithm, owner.endingIndex);
+    dueSample = owner.dueInterval < algorithm.playbackIntervalOrdinal ||
+                        ending == NULL
+                    ? algorithm.playbackIntervalStartSample
+                    : eventDispatchSample(algorithm, *ending);
+    return force || dueSample <= sample;
+}
+
+void mpeEmitPendingTop(Algorithm& algorithm, uint64_t sample) {
+    MpePlayback& mpe = mpeState(algorithm);
+    const uint16_t key = mpe.heap[0];
+    const MpeOwner& owner = mpe.owners[key];
+    const RecordedEvent* ending =
+        recordedEventByIndex(algorithm, owner.endingIndex);
+    const uint32_t destination = owner.destination;
+    mpeCancelPending(algorithm, key);
+    if (ending != NULL) {
+        mpeSend(algorithm, destination, ending->bytes[0], ending->bytes[1],
+                ending->bytes[2], 3U, sample, false);
+    }
+    mpeDisown(mpe, key);
+}
+
+void mpeDispatchPlaybackEvents(Algorithm& algorithm, uint64_t sample,
+                               bool force) {
+    MpePlayback& mpe = mpeState(algorithm);
+    uint64_t pendingSample = 0U;
+    const bool regularDue =
+        algorithm.playbackNextEventScheduled &&
+        (force || algorithm.playbackNextEventSample <= sample);
+    if (!regularDue && !mpePendingDue(algorithm, sample, force, pendingSample)) {
+        return;
+    }
+    if (force || !mpe.admittedValid || mpe.admittedSample != sample) {
+        if (!mpeAdmitCluster(algorithm, sample, force,
+                             algorithm.playbackEventIndex,
+                             algorithm.playbackPulse, algorithm.activeSelection,
+                             algorithm.playbackIntervalStartSample,
+                             algorithm.playbackIntervalOrdinal, 0U, 0U)) {
+            return;
+        }
+        if (!force) {
+            mpe.admittedValid = true;
+            mpe.admittedSample = sample;
+        }
+    }
+    while (algorithm.transportState == kTransportPlaying) {
+        const bool eventDue =
+            algorithm.playbackNextEventScheduled &&
+            (force || algorithm.playbackNextEventSample <= sample);
+        const bool pendingDue =
+            mpePendingDue(algorithm, sample, force, pendingSample);
+        if (!eventDue && !pendingDue) {
+            break;
+        }
+        // Selected recorded messages win ties with pending endings.
+        if (eventDue && (!pendingDue ||
+                         algorithm.playbackNextEventSample <= pendingSample)) {
+            const uint32_t eventIndex = algorithm.playbackEventIndex;
+            const RecordedEvent* event = nextPlaybackEvent(algorithm);
+            ++algorithm.playbackEventIndex;
+            mpeEmitSelectedEvent(algorithm, *event, eventIndex, sample);
+            scheduleNextPlaybackEvent(algorithm);
+        } else {
+            mpeEmitPendingTop(algorithm, sample);
+        }
+    }
+}
+
+// MPE wrap: owned in-scope note endings, then owned holds, stale-occurrence
+// cancellation, known starting context, then the next pass's attacks. No
+// MCM/RPN or CC120/123 is emitted. A ready, setup-compatible candidate is
+// adopted here; an incompatible one keeps the active range and asks for a
+// restart; an unready one waits another wrap. Returns false when rejected.
+bool mpeWrap(Algorithm& algorithm, uint64_t sample) {
+    MpePlayback& mpe = mpeState(algorithm);
+    HistoryControl& history = historyControl(algorithm);
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    const HistoryContextMeta& candidate =
+        history.contexts[kHistoryContextCandidate];
+    bool adopt = false;
+    bool restart = false;
+    if (algorithm.rangeTransitionPending && candidate.ready &&
+        candidate.generation == history.generation &&
+        sameHistoryRange(candidate.range, algorithm.selection)) {
+        adopt = candidate.setupFingerprint ==
+                history.contexts[kHistoryContextActive].setupFingerprint;
+        restart = !adopt;
+    }
+    const PulseRange range = adopt ? algorithm.selection
+                                   : algorithm.activeSelection;
+    const HistoryContextSlot slot =
+        adopt ? kHistoryContextCandidate : kHistoryContextActive;
+    const uint32_t cursor = mpeLowerBound(algorithm, range.startPulse);
+    bool incomplete = false;
+    const uint32_t contextSends =
+        mpeContextPlan(algorithm, arena.contexts[slot], history.contexts[slot],
+                       false, sample, incomplete);
+    if (!mpeAdmitCluster(algorithm, sample, false, cursor, range.startPulse,
+                         range, sample, algorithm.playbackIntervalOrdinal + 1U,
+                         mpeOwnedCount(mpe) + contextSends,
+                         static_cast<uint64_t>(mpe.heapSize) *
+                             kMpeHeapRemoveCost)) {
+        return false;
+    }
+    mpe.admittedValid = true;
+    mpe.admittedSample = sample;
+    mpeReleaseOwned(algorithm, sample, false, adopt ? 0xffffU : mpe.scopeMask);
+    if (adopt) {
+        copyHistoryState(arena.contexts[kHistoryContextActive],
+                         arena.contexts[kHistoryContextCandidate]);
+        history.contexts[kHistoryContextActive] = candidate;
+        algorithm.activeSelection = algorithm.selection;
+    }
+    if (adopt || restart) {
+        algorithm.rangeTransitionPending = false;
+    }
+    mpe.restartRequired = mpe.restartRequired || restart;
+    mpeContextPlan(algorithm, arena.contexts[kHistoryContextActive],
+                   history.contexts[kHistoryContextActive], true, sample,
+                   mpe.contextIncomplete);
+    algorithm.playbackPulse = algorithm.activeSelection.startPulse;
+    algorithm.playbackEventIndex = cursor;
+    return true;
+}
+
+// Entry/re-entry cluster: old ownership cleanup, safe known setup (only with
+// a deliberate-entry capability), known context, then recorded music.
+bool mpeActivate(Algorithm& algorithm, uint64_t sample, bool advance) {
+    MpePlayback& mpe = mpeState(algorithm);
+    HistoryControl& history = historyControl(algorithm);
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    const HistoryState& context = arena.contexts[kHistoryContextActive];
+    const HistoryContextMeta& meta = history.contexts[kHistoryContextActive];
+    bool incomplete = false;
+    const uint32_t setupSends =
+        mpe.deliberate
+            ? mpeSetupPlan(algorithm, context, false, sample, incomplete)
+            : 0U;
+    const uint32_t contextSends =
+        mpe.contextPending
+            ? mpeContextPlan(algorithm, context, meta, false, sample, incomplete)
+            : 0U;
+    if (!mpeAdmitCluster(algorithm, sample, false, algorithm.playbackEventIndex,
+                         algorithm.playbackPulse, algorithm.activeSelection,
+                         sample,
+                         algorithm.playbackIntervalOrdinal + (advance ? 1U : 0U),
+                         mpeOwnedCount(mpe) + setupSends + contextSends,
+                         static_cast<uint64_t>(mpe.heapSize) *
+                             kMpeHeapRemoveCost)) {
+        return false;
+    }
+    mpe.admittedValid = true;
+    mpe.admittedSample = sample;
+    mpeReleaseOwned(algorithm, sample, false, 0xffffU);
+    if (mpe.deliberate) {
+        mpeSetupPlan(algorithm, context, true, sample, mpe.setupIncomplete);
+        mpe.deliberate = false;
+    }
+    if (mpe.contextPending) {
+        mpeContextPlan(algorithm, context, meta, true, sample,
+                       mpe.contextIncomplete);
+        mpe.contextPending = false;
+    }
+    return true;
+}
+
+// Bounded entry progress after Playback On: Finalizing, then Preparing
+// (pairing and candidate context share the 512-visit step budget), then
+// validation against the prepared historical scope. A blocked request stays
+// visibly blocked and keeps its deliberate capability for a live correction.
+void mpeAdvanceEntry(Algorithm& algorithm) {
+    MpePlayback& mpe = mpeState(algorithm);
+    if (!mpe.entryPending) {
+        return;
+    }
+    HistoryControl& history = historyControl(algorithm);
+    if (history.finalizing || !algorithm.selectionValid ||
+        !history.pairingComplete ||
+        history.pairedGeneration != history.generation) {
+        return;
+    }
+    const HistoryContextMeta& candidate =
+        history.contexts[kHistoryContextCandidate];
+    if (!candidate.ready || candidate.generation != history.generation ||
+        !sameHistoryRange(candidate.range, algorithm.selection)) {
+        requestHistoryCandidate(algorithm, algorithm.selection);
+        return;
+    }
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    uint8_t lower = 0U;
+    uint8_t upper = 0U;
+    mpe.entryPending = false;
+    mpe.status = mpeResolveScope(algorithm,
+                                 arena.contexts[kHistoryContextCandidate],
+                                 lower, upper);
+    if (mpe.status != kMpeStatusReady) {
+        return;
+    }
+    copyHistoryState(arena.contexts[kHistoryContextActive],
+                     arena.contexts[kHistoryContextCandidate]);
+    history.contexts[kHistoryContextActive] = candidate;
+    mpe.lower = lower;
+    mpe.upper = upper;
+    mpe.scopeMask = mpeScopeMask(lower, upper);
+    mpe.engaged = true;
+    mpe.restartRequired = false;
+    mpe.contextPending = true;
+    algorithm.activeSelection = algorithm.selection;
+    algorithm.activeSelectionValid = true;
+    algorithm.rangeTransitionPending = false;
+    algorithm.playbackPulse = algorithm.selection.startPulse;
+    algorithm.playbackEventIndex =
+        mpeLowerBound(algorithm, algorithm.playbackPulse);
+    algorithm.playbackPositionValid = true;
+    algorithm.playbackIntervalOpen = false;
+    algorithm.playbackNextEventScheduled = false;
+    algorithm.transportState = kTransportArmed;
+}
+
+bool mpeStartPlayback(Algorithm& algorithm, const PulseRange& range) {
+    MpePlayback& mpe = mpeState(algorithm);
+    if (algorithm.transportState != kTransportStopped) {
+        return true;
+    }
+    if (mpe.fault) {
+        return false;
+    }
+    for (uint32_t parameter = 0; parameter < kNumParameters; ++parameter) {
+        mpe.controls[parameter] = algorithm.v[parameter];
+    }
+    mpe.status = mpeControlStatus(algorithm);
+    if (mpe.status != kMpeStatusReady) {
+        // Visibly blocked before any preparation or output.
+        return false;
+    }
+    beginFinalization(algorithm);
+    requestHistoryCandidate(algorithm, range);
+    mpe.entryPending = true;
+    mpe.engaged = false;
+    algorithm.playbackPositionValid = false;
+    mpeAdvanceEntry(algorithm);
+    return true;
+}
+
+uint8_t mpePhase(const Algorithm& algorithm) {
+    const MpePlayback& mpe = mpeState(algorithm);
+    if (mpe.fault) {
+        return kMpePhaseFault;
+    }
+    if (mpe.entryPending) {
+        return historyControl(algorithm).finalizing ? kMpePhaseFinalizing
+                                                    : kMpePhasePreparing;
+    }
+    if (!mpe.engaged) {
+        return kMpePhaseIdle;
+    }
+    switch (algorithm.transportState) {
+    case kTransportArmed:
+    case kTransportClockLossPaused:
+        return kMpePhaseArmed;
+    case kTransportPlaying:
+        return kMpePhasePlaying;
+    default:
+        return kMpePhaseIdle;
+    }
+}
+
+bool mpeRelevantParameter(int parameter) {
+    return parameter == kParameterRecordingChannel ||
+           parameter == kParameterPlaybackDestination ||
+           parameter == kParameterPlaybackChannel ||
+           parameter == kParameterFilterControlChange ||
+           parameter == kParameterFilterPitchBend ||
+           parameter == kParameterFilterAftertouch ||
+           parameter == kParameterMpeMode ||
+           parameter == kParameterMpeSetupSource ||
+           parameter == kParameterLowerMembers ||
+           parameter == kParameterUpperMembers;
+}
+
+// Live relevant changes during MPE play (or an MPE Mode change during
+// ordinary play) clean the stored old routes, cancel ownership and stop
+// intent. While stopped, a live correction may complete a blocked request.
+void mpeControlChanged(_NT_algorithm* self, Algorithm& algorithm,
+                       int parameter) {
+    MpePlayback& mpe = mpeState(algorithm);
+    if (algorithm.v == NULL || !mpeRelevantParameter(parameter)) {
+        return;
+    }
+    const int16_t value = algorithm.v[parameter];
+    const bool changed = value != mpe.controls[parameter];
+    mpe.controls[parameter] = value;
+    if (!changed || mpe.restoreWindow) {
+        return;
+    }
+    const bool modeChange = parameter == kParameterMpeMode;
+    if (algorithm.transportState != kTransportStopped &&
+        (mpe.engaged || modeChange)) {
+        stopTransport(algorithm);
+        mpe.deliberate = false;
+        if (algorithm.v[kParameterPlayback] != 0) {
+            nt_host::setParameterFromAudio(self, kParameterPlayback, 0);
+        }
+        return;
+    }
+    if (mpe.entryPending) {
+        mpe.status = mpeControlStatus(algorithm);
+        if (mpe.status != kMpeStatusReady || !mpeModeOn(algorithm)) {
+            mpe.entryPending = false;
+        }
+        return;
+    }
+    if (algorithm.transportState == kTransportStopped && !mpe.fault &&
+        algorithm.v[kParameterPlayback] != 0 &&
+        (modeChange || (mpeModeOn(algorithm) && mpe.status != kMpeStatusReady))) {
+        startPlayback(self);
+    }
+}
+
 void dispatchPendingEndingsAt(Algorithm& algorithm, uint64_t sample,
                               bool forceCurrentInterval) {
     if (!algorithm.pendingNextEndingScheduled ||
@@ -2174,6 +3442,10 @@ void dispatchPlaybackEvents(Algorithm& algorithm, uint64_t sample,
         !algorithm.activeSelectionValid) {
         return;
     }
+    if (mpeState(algorithm).engaged) {
+        mpeDispatchPlaybackEvents(algorithm, sample, forceCurrentInterval);
+        return;
+    }
 
     while (true) {
         const bool regularDue =
@@ -2218,6 +3490,10 @@ void advancePlaybackPulse(Algorithm& algorithm, uint64_t sample) {
     if (algorithm.playbackPulse < algorithm.activeSelection.endPulse) {
         return;
     }
+    if (mpeState(algorithm).engaged) {
+        mpeWrap(algorithm, sample);
+        return;
+    }
 
     if (algorithm.rangeTransitionPending) {
         // A changed range owns a clean phrase boundary. Release all output
@@ -2240,7 +3516,9 @@ void openPlaybackInterval(Algorithm& algorithm, uint64_t sample,
     algorithm.playbackIntervalStartSample = sample;
     algorithm.playbackIntervalOpen = true;
     scheduleNextPlaybackEvent(algorithm);
-    refreshPendingEndingSchedule(algorithm);
+    if (!mpeState(algorithm).engaged) {
+        refreshPendingEndingSchedule(algorithm);
+    }
     dispatchPlaybackEvents(algorithm, sample, false);
 }
 
@@ -2258,6 +3536,10 @@ void activatePendingPlayback(Algorithm& algorithm, uint64_t sample) {
             findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
         algorithm.playbackPositionValid = true;
     }
+    if (mpeState(algorithm).engaged &&
+        !mpeActivate(algorithm, sample, !resumeSavedInterval)) {
+        return;
+    }
     algorithm.transportState = kTransportPlaying;
     // A loaded active preset retains the logical interval, event cursor, and
     // pending-ending ordinal from its save boundary. The second fresh clock
@@ -2271,7 +3553,9 @@ void beginOrAdvancePlayback(Algorithm& algorithm, uint64_t sample) {
         activatePendingPlayback(algorithm, sample);
     } else if (algorithm.transportState == kTransportPlaying) {
         advancePlaybackPulse(algorithm, sample);
-        beginPlaybackInterval(algorithm, sample);
+        if (algorithm.transportState == kTransportPlaying) {
+            beginPlaybackInterval(algorithm, sample);
+        }
     }
 }
 
@@ -2362,8 +3646,16 @@ void handleResetEdge(Algorithm& algorithm, uint64_t sample) {
             ? algorithm.activeSelection
             : algorithm.selection;
     algorithm.playbackPulse = resetRange.startPulse;
-    algorithm.playbackEventIndex =
-        findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+    MpePlayback& mpe = mpeState(algorithm);
+    if (mpe.engaged) {
+        // Re-entry at the range start resends known context, never setup.
+        algorithm.playbackEventIndex =
+            mpeLowerBound(algorithm, algorithm.playbackPulse);
+        mpe.contextPending = true;
+    } else {
+        algorithm.playbackEventIndex =
+            findPlaybackEventIndex(algorithm, algorithm.playbackPulse);
+    }
     algorithm.playbackPositionValid = true;
     if (algorithm.transportState == kTransportPlaying) {
         algorithm.transportState = kTransportArmed;
@@ -2619,7 +3911,13 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     const int numFrames = numFramesBy4 * 4;
     algorithm->processingStarted = true;
+    // MPE normal budgets reset once per host step, across all its frames.
+    MpePlayback& mpe = mpeState(*algorithm);
+    mpe.step = MpeWorkCounters();
+    mpe.admittedValid = false;
+    mpe.restoreWindow = false;
     advanceHistoryWork(*algorithm);
+    mpeAdvanceEntry(*algorithm);
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
     const float* clockFrames = clockBus >= 1 && clockBus <= kNT_lastBus
@@ -2656,6 +3954,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
         ++algorithm->sampleCursor;
     }
+    mpe.lastStep = mpe.step;
 }
 
 void setPlaybackRequest(_NT_algorithm* self, bool requested,
@@ -2701,6 +4000,7 @@ void emergencySilence(_NT_algorithm* self, Algorithm& algorithm,
     // restart through the ordinary playback-entry path.
     algorithm.playbackOutputState = PlaybackOutputState();
     clearPendingPlaybackEndings(algorithm);
+    mpeForgetOwners(algorithm);
     algorithm.transportState = kTransportStopped;
     algorithm.playbackIntervalOpen = false;
     algorithm.playbackNextEventScheduled = false;
@@ -2753,8 +4053,16 @@ void refreshSetupRoles(SetupObserver& setup) {
     }
 }
 
+// A received MCM resets receiver ranges, so role-free receipts are forgotten.
+void forgetChannelSensitivities(SetupObserver& setup) {
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        setup.channelSensitivity[channel] = {0U, kSetupUnknown};
+    }
+}
+
 void applyManagerConfiguration(SetupObserver& setup, unsigned zoneIndex,
                                uint8_t count) {
+    forgetChannelSensitivities(setup);
     SetupZone& zone = setup.zones[zoneIndex];
     SetupZone& opposite = setup.zones[1U - zoneIndex];
     zone.count = count;
@@ -2773,6 +4081,7 @@ void applyManagerConfiguration(SetupObserver& setup, unsigned zoneIndex,
 // The receiver's result of a relative or out-of-range MCM cannot be known.
 // An active opposite zone could have been shrunk or disabled by it.
 void invalidateManagerConfiguration(SetupObserver& setup, unsigned zoneIndex) {
+    forgetChannelSensitivities(setup);
     SetupZone& zone = setup.zones[zoneIndex];
     SetupZone& opposite = setup.zones[1U - zoneIndex];
     zone.countState = kSetupIndeterminate;
@@ -2787,6 +4096,7 @@ void invalidateManagerConfiguration(SetupObserver& setup, unsigned zoneIndex) {
 void writeSensitivity(SetupObserver& setup, uint8_t channel, uint16_t cents,
                       uint8_t state) {
     SetupValue value = {state == kSetupKnown ? cents : uint16_t(0), state};
+    setup.channelSensitivity[channel] = value;
     switch (setup.roles[channel]) {
     case kSetupRoleLowerManager: setup.zones[0].manager = value; break;
     case kSetupRoleLowerMember: setup.zones[0].member = value; break;
@@ -3648,6 +4958,46 @@ void drawSelectionBracket(uint64_t pulse, uint64_t viewStart,
     nt_host::drawShape(kNT_line, x, 56, x + (start ? 4 : -4), 56, 15);
 }
 
+// MPE lifecycle/blocking status. Blocking and overload reasons take priority
+// over warnings, which never stop playback.
+void drawMpeStatus(const Algorithm& algorithm) {
+    const MpePlayback& mpe = mpeState(algorithm);
+    if (!mpeModeOn(algorithm) && !mpe.fault) {
+        return;
+    }
+    static const char* const kPhases[] = {
+        "Idle", "Finalizing", "Preparing", "Armed", "Playing", "Fault"};
+    static const char* const kBlocked[] = {
+        "",
+        "Blocked: Record Ch not Omni",
+        "Blocked: Play Ch not Original",
+        "Blocked: filters On",
+        "Blocked: invalid zones",
+        "Blocked: zones unknown",
+        "Blocked: zones mismatch",
+        "Overload: Off/On to restart"};
+    const HistoryContextMeta& active =
+        historyControl(algorithm).contexts[kHistoryContextActive];
+    char text[48];
+    BoundedText status(text, sizeof(text));
+    status.append("MPE ");
+    if (mpe.status != kMpeStatusReady && mpe.status < ARRAY_SIZE(kBlocked)) {
+        status.append(kBlocked[mpe.status]);
+    } else {
+        status.append(kPhases[mpePhase(algorithm)]);
+        if (mpe.restartRequired) {
+            status.append(" - Restart to apply setup");
+        } else if (mpe.engaged && active.setupChangesInside) {
+            status.append(" - setup change unsupported");
+        } else if (mpe.engaged && mpe.contextIncomplete) {
+            status.append(" - context incomplete");
+        } else if (mpe.engaged && mpe.setupIncomplete) {
+            status.append(" - setup incomplete");
+        }
+    }
+    nt_host::drawTinyText(0, 63, text);
+}
+
 bool draw(_NT_algorithm* self) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL) {
@@ -3731,6 +5081,7 @@ bool draw(_NT_algorithm* self) {
                                  observed.viewStart, observed.viewEnd, false);
         }
     }
+    drawMpeStatus(*algorithm);
     return true;
 }
 
@@ -4396,6 +5747,18 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
         return false;
     }
     const uint64_t retiredOrdinal = nextHistoryOrdinal(*algorithm);
+    // Base-preset restoration never carries deliberate-entry origin; loaded
+    // state is continuation-only and its restore callbacks are action-free.
+    MpePlayback& mpe = mpeState(*algorithm);
+    mpeForgetOwners(*algorithm);
+    mpe.deliberate = false;
+    mpe.engaged = false;
+    mpe.entryPending = false;
+    mpe.contextPending = false;
+    mpe.fault = false;
+    mpe.restartRequired = false;
+    mpe.status = kMpeStatusReady;
+    mpe.restoreWindow = true;
     const bool restored = deserialiseState(self, parse);
     restartHistory(*algorithm, retiredOrdinal, algorithm->eventCount == 0U);
     return restored;
@@ -4484,6 +5847,39 @@ bool setupObserverSnapshot(const _NT_algorithm* self, SetupObserver& snapshot) {
     return true;
 }
 #endif
+
+bool mpePlaybackSnapshot(const _NT_algorithm* self,
+                         MpePlaybackSnapshot& snapshot) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    const MpePlayback& mpe = mpeState(*algorithm);
+    snapshot = MpePlaybackSnapshot();
+    snapshot.lastStep = mpe.lastStep;
+    snapshot.maximumStep = mpe.maximum;
+    snapshot.ownedNotes = mpe.ownedNoteCount;
+    snapshot.ownedHolds = mpeOwnedCount(mpe) - mpe.ownedNoteCount;
+    snapshot.pendingEndings = mpe.heapSize;
+    snapshot.rejectedClusters = mpe.rejectedClusters;
+    snapshot.generatedSetup = mpe.generatedSetup;
+    snapshot.generatedContext = mpe.generatedContext;
+    snapshot.generatedCleanup = mpe.generatedCleanup;
+    snapshot.scopeMask = mpe.scopeMask;
+    snapshot.lowerMembers = mpe.lower;
+    snapshot.upperMembers = mpe.upper;
+    snapshot.phase = mpePhase(*algorithm);
+    snapshot.status = mpe.status;
+    snapshot.engaged = mpe.engaged;
+    snapshot.deliberate = mpe.deliberate;
+    snapshot.restartRequired = mpe.restartRequired;
+    snapshot.setupChangesInside =
+        historyControl(*algorithm).contexts[kHistoryContextActive]
+            .setupChangesInside;
+    snapshot.setupIncomplete = mpe.setupIncomplete;
+    snapshot.contextIncomplete = mpe.contextIncomplete;
+    return true;
+}
 
 bool musicalDurationFromPulses(uint64_t pulseIntervals,
                                uint32_t pulsesPerBeat,
@@ -4827,6 +6223,9 @@ bool startPlayback(_NT_algorithm* self) {
     PulseRange range = {};
     if (!acquirePlaybackSelection(self, range)) {
         return false;
+    }
+    if (mpeModeOn(*algorithm)) {
+        return mpeStartPlayback(*algorithm, range);
     }
 
     // A valid continuing request is a capture-stop path: freeze a finite

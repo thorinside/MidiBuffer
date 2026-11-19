@@ -25,6 +25,10 @@ const size_t kFilterAftertouchParameter = 8;
 const size_t kPulsesPerDisplayedBeatParameter = 9;
 const size_t kPlaybackParameter = 10;
 const size_t kClearRecordingParameter = 11;
+const size_t kMpeModeParameter = 12;
+const size_t kMpeSetupSourceParameter = 13;
+const size_t kLowerMembersParameter = 14;
+const size_t kUpperMembersParameter = 15;
 
 const uint32_t kPulsesPerDisplayedBeatValues[] = {1, 2, 4, 8, 16, 24, 48};
 
@@ -448,8 +452,8 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                        capacities[mb - 1],
                "MPE arena preserves each decimal event capacity");
     }
-    expect(host.requirements().numParameters == 12,
-           "indices 0 through 9 stay stable and Playback/Clear Recording append at 10 and 11");
+    expect(host.requirements().numParameters == 16,
+           "indices 0 through 11 stay stable and the four MPE controls append at 12 through 15");
     expect(host.requirements().dram == 3524288U,
            "selected recording bytes and separate MPE arena are requested from DRAM");
     expect(host.hostAllocatedBytes() ==
@@ -600,7 +604,7 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                host.algorithm()->parameters[kClearRecordingParameter].def == 0,
            "appended Playback and reserved Clear Recording expose Boolean Off/On values");
     const _NT_parameterPages* pages = host.algorithm()->parameterPages;
-    expect(pages->numPages == 4 && pages->pages[1].numParams == 3 &&
+    expect(pages->numPages == 5 && pages->pages[1].numParams == 3 &&
                pages->pages[1].params[2] == kClearRecordingParameter &&
                pages->pages[2].numParams == 6 &&
                pages->pages[2].params[0] == kPlaybackParameter &&
@@ -610,8 +614,31 @@ void verifyEntryAndLifecycle(midibuffer_test::HostDouble& host) {
                pages->pages[2].params[5] == kFilterAftertouchParameter &&
                pages->pages[3].numParams == 1 &&
                pages->pages[3].params[0] ==
-                   kPulsesPerDisplayedBeatParameter,
+                   kPulsesPerDisplayedBeatParameter &&
+               pages->pages[4].numParams == 4 &&
+               pages->pages[4].params[0] == kMpeModeParameter &&
+               pages->pages[4].params[3] == kUpperMembersParameter,
            "new controls join their pages without renumbering inherited controls");
+    // ac-002: the appended MPE controls default to legacy-safe Off/Observed
+    // with zero manual members; counts are 0..15.
+    const _NT_parameter* params = host.algorithm()->parameters;
+    expect(std::strcmp(params[kMpeModeParameter].name, "MPE Mode") == 0 &&
+               params[kMpeModeParameter].def == 0 &&
+               params[kMpeModeParameter].max == 1 &&
+               std::strcmp(params[kMpeSetupSourceParameter].enumStrings[0],
+                           "Observed") == 0 &&
+               std::strcmp(params[kMpeSetupSourceParameter].enumStrings[1],
+                           "Manual") == 0 &&
+               params[kMpeSetupSourceParameter].def == 0 &&
+               params[kLowerMembersParameter].def == 0 &&
+               params[kLowerMembersParameter].max == 15 &&
+               params[kUpperMembersParameter].def == 0 &&
+               params[kUpperMembersParameter].max == 15 &&
+               host.parameter(kMpeModeParameter) == 0 &&
+               host.parameter(kMpeSetupSourceParameter) == 0 &&
+               host.parameter(kLowerMembersParameter) == 0 &&
+               host.parameter(kUpperMembersParameter) == 0,
+           "MPE Mode/Setup/Lower/Upper append at 12..15 with Off/Observed/zero defaults");
 }
 
 void verifyMusicalDurationFormattingAndReadouts() {
@@ -5697,7 +5724,7 @@ void verifySharedControlPresetRestoration() {
     midibuffer_test::PresetImage image;
     int16_t savedPlayback = -1;
     int16_t savedClear = -1;
-    expect(source.savePreset(image) && image.parameterCount() == 12U &&
+    expect(source.savePreset(image) && image.parameterCount() == 16U &&
                image.parameter(kPlaybackParameter, savedPlayback) &&
                image.parameter(kClearRecordingParameter, savedClear) &&
                savedPlayback == 1 && savedClear == 1,
@@ -6813,6 +6840,1108 @@ void verifyHostOutputTrace() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// MPE playback through the production callbacks. Fixtures record at a steady
+// 16-sample clock and replay at the same tempo, so a message received right
+// after a clock edge (offset 8) replays 8 samples after its playback pulse.
+// Messages sent between the same two steps share one sample and keep their
+// receipt order.
+
+struct MpeRig {
+    uint64_t clock; // sample of the most recent delivered clock edge
+};
+
+struct ExpectedMidi {
+    uint8_t status;
+    uint8_t data1;
+    uint8_t data2;
+};
+
+struct MidiList {
+    ExpectedMidi items[512];
+    size_t count;
+
+    void add(uint8_t status, uint8_t data1, uint8_t data2 = 0U) {
+        if (count < ARRAY_SIZE(items)) {
+            items[count].status = status;
+            items[count].data1 = data1;
+            items[count].data2 = data2;
+        }
+        ++count;
+    }
+    void rpn(uint8_t channel, uint8_t parameter, uint8_t msb, int lsb) {
+        const uint8_t status = static_cast<uint8_t>(0xb0U | channel);
+        add(status, 101U, 0U);
+        add(status, 100U, parameter);
+        add(status, 6U, msb);
+        if (lsb >= 0) {
+            add(status, 38U, static_cast<uint8_t>(lsb));
+        }
+        add(status, 101U, 127U);
+        add(status, 100U, 127U);
+    }
+    void range(uint8_t channel, uint16_t cents) {
+        rpn(channel, 0U, static_cast<uint8_t>(cents / 100U), cents % 100U);
+    }
+    void lowerMembers(uint8_t count, uint16_t cents) {
+        for (uint8_t member = 1; member <= count; ++member) {
+            range(member, cents);
+        }
+    }
+    void upperMembers(uint8_t count, uint16_t cents) {
+        for (uint8_t member = 1; member <= count; ++member) {
+            range(static_cast<uint8_t>(15U - member), cents);
+        }
+    }
+};
+
+bool midiAt(size_t index, uint8_t status, uint8_t data1, uint8_t data2) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    if (index >= current.midiCallCount) {
+        return false;
+    }
+    const midibuffer_test::MidiCall& call = current.midiCalls[index];
+    const uint8_t size = (status & 0xf0U) == 0xd0U ? 2U : 3U;
+    return call.size == size && call.bytes[0] == status &&
+           call.bytes[1] == data1 && (size == 2U || call.bytes[2] == data2);
+}
+
+// Matches `expected` at `cursor` and advances past it.
+bool midiSequence(size_t& cursor, const MidiList& expected) {
+    for (size_t index = 0; index < expected.count; ++index) {
+        if (!midiAt(cursor + index, expected.items[index].status,
+                    expected.items[index].data1, expected.items[index].data2)) {
+            return false;
+        }
+    }
+    cursor += expected.count;
+    return true;
+}
+
+bool midiCallsAt(size_t from, size_t count, uint64_t sample) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    for (size_t index = from; index < from + count; ++index) {
+        if (index >= current.midiCallCount ||
+            current.midiCalls[index].dispatchSample != sample) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t countMidi(size_t from, uint8_t status, int data1 = -1) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    size_t count = 0U;
+    for (size_t index = from; index < current.midiCallCount; ++index) {
+        if (current.midiCalls[index].bytes[0] == status &&
+            (data1 < 0 || current.midiCalls[index].bytes[1] == data1)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Wrap is not panic and continuation never reconfigures the receiver.
+bool noSetupOrPanicFrom(size_t from) {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    for (size_t index = from; index < current.midiCallCount; ++index) {
+        const midibuffer_test::MidiCall& call = current.midiCalls[index];
+        if ((call.bytes[0] & 0xf0U) == 0xb0U &&
+            (call.bytes[1] == 6U || call.bytes[1] == 38U ||
+             call.bytes[1] == 100U || call.bytes[1] == 101U ||
+             call.bytes[1] == 120U || call.bytes[1] == 123U)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+midibuffer::MpePlaybackSnapshot mpeSnapshot(midibuffer_test::HostDouble& host) {
+    midibuffer::MpePlaybackSnapshot state = {};
+    expect(midibuffer::mpePlaybackSnapshot(host.algorithm(), state),
+           "MPE playback snapshot is readable");
+    return state;
+}
+
+void mpeInstantiate(midibuffer_test::HostDouble& host, MpeRig& rig,
+                    int32_t megabytes = 1) {
+    expect(host.instantiate(megabytes), "MPE fixture host constructs");
+    rig.clock = 16U;
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "MPE fixture acquires a 16-sample clock");
+}
+
+void mpeClock(midibuffer_test::HostDouble& host, MpeRig& rig) {
+    rig.clock += 16U;
+    while (rig.clock < host.elapsedSamples()) {
+        rig.clock += 16U; // stay on the 16-sample grid after free-running steps
+    }
+    expect(clockPulseAt(host, rig.clock), "MPE fixture clock edge is delivered");
+}
+
+void mpeClocks(midibuffer_test::HostDouble& host, MpeRig& rig, uint32_t count) {
+    for (uint32_t index = 0; index < count; ++index) {
+        mpeClock(host, rig);
+    }
+}
+
+// Starts capture and returns the first captured pulse.
+uint64_t mpeBeginTake(midibuffer_test::HostDouble& host, MpeRig& rig) {
+    startCapture(host);
+    mpeClock(host, rig);
+    return snapshot(host).currentPulse;
+}
+
+void mpeEndTake(midibuffer_test::HostDouble& host, MpeRig& rig) {
+    mpeClocks(host, rig, 2U);
+    stopCapture(host);
+    mpeClock(host, rig);
+}
+
+// Fresh live Playback On; clocks continue until the MPE entry plays.
+// Returns the activation clock sample, or 0 if it never played.
+uint64_t mpeEnter(midibuffer_test::HostDouble& host, MpeRig& rig,
+                  uint32_t maximumClocks = 64U) {
+    changeParameter(host, kPlaybackParameter, 1);
+    for (uint32_t index = 0; index < maximumClocks; ++index) {
+        mpeClock(host, rig);
+        if (mpeSnapshot(host).phase == midibuffer::kMpePhasePlaying) {
+            return rig.clock;
+        }
+    }
+    return 0U;
+}
+
+void setManualScope(midibuffer_test::HostDouble& host, int16_t lower,
+                    int16_t upper) {
+    changeParameter(host, kMpeSetupSourceParameter, 1);
+    changeParameter(host, kLowerMembersParameter, lower);
+    changeParameter(host, kUpperMembersParameter, upper);
+}
+
+void memberRange(midibuffer_test::HostDouble& host, uint8_t channel,
+                 uint8_t semitones, uint8_t cents) {
+    bend(host, channel, semitones, cents);
+    sendMidi(host, static_cast<uint8_t>(0xb0U | channel), 101, 127);
+    sendMidi(host, static_cast<uint8_t>(0xb0U | channel), 100, 127);
+}
+
+// ac-003/ac-001: the canonical two-member fixture, recorded and replayed in
+// the existing single loop. Observed lower-15 setup precedes capture; the
+// deliberate start sends generated setup first, then the unchanged input
+// bytes with their lengths, channels and equal-time receipt order. The next
+// pass repeats them with no setup, CC120 or CC123.
+void verifyMpeCanonicalTwoMemberFixtureReplaysExactly() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0xE1, 0x01, 0x40);
+    sendMidi(host, 0xD1, 0x20, 0);
+    sendMidi(host, 0xB1, 0x4A, 0x30);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    sendMidi(host, 0xE2, 0x00, 0x50);
+    sendMidi(host, 0xD2, 0x60, 0);
+    sendMidi(host, 0xB2, 0x4A, 0x70);
+    sendMidi(host, 0x92, 0x3C, 0x50);
+    sendMidi(host, 0xB0, 0x40, 0x7F);
+    sendMidi(host, 0xB0, 0x01, 0x22);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x2D);
+    sendMidi(host, 0x92, 0x3C, 0x00);
+    sendMidi(host, 0xB0, 0x40, 0x00);
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "canonical MPE take is selectable in the existing timeline");
+    changeParameter(host, kMpeModeParameter, 1);
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    expect(entry != 0U, "canonical MPE fixture enters playback");
+    stepThrough(host, entry + 15U);
+    mpeClock(host, rig);
+    stepThrough(host, rig.clock + 15U);
+    const size_t firstPassEnd = midibuffer_test::trace().midiCallCount;
+    mpeClock(host, rig); // wrap
+    stepThrough(host, rig.clock + 15U);
+    mpeClock(host, rig);
+    stepThrough(host, rig.clock + 15U);
+
+    MidiList setup = {};
+    setup.rpn(0, 6, 15, -1);
+    setup.range(0, 200);
+    setup.lowerMembers(15, 4800);
+    MidiList attacks = {};
+    attacks.add(0xE1, 0x01, 0x40);
+    attacks.add(0xD1, 0x20);
+    attacks.add(0xB1, 0x4A, 0x30);
+    attacks.add(0x91, 0x3C, 0x64);
+    attacks.add(0xE2, 0x00, 0x50);
+    attacks.add(0xD2, 0x60);
+    attacks.add(0xB2, 0x4A, 0x70);
+    attacks.add(0x92, 0x3C, 0x50);
+    attacks.add(0xB0, 0x40, 0x7F);
+    attacks.add(0xB0, 0x01, 0x22);
+    MidiList releases = {};
+    releases.add(0x81, 0x3C, 0x2D);
+    releases.add(0x92, 0x3C, 0x00);
+    releases.add(0xB0, 0x40, 0x00);
+
+    size_t cursor = 0U;
+    const midibuffer::MpePlaybackSnapshot state = mpeSnapshot(host);
+    expect(midiSequence(cursor, setup) && midiCallsAt(0U, setup.count, entry) &&
+               state.generatedSetup == setup.count &&
+               state.generatedContext == 0U && state.lowerMembers == 15U &&
+               state.scopeMask == 0xffffU,
+           "deliberate entry sends only the observed lower-15 MCM and ranges as generated setup");
+    const size_t attackStart = cursor;
+    expect(midiSequence(cursor, attacks) &&
+               midiCallsAt(attackStart, attacks.count, entry + 8U),
+           "two-member attacks keep low bend bits, two-byte pressure, CC74, manager controls and receipt order");
+    const size_t releaseStart = cursor;
+    expect(midiSequence(cursor, releases) &&
+               midiCallsAt(releaseStart, releases.count, entry + 24U) &&
+               cursor == firstPassEnd,
+           "independent Note Off velocity, zero-velocity release and manager hold release replay exactly");
+    expect(midiSequence(cursor, attacks) && midiSequence(cursor, releases) &&
+               cursor == midibuffer_test::trace().midiCallCount &&
+               noSetupOrPanicFrom(firstPassEnd) &&
+               mpeSnapshot(host).generatedCleanup == 0U,
+           "the next pass repeats the recorded bytes with no wrap setup, panic or generated cut");
+    for (size_t index = 0; index < midibuffer_test::trace().midiCallCount;
+         ++index) {
+        expect(midibuffer_test::trace().midiCalls[index].destination ==
+                   kNT_destinationBreakout,
+               "MPE replay uses the selected destination");
+    }
+}
+
+// ac-003: legal sharing is preserved. Two pitches share a member channel and
+// sixteen notes use fifteen members without stealing or generated endings.
+void verifyMpeMemberSharingAndSixteenNotesOnFifteenMembers() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    for (uint8_t channel = 1; channel < 16U; ++channel) {
+        sendMidi(host, static_cast<uint8_t>(0x90U | channel), 0x30 + channel, 0x50);
+    }
+    sendMidi(host, 0x91, 0x50, 0x51); // second pitch shares member 2
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x50, 0x11);
+    for (uint8_t channel = 1; channel < 16U; ++channel) {
+        sendMidi(host, static_cast<uint8_t>(0x80U | channel), 0x30 + channel, 0x22);
+    }
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "sharing fixture is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 15U);
+    mpeClock(host, rig);
+    stepThrough(host, rig.clock + 15U);
+    const size_t setupCount = mpeSnapshot(host).generatedSetup;
+    size_t cursor = setupCount;
+    MidiList expected = {};
+    for (uint8_t channel = 1; channel < 16U; ++channel) {
+        expected.add(static_cast<uint8_t>(0x90U | channel), 0x30 + channel, 0x50);
+    }
+    expected.add(0x91, 0x50, 0x51);
+    expected.add(0x81, 0x50, 0x11);
+    for (uint8_t channel = 1; channel < 16U; ++channel) {
+        expected.add(static_cast<uint8_t>(0x80U | channel), 0x30 + channel, 0x22);
+    }
+    expect(entry != 0U && midiSequence(cursor, expected) &&
+               cursor == midibuffer_test::trace().midiCallCount &&
+               mpeSnapshot(host).generatedCleanup == 0U &&
+               mpeSnapshot(host).ownedNotes == 0U,
+           "different-pitch sharing and sixteen notes on fifteen members play and end independently");
+}
+
+// Records one member note across a two-pulse selection after `setup` ran
+// before capture. Returns the selection start.
+typedef void (*MpeSetupFixture)(midibuffer_test::HostDouble& host);
+
+uint64_t recordMemberNoteTake(midibuffer_test::HostDouble& host, MpeRig& rig,
+                              MpeSetupFixture setup) {
+    mpeInstantiate(host, rig);
+    if (setup != NULL) {
+        setup(host);
+    }
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "member-note take is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+    return start;
+}
+
+void observedLower15(midibuffer_test::HostDouble& host) { mcm(host, 0, 15); }
+void observedLower5(midibuffer_test::HostDouble& host) { mcm(host, 0, 5); }
+void observedUpper5(midibuffer_test::HostDouble& host) { mcm(host, 15, 5); }
+
+struct MpeBlockCase {
+    MpeSetupFixture setup;
+    size_t parameter;   // conflicting control, or kPlaybackParameter for none
+    int16_t value;
+    bool manual;
+    int16_t lower;
+    int16_t upper;
+    uint8_t status;
+    const char* message;
+};
+
+// ac-002: each invalid scope, known/manual mismatch and conflicting channel or
+// filter setting visibly blocks MPE entry with zero output.
+void verifyMpeScopeAndConflictsVisiblyBlockEntry() {
+    const MpeBlockCase cases[] = {
+        {NULL, kPlaybackParameter, 0, false, 0, 0,
+         midibuffer::kMpeStatusScopeUnknown,
+         "Observed source without a known zone blocks entry"},
+        {NULL, kPlaybackParameter, 0, true, 0, 0,
+         midibuffer::kMpeStatusInvalidScope,
+         "Manual zero members on both zones blocks entry"},
+        {NULL, kPlaybackParameter, 0, true, 8, 7,
+         midibuffer::kMpeStatusInvalidScope,
+         "Manual overlapping lower 8 and upper 7 blocks entry"},
+        {observedLower15, kPlaybackParameter, 0, true, 0, 3,
+         midibuffer::kMpeStatusMismatch,
+         "known lower-15/upper-disabled observation contradicts Manual upper 3"},
+        {observedLower5, kPlaybackParameter, 0, true, 6, 0,
+         midibuffer::kMpeStatusMismatch,
+         "known lower count 5 contradicts Manual lower 6"},
+        {observedLower15, kRecordingChannelParameter, 2, false, 0, 0,
+         midibuffer::kMpeStatusRecordChannel,
+         "Record Ch other than Omni blocks entry"},
+        {observedLower15, kPlaybackChannelParameter, 1, false, 0, 0,
+         midibuffer::kMpeStatusPlayChannel,
+         "Play Ch other than Original blocks entry"},
+        {observedLower15, kFilterControlChangeParameter, 1, false, 0, 0,
+         midibuffer::kMpeStatusFilters, "Filter CC On blocks entry"},
+        {observedLower15, kFilterPitchBendParameter, 1, false, 0, 0,
+         midibuffer::kMpeStatusFilters, "Filter Pitch Bend On blocks entry"},
+        {observedLower15, kFilterAftertouchParameter, 1, false, 0, 0,
+         midibuffer::kMpeStatusFilters, "Filter Aftertouch On blocks entry"},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(cases); ++index) {
+        const MpeBlockCase& entry = cases[index];
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordMemberNoteTake(host, rig, entry.setup);
+        if (entry.manual) {
+            setManualScope(host, entry.lower, entry.upper);
+        }
+        if (entry.parameter != kPlaybackParameter) {
+            changeParameter(host, entry.parameter, entry.value);
+        }
+        midibuffer_test::resetTrace();
+        expect(mpeEnter(host, rig, 6U) == 0U, entry.message);
+        const midibuffer::MpePlaybackSnapshot state = mpeSnapshot(host);
+        expect(state.status == entry.status &&
+                   state.phase == midibuffer::kMpePhaseIdle && !state.engaged &&
+                   midibuffer_test::trace().midiCallCount == 0U &&
+                   host.parameter(kPlaybackParameter) == 1,
+               "a blocked request keeps Playback On, emits nothing and cannot configure the receiver");
+        expect(host.factory()->draw(host.algorithm()) &&
+                   drawContainsSubstring("MPE Blocked"),
+               "the blocking reason is drawn");
+
+        if (entry.parameter == kFilterControlChangeParameter) {
+            // A live correction completes the original deliberate request.
+            changeParameter(host, entry.parameter, 0);
+            const uint64_t started = rig.clock;
+            mpeClocks(host, rig, 2U);
+            expect(mpeSnapshot(host).phase == midibuffer::kMpePhasePlaying &&
+                       mpeSnapshot(host).generatedSetup != 0U && started != 0U,
+                   "a live filter correction completes the blocked deliberate start with setup");
+        }
+    }
+}
+
+struct MpeScopeCase {
+    MpeSetupFixture setup;
+    int16_t lower;
+    int16_t upper;
+    uint16_t scopeMask;
+    const char* message;
+};
+
+// ac-002: valid Manual scopes, including one known zone with the opposite
+// unknown in both directions, never guess an MCM.
+void verifyMpeValidManualScopesNeverGuessMcm() {
+    const MpeScopeCase cases[] = {
+        {NULL, 15, 0, 0xffffU, "Manual single 15-member lower zone is valid"},
+        {NULL, 7, 7, 0xffffU, "Manual valid dual 7+7 scope is valid"},
+        {observedLower5, 5, 4, 0xf83fU,
+         "lower-known/upper-unknown Manual scope restores only lower RPN0 ranges"},
+        {observedUpper5, 4, 5, 0xfc1fU,
+         "upper-known/lower-unknown Manual scope restores only upper RPN0 ranges"},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(cases); ++index) {
+        const MpeScopeCase& entry = cases[index];
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordMemberNoteTake(host, rig, entry.setup);
+        setManualScope(host, entry.lower, entry.upper);
+        midibuffer_test::resetTrace();
+        const uint64_t started = mpeEnter(host, rig);
+        stepThrough(host, rig.clock + 8U);
+        const midibuffer::MpePlaybackSnapshot state = mpeSnapshot(host);
+        MidiList expected = {};
+        if (entry.setup == observedLower5) {
+            expected.range(0, 200);
+            expected.lowerMembers(5, 4800);
+        } else if (entry.setup == observedUpper5) {
+            expected.range(15, 200);
+            expected.upperMembers(5, 4800);
+        }
+        expected.add(0x91, 0x3C, 0x64);
+        size_t cursor = 0U;
+        bool mcmSent = false;
+        for (size_t call = 0; call < midibuffer_test::trace().midiCallCount;
+             ++call) {
+            mcmSent = mcmSent ||
+                      (midibuffer_test::trace().midiCalls[call].bytes[1] == 100U &&
+                       midibuffer_test::trace().midiCalls[call].bytes[2] == 6U);
+        }
+        expect(started != 0U && state.status == midibuffer::kMpeStatusReady &&
+                   state.scopeMask == entry.scopeMask &&
+                   midiSequence(cursor, expected) && !mcmSent,
+               entry.message);
+    }
+}
+
+// ac-002/ac-008: a live relevant control change during MPE play cleans the
+// stored old route, cancels ownership and stops intent before a restart.
+void verifyMpeLiveRouteChangeCleansOldRouteAndStops() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    recordMemberNoteTake(host, rig, observedLower15);
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 10U);
+    expect(entry != 0U && mpeSnapshot(host).ownedNotes == 1U,
+           "the member attack is owned on the Breakout route");
+    const size_t before = midibuffer_test::trace().midiCallCount;
+    changeParameter(host, kPlaybackDestinationParameter, 1); // USB
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    expect(current.midiCallCount == before + 1U &&
+               midiAt(before, 0x81, 0x3C, 0x00) &&
+               current.midiCalls[before].destination == kNT_destinationBreakout &&
+               host.parameter(kPlaybackParameter) == 0 &&
+               mpeSnapshot(host).phase == midibuffer::kMpePhaseIdle &&
+               mpeSnapshot(host).ownedNotes == 0U,
+           "destination change ends the owned note on its latched old route and stops intent");
+    mpeClocks(host, rig, 4U);
+    expect(midibuffer_test::trace().midiCallCount == before + 1U,
+           "stopped intent emits nothing until a deliberate restart");
+}
+
+// Plays the selected range once from a fresh deliberate entry and returns
+// the entry sample (0 when blocked).
+uint64_t mpePlayFirstPulse(midibuffer_test::HostDouble& host, MpeRig& rig) {
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 15U);
+    return entry;
+}
+
+// ac-005: known context received before clock/capture, manager-only context
+// and pre-selection equal-time changes restore historical values, not the
+// newest history or later live input, before the first attack.
+void verifyMpeHistoricalContextPrecedesFirstAttack() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    expect(host.instantiate(1), "historical-context host constructs");
+    mcm(host, 0, 7);
+    sendMidi(host, 0xE1, 0x10, 0x50); // before clock and capture
+    sendMidi(host, 0xD1, 0x33, 0);
+    sendMidi(host, 0xB1, 0x4A, 0x44);
+    sendMidi(host, 0xB0, 0x01, 0x05); // manager-only context
+    sendMidi(host, 0xB0, 0x0B, 0x60);
+    rig.clock = 16U;
+    expect(clockPulseAt(host, 0U) && clockPulseAt(host, 16U),
+           "historical-context clock is acquired after the context");
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    sendMidi(host, 0xE2, 0x11, 0x11); // equal-time changes before an attack
+    sendMidi(host, 0xE2, 0x22, 0x22);
+    mpeClock(host, rig);
+    sendMidi(host, 0x92, 0x40, 0x64);
+    sendMidi(host, 0xE1, 0x7F, 0x7F); // newer history after the selections
+    mpeClock(host, rig);
+    sendMidi(host, 0x82, 0x40, 0x00);
+    mpeEndTake(host, rig);
+    sendMidi(host, 0xE1, 0x00, 0x00); // later live input
+    sendMidi(host, 0xB0, 0x01, 0x7F);
+    changeParameter(host, kMpeModeParameter, 1);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "pre-capture context selection is valid");
+    const uint64_t entry = mpePlayFirstPulse(host, rig);
+    MidiList expected = {};
+    expected.add(0xB0, 0x01, 0x05);
+    expected.add(0xB0, 0x0B, 0x60);
+    expected.add(0xE1, 0x10, 0x50);
+    expected.add(0xD1, 0x33);
+    expected.add(0xB1, 0x4A, 0x44);
+    size_t cursor = mpeSnapshot(host).generatedSetup;
+    const size_t contextStart = cursor;
+    expect(entry != 0U && midiSequence(cursor, expected) &&
+               midiCallsAt(contextStart, expected.count, entry) &&
+               midiAt(cursor, 0x91, 0x3C, 0x64) &&
+               mpeSnapshot(host).generatedContext == expected.count &&
+               mpeSnapshot(host).contextIncomplete,
+           "pre-clock member and manager-only context precede the attack with historical values and an incomplete-context warning");
+
+    changeParameter(host, kPlaybackParameter, 0);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start + 2U,
+                                         start + 3U),
+           "pre-selection context selection is valid");
+    const uint32_t setupBefore = mpeSnapshot(host).generatedSetup;
+    const uint64_t second = mpePlayFirstPulse(host, rig);
+    MidiList later = {};
+    later.add(0xB0, 0x01, 0x05);
+    later.add(0xB0, 0x0B, 0x60);
+    later.add(0xE1, 0x10, 0x50);
+    later.add(0xD1, 0x33);
+    later.add(0xB1, 0x4A, 0x44);
+    later.add(0xE2, 0x22, 0x22);
+    later.add(0x92, 0x40, 0x64);
+    cursor = mpeSnapshot(host).generatedSetup - setupBefore;
+    expect(second != 0U && midiSequence(cursor, later),
+           "pre-selection equal-time changes restore the last received value, not newer history or live input");
+}
+
+// ac-005: a music-free capture gap seeds the live change made while capture
+// was paused; synthetic finalization endings remain tagged and do not seed it.
+void verifyMpeResumptionSeedAndMissingContext() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    mpeBeginTake(host, rig);
+    sendMidi(host, 0xE1, 0x01, 0x70);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    mpeEndTake(host, rig); // finalization appends a tagged bend ending
+    sendMidi(host, 0xE2, 0x55, 0x55); // music-free gap change
+    mpeClocks(host, rig, 2U);
+    const uint64_t resumed = mpeBeginTake(host, rig);
+    sendMidi(host, 0x92, 0x30, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x82, 0x30, 0x00);
+    mpeEndTake(host, rig);
+    changeParameter(host, kMpeModeParameter, 1);
+    expect(midibuffer::setPulseSelection(host.algorithm(), resumed, resumed + 2U),
+           "resumed take is selectable");
+    const uint64_t entry = mpePlayFirstPulse(host, rig);
+    MidiList expected = {};
+    expected.add(0xE1, 0x01, 0x70);
+    expected.add(0xE2, 0x55, 0x55);
+    expected.add(0x92, 0x30, 0x64);
+    size_t cursor = mpeSnapshot(host).generatedSetup;
+    expect(entry != 0U && midiSequence(cursor, expected),
+           "the resumption seed restores the gap change and the observed bend, not the generated centre");
+
+    // Missing context: Manual scope over a take with no prior expression
+    // warns, sends no invented values and never reconstructs a pre-range attack.
+    midibuffer_test::HostDouble bare;
+    MpeRig bareRig = {};
+    mpeInstantiate(bare, bareRig);
+    const uint64_t bareStart = mpeBeginTake(bare, bareRig);
+    sendMidi(bare, 0x91, 0x3C, 0x64);
+    mpeClock(bare, bareRig);
+    sendMidi(bare, 0x93, 0x40, 0x64);
+    mpeClock(bare, bareRig);
+    sendMidi(bare, 0x81, 0x3C, 0x00);
+    sendMidi(bare, 0x83, 0x40, 0x00);
+    mpeEndTake(bare, bareRig);
+    changeParameter(bare, kMpeModeParameter, 1);
+    setManualScope(bare, 15, 0);
+    expect(midibuffer::setPulseSelection(bare.algorithm(), bareStart + 1U,
+                                         bareStart + 3U),
+           "selection after a pre-range attack is valid");
+    const uint64_t bareEntry = mpePlayFirstPulse(bare, bareRig);
+    mpeClock(bare, bareRig);
+    stepThrough(bare, bareRig.clock + 15U);
+    cursor = 0U;
+    MidiList bareExpected = {};
+    bareExpected.add(0x93, 0x40, 0x64);
+    bareExpected.add(0x83, 0x40, 0x00);
+    expect(bareEntry != 0U && midiSequence(cursor, bareExpected) &&
+               cursor == midibuffer_test::trace().midiCallCount &&
+               mpeSnapshot(bare).generatedContext == 0U &&
+               mpeSnapshot(bare).contextIncomplete &&
+               bare.factory()->draw(bare.algorithm()) &&
+               drawContainsSubstring("context incomplete"),
+           "missing context warns and plays with no invented values or pre-range attack/release");
+}
+
+void observedLowerSetupWith1200(midibuffer_test::HostDouble& host) {
+    mcm(host, 0, 15);
+    memberRange(host, 1, 12, 0);
+}
+
+// ac-006: a selected stable old take restores its effective setup despite
+// later live MCM/range changes.
+void verifyMpeOldTakeRestoresItsOwnSetup() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    recordMemberNoteTake(host, rig, observedLowerSetupWith1200);
+    mcm(host, 0, 7);
+    memberRange(host, 1, 24, 0);
+    const uint64_t entry = mpePlayFirstPulse(host, rig);
+    MidiList expected = {};
+    expected.rpn(0, 6, 15, -1);
+    expected.range(0, 200);
+    expected.lowerMembers(15, 1200);
+    expected.add(0x91, 0x3C, 0x64);
+    size_t cursor = 0U;
+    expect(entry != 0U && midiSequence(cursor, expected) &&
+               midibuffer_test::trace().midiCalls[0].dispatchSample == entry,
+           "old take restores MCM 15 and its 12-semitone member range despite later live setup");
+}
+
+void observedLower7(midibuffer_test::HostDouble& host) { mcm(host, 0, 7); }
+void observedLower7RelativeMember(midibuffer_test::HostDouble& host) {
+    mcm(host, 0, 7);
+    selectRpn(host, 1, 0, 0);
+    sendMidi(host, 0xB1, 96, 1); // relative: member range indeterminate
+}
+void manualRpnOnly(midibuffer_test::HostDouble& host) {
+    memberRange(host, 0, 3, 0);
+    memberRange(host, 1, 12, 0);
+    memberRange(host, 5, 12, 0);
+}
+
+// ac-006: known single-zone setup restores with an unknown opposite zone;
+// an MCM that would reset an indeterminate range is omitted; Manual-known
+// RPN0-only restoration never guesses MCM.
+void verifyMpeSafeSetupFragments() {
+    {
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordMemberNoteTake(host, rig, observedLower7);
+        const uint64_t entry = mpePlayFirstPulse(host, rig);
+        MidiList expected = {};
+        expected.rpn(0, 6, 7, -1);
+        expected.range(0, 200);
+        expected.lowerMembers(7, 4800);
+        expected.add(0x91, 0x3C, 0x64);
+        size_t cursor = 0U;
+        expect(entry != 0U && midiSequence(cursor, expected) &&
+                   mpeSnapshot(host).scopeMask == 0x00ffU &&
+                   !mpeSnapshot(host).setupIncomplete,
+               "known lower-7 setup restores alone while the upper zone stays unknown");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordMemberNoteTake(host, rig, observedLower7RelativeMember);
+        const uint64_t entry = mpePlayFirstPulse(host, rig);
+        MidiList expected = {};
+        expected.range(0, 200);
+        expected.add(0x91, 0x3C, 0x64);
+        size_t cursor = 0U;
+        expect(entry != 0U && midiSequence(cursor, expected) &&
+                   mpeSnapshot(host).setupIncomplete,
+               "an MCM that would reset an indeterminate member range is omitted and flagged");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordMemberNoteTake(host, rig, manualRpnOnly);
+        setManualScope(host, 15, 0);
+        const uint64_t entry = mpePlayFirstPulse(host, rig);
+        MidiList expected = {};
+        expected.range(0, 300);
+        expected.lowerMembers(15, 1200);
+        expected.add(0x91, 0x3C, 0x64);
+        size_t cursor = 0U;
+        expect(entry != 0U && midiSequence(cursor, expected),
+               "Manual scope restores unambiguous known RPN0 ranges without any MCM");
+    }
+}
+
+// ac-006/ac-008: setup changing inside the selected take is flagged as
+// unsupported, and a different-fingerprint range edit keeps the active range
+// and requests restart while a compatible edit is adopted at the wrap.
+void verifyMpeSetupChangingSelectionsAndRangeEdits() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    sendMidi(host, 0x91, 0x3E, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3E, 0x00);
+    mcm(host, 0, 7); // setup changes while recording
+    sendMidi(host, 0x91, 0x40, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x40, 0x00);
+    mpeEndTake(host, rig);
+    changeParameter(host, kMpeModeParameter, 1);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 4U),
+           "setup-changing take is selectable");
+    const uint64_t entry = mpePlayFirstPulse(host, rig);
+    expect(entry != 0U && mpeSnapshot(host).setupChangesInside &&
+               host.factory()->draw(host.algorithm()) &&
+               drawContainsSubstring("setup change unsupported"),
+           "a selection containing a setup change plays but is visibly unsupported");
+    changeParameter(host, kPlaybackParameter, 0);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "stable lower-15 range is selectable");
+    const uint64_t stable = mpePlayFirstPulse(host, rig);
+    expect(stable != 0U && !mpeSnapshot(host).setupChangesInside,
+           "stable range plays without the unsupported flag");
+    expect(midibuffer::setPulseSelection(host.algorithm(), start + 2U,
+                                         start + 4U),
+           "a range with a different setup can be requested while playing");
+    mpeClocks(host, rig, 3U);
+    midibuffer::CaptureSnapshot after = snapshot(host);
+    expect(after.activeSelection.startPulse == start &&
+               after.activeSelection.endPulse == start + 2U &&
+               !after.rangeTransitionPending &&
+               mpeSnapshot(host).restartRequired &&
+               host.factory()->draw(host.algorithm()) &&
+               drawContainsSubstring("Restart to apply setup"),
+           "a different-fingerprint edit keeps the active range and requests restart");
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 1U),
+           "a compatible shorter range can be requested");
+    mpeClocks(host, rig, 3U);
+    after = snapshot(host);
+    expect(after.activeSelection.startPulse == start &&
+               after.activeSelection.endPulse == start + 1U,
+           "a ready compatible candidate is adopted at the wrap");
+}
+
+// Lower-7 zone with member CC74 context, an owned member note, manager CC64
+// and member CC66 held past the loop end, and an ordinary channel-10 note
+// whose recorded tail crosses the wrap.
+uint64_t recordWrapOwnershipTake(midibuffer_test::HostDouble& host, MpeRig& rig) {
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 7);
+    sendMidi(host, 0xB1, 0x4A, 0x40);
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    sendMidi(host, 0xB0, 0x40, 0x7F);
+    sendMidi(host, 0xB1, 0x42, 0x7F);
+    mpeClocks(host, rig, 2U);
+    sendMidi(host, 0x99, 0x30, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    sendMidi(host, 0xB0, 0x40, 0x00);
+    sendMidi(host, 0xB1, 0x42, 0x00);
+    sendMidi(host, 0x89, 0x30, 0x00);
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 3U),
+           "wrap ownership take is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+    return start;
+}
+
+// ac-008: at an MPE wrap owned note endings precede owned holds, stale
+// endings are cancelled and known context precedes the next attacks, while an
+// unrelated ordinary-channel tail survives with its recorded ending. No
+// MCM/RPN or CC120/123 is emitted.
+void verifyMpeWrapOrderingAndOrdinaryTails() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    recordWrapOwnershipTake(host, rig);
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 15U);
+    mpeClocks(host, rig, 2U);
+    stepThrough(host, rig.clock + 15U);
+    const size_t wrapStart = midibuffer_test::trace().midiCallCount;
+    mpeClock(host, rig); // wrap
+    const uint64_t wrap = rig.clock;
+    stepThrough(host, wrap + 15U);
+    mpeClocks(host, rig, 2U);
+    stepThrough(host, rig.clock + 15U);
+
+    size_t cursor = mpeSnapshot(host).generatedSetup;
+    MidiList firstPass = {};
+    firstPass.add(0xB1, 0x4A, 0x40);
+    firstPass.add(0x91, 0x3C, 0x64);
+    firstPass.add(0xB0, 0x40, 0x7F);
+    firstPass.add(0xB1, 0x42, 0x7F);
+    firstPass.add(0x99, 0x30, 0x64);
+    expect(entry != 0U && midiSequence(cursor, firstPass) &&
+               cursor == wrapStart,
+           "first pass sends context, then member note, holds and the ordinary note");
+    MidiList atWrap = {};
+    atWrap.add(0x81, 0x3C, 0x00);
+    atWrap.add(0xB0, 0x40, 0x00);
+    atWrap.add(0xB1, 0x42, 0x00);
+    atWrap.add(0xB1, 0x4A, 0x40);
+    const size_t wrapCursor = cursor;
+    expect(midiSequence(cursor, atWrap) &&
+               midiCallsAt(wrapCursor, atWrap.count, wrap),
+           "wrap ends owned notes, then owned manager/member holds, then restores known context");
+    MidiList nextPass = {};
+    nextPass.add(0x91, 0x3C, 0x64);
+    nextPass.add(0xB0, 0x40, 0x7F);
+    nextPass.add(0xB1, 0x42, 0x7F);
+    nextPass.add(0x89, 0x30, 0x00);
+    const size_t nextCursor = cursor;
+    expect(midiSequence(cursor, nextPass) &&
+               midiCallsAt(nextCursor, nextPass.count, wrap + 8U) &&
+               midiAt(cursor, 0x99, 0x30, 0x64) &&
+               midiCallsAt(cursor, 1U, wrap + 40U) &&
+               cursor + 1U == midibuffer_test::trace().midiCallCount,
+           "next attacks follow; the ordinary tail survives the wrap and the stale member ending never fires");
+    expect(noSetupOrPanicFrom(wrapStart),
+           "an MPE wrap emits no MCM, RPN, CC120 or CC123");
+}
+
+// ac-008: stop, clear, reset, clock loss and restart each end only emitted
+// ownership on its original route; re-entry sends context but never setup.
+void verifyMpeSafetyTransitionsPreserveCleanupOwnership() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    recordWrapOwnershipTake(host, rig);
+    midibuffer_test::resetTrace();
+    changeParameter(host, kPlaybackDestinationParameter, 1); // USB
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 12U);
+    const uint32_t setupSent = mpeSnapshot(host).generatedSetup;
+
+    // Reset: cleanup, then re-entry at the range start with context only.
+    size_t before = midibuffer_test::trace().midiCallCount;
+    resetPulse(host);
+    MidiList cleanup = {};
+    cleanup.add(0x81, 0x3C, 0x00);
+    cleanup.add(0xB0, 0x40, 0x00);
+    cleanup.add(0xB1, 0x42, 0x00);
+    size_t cursor = before;
+    expect(entry != 0U && midiSequence(cursor, cleanup) &&
+               midibuffer_test::trace().midiCalls[before].destination ==
+                   kNT_destinationUSB &&
+               cursor == midibuffer_test::trace().midiCallCount,
+           "reset ends owned notes before holds on the emitted route");
+    mpeClock(host, rig);
+    stepThrough(host, rig.clock + 12U);
+    expect(midiAt(cursor, 0xB1, 0x4A, 0x40) &&
+               midiAt(cursor + 1U, 0x91, 0x3C, 0x64) &&
+               mpeSnapshot(host).generatedSetup == setupSent,
+           "reset re-entry restores known context and never resends setup");
+
+    // Clock loss: cleanup; reacquisition continues without setup.
+    before = midibuffer_test::trace().midiCallCount;
+    for (uint32_t block = 0; block < 8U; ++block) {
+        noClockBlock(host);
+    }
+    cursor = before;
+    expect(midiSequence(cursor, cleanup) &&
+               snapshot(host).playbackClockLossPaused,
+           "clock loss ends owned output in the same note-before-hold order");
+    rig.clock = host.elapsedSamples();
+    mpeClocks(host, rig, 4U);
+    expect(mpeSnapshot(host).generatedSetup == setupSent &&
+               noSetupOrPanicFrom(before),
+           "clock reacquisition emits no automatic setup");
+
+    // Stop and clear end only emitted ownership.
+    stepThrough(host, rig.clock + 12U);
+    const uint32_t ownedBeforeStop = mpeSnapshot(host).ownedNotes +
+                                     mpeSnapshot(host).ownedHolds;
+    before = midibuffer_test::trace().midiCallCount;
+    changeParameter(host, kPlaybackParameter, 0);
+    expect(midibuffer_test::trace().midiCallCount - before == ownedBeforeStop &&
+               mpeSnapshot(host).ownedNotes == 0U &&
+               mpeSnapshot(host).ownedHolds == 0U &&
+               noSetupOrPanicFrom(before),
+           "manual stop ends exactly the owned notes and holds");
+    const uint64_t restart = mpeEnter(host, rig);
+    stepThrough(host, restart + 12U);
+    expect(restart != 0U && mpeSnapshot(host).generatedSetup == 2U * setupSent,
+           "manual Stop->On is a fresh deliberate entry with setup");
+    before = midibuffer_test::trace().midiCallCount;
+    changeParameter(host, kClearRecordingParameter, 1);
+    cursor = before;
+    expect(midiSequence(cursor, cleanup) &&
+               host.parameter(kPlaybackParameter) == 0,
+           "clear ends owned output and stops playback");
+}
+
+// ac-012: a clean 8,193-expression same-sample cluster rejects atomically:
+// none of its bytes are sent, prior ownership is cleaned from the reserve,
+// Playback turns Off and the overload stays latched until a fresh Off/On.
+void verifyMpeClusterAdmissionRejectsOverloadAtomically() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    for (uint32_t index = 0; index < 8193U; ++index) {
+        sendMidi(host, 0xB2, 0x4A, static_cast<uint8_t>(index & 0x7fU));
+    }
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 3U),
+           "overload take is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+    const uint64_t allocationsBefore = midibuffer_test::heapAllocationCount();
+    midibuffer_test::resetTrace();
+    const uint64_t entry = mpeEnter(host, rig);
+    stepThrough(host, entry + 15U);
+    const size_t admitted = midibuffer_test::trace().midiCallCount;
+    expect(entry != 0U && midiAt(admitted - 1U, 0x91, 0x3C, 0x64),
+           "the earlier admitted cluster emitted its attack");
+    mpeClock(host, rig);
+    stepThrough(host, rig.clock + 15U);
+    const midibuffer::MpePlaybackSnapshot rejected = mpeSnapshot(host);
+    expect(midibuffer_test::trace().midiCallCount == admitted + 1U &&
+               midiAt(admitted, 0x81, 0x3C, 0x00) &&
+               countMidi(admitted, 0xB2) == 0U &&
+               rejected.rejectedClusters == 1U &&
+               rejected.phase == midibuffer::kMpePhaseFault &&
+               rejected.status == midibuffer::kMpeStatusOverload &&
+               host.parameter(kPlaybackParameter) == 0 &&
+               rejected.maximumStep.cleanupCalls <= 2304U &&
+               rejected.maximumStep.cleanupFanout <= 9216U &&
+               rejected.maximumStep.sends <= 8192U &&
+               rejected.maximumStep.visits <= 32768U,
+           "8,193 expressions emit zero cluster bytes and only prior-ownership cleanup within the reserve");
+    expect(host.factory()->draw(host.algorithm()) &&
+               drawContainsSubstring("Overload: Off/On to restart"),
+           "the overload requiring restart is visible");
+    mpeClocks(host, rig, 4U);
+    expect(midibuffer_test::trace().midiCallCount == admitted + 1U,
+           "no deferred backlog or thinned output follows the rejection");
+    changeParameter(host, kPlaybackParameter, 0);
+    expect(mpeEnter(host, rig) != 0U &&
+               mpeSnapshot(host).phase == midibuffer::kMpePhasePlaying,
+           "a fresh Off/On clears the latch and restarts playback");
+    expect(midibuffer_test::heapAllocationCount() == allocationsBefore,
+           "MPE playback callbacks perform no heap allocation");
+}
+
+void recordSameSampleCluster(midibuffer_test::HostDouble& host, MpeRig& rig,
+                             bool attacks, uint32_t count) {
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    for (uint32_t index = 0; index < count; ++index) {
+        const uint8_t channel = static_cast<uint8_t>(1U + index % 15U);
+        if (attacks) {
+            sendMidi(host, static_cast<uint8_t>(0x90U | channel),
+                     static_cast<uint8_t>((index / 15U) % 128U), 0x40);
+        } else {
+            sendMidi(host, static_cast<uint8_t>(0xB0U | channel), 0x4A,
+                     static_cast<uint8_t>(index & 0x7fU));
+        }
+    }
+    mpeEndTake(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "same-sample cluster take is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+}
+
+// ac-012: 5,000 expression messages fit one step; 5,000 attacks do not,
+// because every possible collision ending is counted with its attack.
+// Counters cover all frames of each step, setup and heap work.
+void verifyMpeStepBudgetsCountCollisionsAndFanout() {
+    {
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordSameSampleCluster(host, rig, false, 5000U);
+        changeParameter(host, kPlaybackDestinationParameter, 4); // all four
+        midibuffer_test::resetTrace();
+        const uint64_t entry = mpeEnter(host, rig);
+        stepThrough(host, entry + 15U);
+        const midibuffer::MpePlaybackSnapshot state = mpeSnapshot(host);
+        expect(entry != 0U && countMidi(0U, 0xB1, 0x4A) == 334U &&
+                   state.rejectedClusters == 0U &&
+                   state.maximumStep.sends >= 5000U &&
+                   state.maximumStep.sends <= 8192U &&
+                   state.maximumStep.fanout == 4U * state.maximumStep.sends &&
+                   state.maximumStep.fanout <= 32768U &&
+                   state.maximumStep.visits <= 32768U &&
+                   state.maximumStep.heap <= 262144U,
+               "a 5,000-expression cluster with four-destination fanout is admitted within every normal budget");
+    }
+    {
+        midibuffer_test::HostDouble host;
+        MpeRig rig = {};
+        recordSameSampleCluster(host, rig, true, 5000U);
+        midibuffer_test::resetTrace();
+        changeParameter(host, kPlaybackParameter, 1);
+        for (uint32_t clock = 0; clock < 64U &&
+                                 mpeSnapshot(host).phase !=
+                                     midibuffer::kMpePhaseFault;
+             ++clock) {
+            mpeClock(host, rig);
+        }
+        stepThrough(host, rig.clock + 15U);
+        const midibuffer::MpePlaybackSnapshot state = mpeSnapshot(host);
+        expect(state.rejectedClusters == 1U &&
+                   countMidi(0U, 0x91) == 0U &&
+                   state.maximumStep.sends <= 8192U &&
+                   host.parameter(kPlaybackParameter) == 0,
+               "a 5,000-attack cluster counting collision endings is rejected atomically");
+    }
+}
+
+// ac-012: MPE entry progresses through Finalizing and Preparing with at most
+// 128 generated appends and 512 preparation visits per step.
+void verifyMpeEntryLifecycleRespectsPreparationBudgets() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    for (uint32_t note = 0; note < 128U; ++note) {
+        sendMidi(host, 0x91, static_cast<uint8_t>(note), 0x40);
+        sendMidi(host, 0x92, static_cast<uint8_t>(note), 0x40);
+    }
+    for (uint32_t index = 0; index < 1200U; ++index) {
+        sendMidi(host, 0xB3, 0x4A, static_cast<uint8_t>(index & 0x7fU));
+    }
+    mpeClocks(host, rig, 2U);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "held-note take is selectable while capture runs");
+    changeParameter(host, kMpeModeParameter, 1);
+    changeParameter(host, kPlaybackParameter, 1);
+    bool sawFinalizing = mpeSnapshot(host).phase == midibuffer::kMpePhaseFinalizing;
+    bool sawPreparing = false;
+    bool sawArmed = false;
+    for (uint32_t block = 0; block < 64U; ++block) {
+        noClockBlock(host);
+        const uint8_t phase = mpeSnapshot(host).phase;
+        sawFinalizing = sawFinalizing || phase == midibuffer::kMpePhaseFinalizing;
+        sawPreparing = sawPreparing || phase == midibuffer::kMpePhasePreparing;
+        sawArmed = sawArmed || phase == midibuffer::kMpePhaseArmed;
+    }
+    const midibuffer::HistorySnapshot history = historyState(host);
+    expect(sawFinalizing && sawPreparing && sawArmed &&
+               history.maximumStepFinalizeAppends <= 128U &&
+               history.maximumStepPreparationVisits <= 512U,
+           "MPE entry moves Finalizing -> Preparing -> Armed within the per-step limits");
+    rig.clock = host.elapsedSamples();
+    mpeClocks(host, rig, 2U);
+    expect(mpeSnapshot(host).phase == midibuffer::kMpePhasePlaying,
+           "the armed entry plays after fresh clock gating");
+}
+
 int main() {
     midibuffer_test::resetTrace();
     midibuffer_test::HostDouble host;
@@ -6871,6 +8000,21 @@ int main() {
     verifyDrawNoninterferenceAndIncrementalCost();
     verifyMaximumFrameClockDelivery();
     verifyHostOutputTrace();
+    verifyMpeCanonicalTwoMemberFixtureReplaysExactly();
+    verifyMpeMemberSharingAndSixteenNotesOnFifteenMembers();
+    verifyMpeScopeAndConflictsVisiblyBlockEntry();
+    verifyMpeValidManualScopesNeverGuessMcm();
+    verifyMpeLiveRouteChangeCleansOldRouteAndStops();
+    verifyMpeHistoricalContextPrecedesFirstAttack();
+    verifyMpeResumptionSeedAndMissingContext();
+    verifyMpeOldTakeRestoresItsOwnSetup();
+    verifyMpeSafeSetupFragments();
+    verifyMpeSetupChangingSelectionsAndRangeEdits();
+    verifyMpeWrapOrderingAndOrdinaryTails();
+    verifyMpeSafetyTransitionsPreserveCleanupOwnership();
+    verifyMpeClusterAdmissionRejectsOverloadAtomically();
+    verifyMpeStepBudgetsCountCollisionsAndFanout();
+    verifyMpeEntryLifecycleRespectsPreparationBudgets();
 
     if (gFailures != 0) {
         std::fprintf(stderr, "%d callback contract checks failed\n", gFailures);

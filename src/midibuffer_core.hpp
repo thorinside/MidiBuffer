@@ -143,6 +143,10 @@ struct SetupObserver {
     SetupZone zones[2];  // 0 lower (manager channel 1), 1 upper (channel 16)
     uint8_t roles[16];   // SetupRole
     uint32_t membershipGeneration[16];
+    // Latest RPN0/0 receipt per channel regardless of role. Any MCM clears
+    // these, so they only describe channels no received MCM has reset; Manual
+    // scope uses them for RPN0-only restoration without guessing MCM.
+    SetupValue channelSensitivity[16];
 };
 
 // Historical expression values tracked with per-byte knownness.
@@ -174,7 +178,9 @@ struct HistoryState {
     uint8_t managerState[2];
     uint8_t memberState[2];
     uint8_t roles[16];         // SetupRole
-    uint8_t reserved[272];
+    uint16_t channelCents[16]; // SetupObserver::channelSensitivity
+    uint8_t channelCentsState[16];
+    uint8_t reserved[224];
 };
 
 // Immutable selection-start context: the state immediately before the
@@ -202,6 +208,61 @@ bool historyContext(const _NT_algorithm* self, bool candidate,
 // bounded per-step progress (at most 128 appends per step). Legacy capture
 // stop, playback start, clear and save complete any pending work themselves.
 bool beginCaptureFinalization(_NT_algorithm* self);
+
+// MPE playback lifecycle, visible status and bounded-work instrumentation.
+enum MpePhase : uint8_t {
+    kMpePhaseIdle,
+    kMpePhaseFinalizing,
+    kMpePhasePreparing,
+    kMpePhaseArmed,
+    kMpePhasePlaying,
+    kMpePhaseFault,      // overload: Playback Off, fresh Off/On required
+};
+
+enum MpeStatus : uint8_t {
+    kMpeStatusReady,
+    kMpeStatusRecordChannel, // Record Ch must be Omni
+    kMpeStatusPlayChannel,   // Play Ch must be Original
+    kMpeStatusFilters,       // expression filters must be Off
+    kMpeStatusInvalidScope,  // manual zero/overlapping or no known zone
+    kMpeStatusScopeUnknown,  // Observed source without a known active zone
+    kMpeStatusMismatch,      // known observed count disagrees with Manual
+    kMpeStatusOverload,      // rejected cluster
+};
+
+struct MpeWorkCounters {
+    uint32_t visits;        // source/heap visits
+    uint32_t sends;         // NT send calls (setup/context/wrap/collision)
+    uint32_t fanout;        // destination bits across sends
+    uint32_t heap;          // heap comparisons/swaps
+    uint32_t cleanupCalls;  // reserved cleanup calls/slot visits
+    uint32_t cleanupFanout; // reserved cleanup destination bits
+};
+
+struct MpePlaybackSnapshot {
+    MpeWorkCounters lastStep;
+    MpeWorkCounters maximumStep;
+    uint32_t ownedNotes;
+    uint32_t ownedHolds;
+    uint32_t pendingEndings;
+    uint32_t rejectedClusters;
+    uint32_t generatedSetup;     // generated setup sends (MCM/RPN0/null)
+    uint32_t generatedContext;   // generated starting-context sends
+    uint32_t generatedCleanup;   // generated wrap/stop/collision endings
+    uint16_t scopeMask;          // channels owned by MPE wrap semantics
+    uint8_t lowerMembers;
+    uint8_t upperMembers;
+    uint8_t phase;               // MpePhase
+    uint8_t status;              // MpeStatus
+    bool engaged;
+    bool deliberate;
+    bool restartRequired;        // incompatible candidate kept active range
+    bool setupChangesInside;     // selected take changes setup (unsupported)
+    bool setupIncomplete;
+    bool contextIncomplete;
+};
+bool mpePlaybackSnapshot(const _NT_algorithm* self,
+                         MpePlaybackSnapshot& snapshot);
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
 struct HistorySnapshot {
