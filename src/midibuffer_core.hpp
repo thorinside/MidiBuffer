@@ -145,12 +145,92 @@ struct SetupObserver {
     uint32_t membershipGeneration[16];
 };
 
+// Historical expression values tracked with per-byte knownness.
+enum HistoryValue : uint8_t {
+    kHistoryBendLsb,
+    kHistoryBendMsb,
+    kHistoryChannelPressure,
+    kHistoryTimbre,          // CC74
+    kHistoryModulationMsb,   // CC1
+    kHistoryModulationLsb,   // CC33
+    kHistoryExpressionMsb,   // CC11
+    kHistoryExpressionLsb,   // CC43
+    kHistorySustain,         // CC64
+    kHistorySostenuto,       // CC66
+    kHistoryHold2,           // CC69
+    kHistoryValueCount,
+};
+
+// One full 512-byte observation state used by live tracking, seeds,
+// checkpoints, journal entries and contexts. It is padding-free so equal
+// states compare bytewise. Setup fields mirror SetupObserver zones/roles.
+struct HistoryState {
+    uint8_t values[16][kHistoryValueCount];
+    uint16_t known[16];        // bit per HistoryValue; clear means unknown
+    uint16_t managerCents[2];
+    uint16_t memberCents[2];
+    uint8_t zoneCount[2];
+    uint8_t zoneCountState[2]; // SetupKnowledge
+    uint8_t managerState[2];
+    uint8_t memberState[2];
+    uint8_t roles[16];         // SetupRole
+    uint8_t reserved[272];
+};
+
+// Immutable selection-start context: the state immediately before the
+// selection's own events in [start,end). Incomplete coverage clears all
+// knownness instead of certifying a checkpoint as stable history.
+struct HistoryContextSnapshot {
+    PulseRange range;
+    uint64_t generation;
+    uint32_t setupFingerprint;
+    bool ready;
+    bool coverageComplete;
+    bool setupChangesInside;
+    HistoryState state;
+};
+
 // Read-only seams used by the timeline/playback layers and native host tests.
 CaptureSnapshot captureSnapshot(const _NT_algorithm* self);
 bool recordedEventAt(const _NT_algorithm* self, uint32_t oldestFirstIndex,
                      RecordedEvent& event);
+// Active is the context adopted by the current playback entry; candidate is
+// the latest selection's prepared context. Neither mutates recorded links.
+bool historyContext(const _NT_algorithm* self, bool candidate,
+                    HistoryContextSnapshot& context);
+// Finalizing-state entry: freezes capture and leaves its generated endings to
+// bounded per-step progress (at most 128 appends per step). Legacy capture
+// stop, playback start, clear and save complete any pending work themselves.
+bool beginCaptureFinalization(_NT_algorithm* self);
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
+struct HistorySnapshot {
+    uint64_t baseOrdinal;          // ordinal of the oldest retained event
+    uint64_t nextOrdinal;          // ordinal the next append receives
+    uint64_t generation;
+    uint64_t pairedGeneration;
+    uint64_t coverageStartOrdinal; // journal coverage watermark
+    uint64_t seedLastPulse;
+    uint32_t checkpointCount;
+    uint32_t journalCount;
+    uint32_t journalEvictions;
+    uint32_t lastStepFinalizeAppends;
+    uint32_t maximumStepFinalizeAppends;
+    uint32_t lastStepPreparationVisits;
+    uint32_t maximumStepPreparationVisits;
+    uint32_t maximumSeedSearchComparisons;
+    uint32_t maximumCheckpointSearchComparisons;
+    uint32_t maximumForwardEventVisits;
+    uint32_t maximumJournalVisits;
+    bool seedValid;
+    bool seedFolded;
+    bool finalizing;
+    bool pairingComplete;
+    HistoryState live;
+    HistoryState recorded;
+    HistoryState seed;
+};
+bool historySnapshot(const _NT_algorithm* self, HistorySnapshot& snapshot);
 // Bounded read-only copy of the production setup observer state.
 bool setupObserverSnapshot(const _NT_algorithm* self, SetupObserver& snapshot);
 // Installs one synthetic retained interval envelope without iterating through

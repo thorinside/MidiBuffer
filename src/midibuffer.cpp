@@ -514,19 +514,144 @@ uint32_t requestedRecordingBytes(const int32_t* specifications) {
 // reserved independently for MPE history, contexts, ownership, and parser data.
 const uint32_t kMpeArenaBytes = 524288U;
 
-// Byte regions avoid imposing an ABI layout on the future history wire data.
-// Owner keys and control/parser state share the remaining planned budget;
-// their internal representation is reserved for their implementation.
+static_assert(sizeof(HistoryState) == 512U,
+              "historical state is the approved 512-byte full state");
+
+// Observations are keyed by pulse, offset, receipt sequence and ordinal. For
+// a checkpoint the ordinal is the first event it does not include; for a
+// journal entry it is the next event ordinal at the time of the change.
+struct HistoryKey {
+    uint64_t ordinal;
+    uint64_t pulse;
+    uint32_t offsetSamples;
+    uint32_t receipt;
+};
+
+struct HistoryCheckpoint {
+    HistoryKey key;
+    HistoryState state;
+};
+
+enum HistoryJournalKind : uint32_t {
+    kHistoryJournalResumption = 1, // capture/clock/admission gap seed
+    kHistoryJournalSetup = 2,      // setup change while capture is recording
+};
+
+struct HistoryJournalEntry {
+    HistoryKey key;
+    uint32_t kind;
+    uint32_t reserved0;
+    uint8_t reserved[96];
+    HistoryState state;
+};
+static_assert(sizeof(HistoryCheckpoint) == 536U &&
+                  sizeof(HistoryJournalEntry) == 640U,
+              "history records match the approved arena accounting");
+
+const uint32_t kHistoryCheckpointInterval = 512U;
+const uint32_t kHistoryMaximumCheckpoints = 409U;
+const uint32_t kHistoryJournalEntries = 256U;
+const uint32_t kHistoryMaximumForwardEvents = kHistoryCheckpointInterval - 1U;
+const uint32_t kFinalizeAppendsPerStep = 128U;
+const uint32_t kPreparationVisitsPerStep = 512U;
+const uint32_t kHistoryNoIndex = 0xffffffffU;
+
+enum HistoryContextSlot {
+    kHistoryContextActive,
+    kHistoryContextCandidate,
+    kHistoryContextWork,
+    kHistoryContextReserved, // sent-context storage for MPE playback
+};
+
+struct HistoryContextMeta {
+    PulseRange range;
+    uint64_t generation;
+    uint32_t setupFingerprint;
+    bool ready;
+    bool coverageComplete;
+    bool setupChangesInside;
+};
+
+enum HistoryPreparationPhase : uint8_t {
+    kPreparationIdle,
+    kPreparationSearch,
+    kPreparationFold,
+    kPreparationInside,
+};
+
+struct HistoryControl {
+    HistoryState live;     // admitted observations, independent of capture
+    HistoryState recorded; // state after the newest appended event
+    HistoryState seed;     // state after the newest evicted event
+    HistoryContextMeta contexts[2];
+    HistoryContextMeta work;
+    RecordedEvent endingTemplate;
+    uint64_t baseOrdinal;
+    uint64_t generation;
+    uint64_t pairedGeneration;
+    uint64_t pairingGeneration;
+    uint64_t coverageStartOrdinal;
+    uint64_t seedLastPulse;
+    uint64_t workOrdinal;
+    uint32_t workForwardEvents;
+    uint32_t workJournalCursor;
+    uint32_t workJournalVisits;
+    uint32_t checkpointCount;
+    uint32_t journalHead;
+    uint32_t journalCount;
+    uint32_t journalEvictions;
+    uint32_t receipt;
+    uint32_t membershipGeneration[16];
+    uint32_t finalizeCursor;
+    uint32_t pairingCursor;
+    uint32_t pairingWalkPress;
+    uint32_t pairingWalkRelease;
+    // CC66/CC69 FIFO heads and tails; notes and CC64 reuse PendingPlaybackEndings.
+    uint32_t pedalHeads[16][2];
+    uint64_t pedalTails[16][2];
+    uint32_t lastStepFinalizeAppends;
+    uint32_t maximumStepFinalizeAppends;
+    uint32_t lastStepPreparationVisits;
+    uint32_t maximumStepPreparationVisits;
+    uint32_t maximumSeedSearchComparisons;
+    uint32_t maximumCheckpointSearchComparisons;
+    uint32_t maximumForwardEventVisits;
+    uint32_t maximumJournalVisits;
+    int32_t admission;
+    uint8_t workPhase;
+    bool seedValid;
+    bool seedFolded;
+    bool finalizing;
+    bool pairing;
+    bool pairingComplete;
+    bool candidateRequested;
+    uint8_t reserved[1];
+};
+
+// Owner keys and parser state share the remaining planned budget; their
+// internal representation is reserved for their implementation.
 struct MpeArenaReservation {
-    uint8_t checkpoints[409U * 536U];
-    uint8_t journal[256U * 640U];
-    uint8_t contexts[4U * 512U];
+    HistoryCheckpoint checkpoints[kHistoryMaximumCheckpoints];
+    HistoryJournalEntry journal[kHistoryJournalEntries];
+    HistoryState contexts[4];
+    HistoryControl history;
     SetupObserver setup;
-    uint8_t ownersAndControl[104416U - sizeof(SetupObserver)];
+    uint8_t ownersAndControl[104416U - sizeof(SetupObserver) -
+                             sizeof(HistoryControl)];
     uint8_t alignmentAndSlack[34760U];
 };
 static_assert(sizeof(MpeArenaReservation) == kMpeArenaBytes,
               "MPE reservation must fit the separately accounted DRAM arena");
+
+MpeArenaReservation& mpeArena(const Algorithm& algorithm) {
+    return *reinterpret_cast<MpeArenaReservation*>(
+        reinterpret_cast<uint8_t*>(algorithm.recordingEvents) +
+        algorithm.recordingBufferBytes);
+}
+
+HistoryControl& historyControl(const Algorithm& algorithm) {
+    return mpeArena(algorithm).history;
+}
 
 void calculateRequirements(_NT_algorithmRequirements& requirements,
                            const int32_t* specifications) {
@@ -555,12 +680,24 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
     for (unsigned channel = 0; channel < 16; ++channel) {
         arena->setup.roles[channel] = kSetupRoleUnknown;
     }
+    HistoryControl* history = new (&arena->history) HistoryControl();
+    history->checkpointCount =
+        (algorithm->eventCapacity + kHistoryCheckpointInterval - 1U) /
+            kHistoryCheckpointInterval + 2U;
+    history->admission = -1;
+    history->seedValid = true;
     algorithm->parameters = kParameters;
     algorithm->parameterPages = &kParameterPages;
     return algorithm;
 }
 
 void finalizeCapture(Algorithm& algorithm);
+void completeCaptureFinalization(Algorithm& algorithm);
+uint64_t nextHistoryOrdinal(const Algorithm& algorithm);
+void restartHistory(Algorithm& algorithm, uint64_t retiredOrdinal,
+                    bool coverageKnown);
+void updateHistoryAdmission(Algorithm& algorithm);
+void cancelHistoryCandidate(Algorithm& algorithm);
 void clearPendingPlaybackEndings(Algorithm& algorithm);
 void releasePlaybackOutput(Algorithm& algorithm, uint64_t dispatchSample);
 void clearRecording(_NT_algorithm* self, Algorithm& algorithm);
@@ -608,6 +745,7 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
             finalizeCapture(*algorithm);
         } else if (!algorithm->captureEnabled &&
                    algorithm->transportState == kTransportStopped) {
+            completeCaptureFinalization(*algorithm);
             algorithm->recordedState = RecordedState();
             algorithm->captureEnabled = true;
         }
@@ -627,6 +765,8 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
             algorithm->clearRecordingArmed = false;
             clearRecording(self, *algorithm);
         }
+    } else if (parameter == kParameterRecordingChannel) {
+        updateHistoryAdmission(*algorithm);
     } else if (parameter == kParameterClock) {
         // A newly routed input must acquire its own edge rather than inherit
         // the previous input's gate level.
@@ -637,6 +777,7 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
 }
 
 void clearSelection(Algorithm& algorithm) {
+    cancelHistoryCandidate(algorithm);
     algorithm.selectionValid = false;
     algorithm.activeSelectionValid = false;
     algorithm.rangeTransitionPending = false;
@@ -668,10 +809,12 @@ void clearRecording(_NT_algorithm* self, Algorithm& algorithm) {
     // of the configured event capacity. The backing event allocation is not
     // scanned or overwritten. Resetting recorded ownership establishes the
     // post-clear capture boundary without changing Capture itself.
+    const uint64_t retiredOrdinal = nextHistoryOrdinal(algorithm);
     algorithm.eventHead = 0;
     algorithm.eventCount = 0;
     algorithm.historyEndPulseExclusive = 0;
     algorithm.recordedState = RecordedState();
+    restartHistory(algorithm, retiredOrdinal, true);
     algorithm.clearHistoryMetadataOperations =
         kClearHistoryMetadataOperations;
     ++algorithm.clearRecordingTransitions;
@@ -693,6 +836,293 @@ uint32_t nextRingIndex(uint32_t index, uint32_t capacity) {
     return index == capacity ? 0 : index;
 }
 
+// Explicit byte loops keep 512-byte state copies free of extra libc imports.
+void copyHistoryState(HistoryState& target, const HistoryState& source) {
+    const volatile uint8_t* from =
+        reinterpret_cast<const volatile uint8_t*>(&source);
+    uint8_t* to = reinterpret_cast<uint8_t*>(&target);
+    for (uint32_t index = 0; index < sizeof(HistoryState); ++index) {
+        to[index] = from[index];
+    }
+}
+
+void zeroHistoryState(HistoryState& state) {
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(&state);
+    for (uint32_t index = 0; index < sizeof(HistoryState); ++index) {
+        bytes[index] = 0U;
+    }
+}
+
+bool sameHistoryBytes(const HistoryState& left, const HistoryState& right,
+                      uint32_t begin, uint32_t end) {
+    const uint8_t* a = reinterpret_cast<const uint8_t*>(&left);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&right);
+    for (uint32_t index = begin; index < end; ++index) {
+        if (a[index] != b[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const uint32_t kHistorySetupBegin = offsetof(HistoryState, managerCents);
+const uint32_t kHistorySetupEnd = offsetof(HistoryState, reserved);
+
+bool sameHistoryState(const HistoryState& left, const HistoryState& right) {
+    return sameHistoryBytes(left, right, 0U, sizeof(HistoryState));
+}
+
+void forgetHistoryChannel(HistoryState& state, uint8_t channel) {
+    for (uint8_t index = 0; index < kHistoryValueCount; ++index) {
+        state.values[channel][index] = 0U;
+    }
+    state.known[channel] = 0U;
+}
+
+void setHistoryValue(HistoryState& state, uint8_t channel,
+                     HistoryValue index, uint8_t value) {
+    state.values[channel][index] = static_cast<uint8_t>(value & 0x7fU);
+    state.known[channel] =
+        static_cast<uint16_t>(state.known[channel] | (1U << index));
+}
+
+void applyHistoryMessage(HistoryState& state, const uint8_t bytes[3]) {
+    const uint8_t type = bytes[0] & 0xf0U;
+    const uint8_t channel = bytes[0] & 0x0fU;
+    if (type == 0xe0U) {
+        setHistoryValue(state, channel, kHistoryBendLsb, bytes[1]);
+        setHistoryValue(state, channel, kHistoryBendMsb, bytes[2]);
+    } else if (type == 0xd0U) {
+        setHistoryValue(state, channel, kHistoryChannelPressure, bytes[1]);
+    } else if (type == 0xb0U) {
+        HistoryValue index = kHistoryValueCount;
+        switch (bytes[1]) {
+        case 74U: index = kHistoryTimbre; break;
+        case 1U: index = kHistoryModulationMsb; break;
+        case 33U: index = kHistoryModulationLsb; break;
+        case 11U: index = kHistoryExpressionMsb; break;
+        case 43U: index = kHistoryExpressionLsb; break;
+        case 64U: index = kHistorySustain; break;
+        case 66U: index = kHistorySostenuto; break;
+        case 69U: index = kHistoryHold2; break;
+        default: break;
+        }
+        if (index != kHistoryValueCount) {
+            setHistoryValue(state, channel, index, bytes[2]);
+        }
+    }
+}
+
+// Generated capture endings are output safety, never observed evidence.
+void applyHistoryEvent(HistoryState& state, const RecordedEvent& event) {
+    if ((event.flags & kRecordedEventFlagCaptureEnding) == 0U) {
+        applyHistoryMessage(state, event.bytes);
+    }
+}
+
+void copyHistorySetup(HistoryState& state, const SetupObserver& setup) {
+    for (unsigned zone = 0; zone < 2U; ++zone) {
+        state.zoneCount[zone] = setup.zones[zone].count;
+        state.zoneCountState[zone] = setup.zones[zone].countState;
+        state.managerCents[zone] = setup.zones[zone].manager.cents;
+        state.managerState[zone] = setup.zones[zone].manager.state;
+        state.memberCents[zone] = setup.zones[zone].member.cents;
+        state.memberState[zone] = setup.zones[zone].member.state;
+    }
+    for (unsigned channel = 0; channel < 16U; ++channel) {
+        state.roles[channel] = setup.roles[channel];
+    }
+}
+
+HistoryCheckpoint& historyCheckpoint(const Algorithm& algorithm,
+                                     uint64_t checkpointNumber) {
+    uint32_t slot = 0;
+    divideUnsigned64By32(checkpointNumber,
+                         historyControl(algorithm).checkpointCount, slot);
+    return mpeArena(algorithm).checkpoints[slot];
+}
+
+uint64_t nextHistoryOrdinal(const Algorithm& algorithm) {
+    return historyControl(algorithm).baseOrdinal + algorithm.eventCount;
+}
+
+HistoryJournalEntry& journalEntry(const Algorithm& algorithm,
+                                  uint32_t oldestFirst) {
+    const HistoryControl& history = historyControl(algorithm);
+    return mpeArena(algorithm).journal[(history.journalHead + oldestFirst) %
+                                       kHistoryJournalEntries];
+}
+
+// Binary search over the ordinal-sorted journal: the number of entries keyed
+// at most `ordinal` (inclusive) or below it. 256 entries need <= 9 probes.
+uint32_t journalBound(const Algorithm& algorithm, uint64_t ordinal,
+                      bool inclusive, uint32_t& comparisons) {
+    uint32_t low = 0;
+    uint32_t high = historyControl(algorithm).journalCount;
+    while (low < high) {
+        const uint32_t middle = low + (high - low) / 2U;
+        const uint64_t key = journalEntry(algorithm, middle).key.ordinal;
+        ++comparisons;
+        if (inclusive ? key <= ordinal : key < ordinal) {
+            low = middle + 1U;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+void noteMaximum(uint32_t& maximum, uint32_t value) {
+    if (value > maximum) {
+        maximum = value;
+    }
+}
+
+void writeHistoryJournal(Algorithm& algorithm, const HistoryState& state,
+                         uint64_t pulse, uint32_t offsetSamples,
+                         uint32_t kind) {
+    HistoryControl& history = historyControl(algorithm);
+    if (history.journalCount == kHistoryJournalEntries) {
+        // Overflow drops an unfolded change. Coverage now starts after it and
+        // the seed cannot certify history until it folds a later full entry.
+        const uint64_t lost = journalEntry(algorithm, 0).key.ordinal + 1U;
+        if (lost > history.coverageStartOrdinal) {
+            history.coverageStartOrdinal = lost;
+        }
+        history.seedValid = false;
+        history.journalHead = (history.journalHead + 1U) %
+                              kHistoryJournalEntries;
+        --history.journalCount;
+        ++history.journalEvictions;
+    }
+    HistoryJournalEntry& entry = journalEntry(algorithm, history.journalCount);
+    entry.key.ordinal = nextHistoryOrdinal(algorithm);
+    entry.key.pulse = pulse;
+    entry.key.offsetSamples = offsetSamples;
+    entry.key.receipt = history.receipt;
+    entry.kind = kind;
+    copyHistoryState(entry.state, state);
+    ++history.journalCount;
+    copyHistoryState(history.recorded, state);
+    ++history.generation;
+}
+
+// Before the oldest event is overwritten, fold it (and the journal entries
+// keyed before it) into the seed so the oldest retained point stays known.
+void advanceHistorySeed(Algorithm& algorithm, const RecordedEvent& evicted) {
+    HistoryControl& history = historyControl(algorithm);
+    uint32_t comparisons = 0;
+    const uint32_t folded =
+        journalBound(algorithm, history.baseOrdinal, true, comparisons);
+    noteMaximum(history.maximumSeedSearchComparisons, comparisons);
+    if (folded != 0U) {
+        copyHistoryState(history.seed,
+                         journalEntry(algorithm, folded - 1U).state);
+        history.seedValid = true;
+        history.journalHead =
+            (history.journalHead + folded) % kHistoryJournalEntries;
+        history.journalCount -= folded;
+    }
+    applyHistoryEvent(history.seed, evicted);
+    history.seedLastPulse = evicted.pulse;
+    history.seedFolded = true;
+    ++history.baseOrdinal;
+}
+
+void recordHistoryAppend(Algorithm& algorithm, const RecordedEvent& event) {
+    HistoryControl& history = historyControl(algorithm);
+    applyHistoryEvent(history.recorded, event);
+    ++history.generation;
+    const uint64_t total = nextHistoryOrdinal(algorithm);
+    if (total % kHistoryCheckpointInterval == 0U) {
+        HistoryCheckpoint& checkpoint =
+            historyCheckpoint(algorithm, total / kHistoryCheckpointInterval);
+        checkpoint.key.ordinal = total;
+        checkpoint.key.pulse = event.pulse;
+        checkpoint.key.offsetSamples = event.offsetSamples;
+        checkpoint.key.receipt = history.receipt;
+        copyHistoryState(checkpoint.state, history.recorded);
+    }
+}
+
+// Clear and load retire every old ordinal, so stale checkpoint slots can never
+// match. A loaded history has no retained observation coverage yet.
+void restartHistory(Algorithm& algorithm, uint64_t retiredOrdinal,
+                    bool coverageKnown) {
+    HistoryControl& history = historyControl(algorithm);
+    history.baseOrdinal = retiredOrdinal;
+    history.journalHead = 0;
+    history.journalCount = 0;
+    zeroHistoryState(history.recorded);
+    zeroHistoryState(history.seed);
+    history.seedValid = coverageKnown;
+    history.seedFolded = false;
+    history.coverageStartOrdinal =
+        coverageKnown ? retiredOrdinal : retiredOrdinal + algorithm.eventCount;
+    history.finalizing = false;
+    history.pairing = false;
+    history.pairingComplete = false;
+    history.candidateRequested = false;
+    history.workPhase = kPreparationIdle;
+    history.contexts[kHistoryContextActive].ready = false;
+    history.contexts[kHistoryContextCandidate].ready = false;
+    ++history.generation;
+}
+
+int recordingAdmission(const Algorithm& algorithm) {
+    int admitted =
+        algorithm.v == NULL ? 0 : algorithm.v[kParameterRecordingChannel];
+    return admitted < 0 || admitted > 16 ? 0 : admitted;
+}
+
+// A recording-channel change is an admission boundary: channels that were
+// not observed under both settings become unknown rather than stale.
+void updateHistoryAdmission(Algorithm& algorithm) {
+    HistoryControl& history = historyControl(algorithm);
+    const int admission = recordingAdmission(algorithm);
+    if (history.admission >= 0 && history.admission != admission) {
+        for (uint8_t channel = 0; channel < 16U; ++channel) {
+            const bool before =
+                history.admission == 0 || history.admission == channel + 1;
+            const bool after = admission == 0 || admission == channel + 1;
+            if (!before || !after) {
+                forgetHistoryChannel(history.live, channel);
+            }
+        }
+    }
+    history.admission = admission;
+}
+
+// Live observation runs for every admitted message before capture/clock
+// gating. A recorded event first seeds any gap since the last recorded item;
+// an unrecorded change while recording (setup) is journaled at its receipt.
+void observeLiveHistory(Algorithm& algorithm, const RecordedEvent& event,
+                        bool recorded) {
+    HistoryControl& history = historyControl(algorithm);
+    updateHistoryAdmission(algorithm);
+    ++history.receipt;
+    if (recorded && !sameHistoryState(history.live, history.recorded)) {
+        writeHistoryJournal(algorithm, history.live, event.pulse,
+                            event.offsetSamples, kHistoryJournalResumption);
+    }
+    const SetupObserver& setup = mpeArena(algorithm).setup;
+    for (uint8_t channel = 0; channel < 16U; ++channel) {
+        if (setup.membershipGeneration[channel] !=
+            history.membershipGeneration[channel]) {
+            history.membershipGeneration[channel] =
+                setup.membershipGeneration[channel];
+            forgetHistoryChannel(history.live, channel);
+        }
+    }
+    copyHistorySetup(history.live, setup);
+    applyHistoryMessage(history.live, event.bytes);
+    if (!recorded && algorithm.captureEnabled && algorithm.clockRunning &&
+        !sameHistoryState(history.live, history.recorded)) {
+        writeHistoryJournal(algorithm, history.live, event.pulse,
+                            event.offsetSamples, kHistoryJournalSetup);
+    }
+}
+
 void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
     if (algorithm.eventCapacity == 0) {
         return;
@@ -705,6 +1135,7 @@ void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
                                  algorithm.recordingEvents[writeIndex].pulse)) {
             clearSelection(algorithm);
         }
+        advanceHistorySeed(algorithm, algorithm.recordingEvents[writeIndex]);
         algorithm.eventHead =
             nextRingIndex(algorithm.eventHead, algorithm.eventCapacity);
     } else {
@@ -715,6 +1146,7 @@ void appendEvent(Algorithm& algorithm, const RecordedEvent& event) {
         ++algorithm.eventCount;
     }
     algorithm.recordingEvents[writeIndex] = event;
+    recordHistoryAppend(algorithm, event);
     const uint64_t maximum = ~static_cast<uint64_t>(0);
     const uint64_t eventEnd = event.pulse == maximum ? maximum
                                                       : event.pulse + 1U;
@@ -831,69 +1263,148 @@ void appendEnding(Algorithm& algorithm, const RecordedEvent& endingTemplate,
     appendEvent(algorithm, event);
 }
 
-void finalizeCapture(Algorithm& algorithm) {
-    if (!algorithm.captureEnabled) {
-        return;
+// Removes and returns the next non-neutral controller ending for a channel
+// in the legacy order: pedals, CC1/11, CC33/43, bend, pressure, polyphonic.
+bool takeChannelEnding(RecordedState& state, uint8_t channel,
+                       uint8_t bytes[3], uint8_t& size) {
+    size = 3U;
+    bytes[0] = static_cast<uint8_t>(0xb0U | channel);
+    bytes[2] = 0U;
+    for (uint8_t controller = 64U; controller <= 69U; ++controller) {
+        const uint8_t bit = static_cast<uint8_t>(1U << (controller - 64U));
+        if ((state.pedalMasks[channel] & bit) != 0U) {
+            state.pedalMasks[channel] =
+                static_cast<uint8_t>(state.pedalMasks[channel] & ~bit);
+            bytes[1] = controller;
+            return true;
+        }
     }
+    const uint8_t modulationControllers[] = {1U, 33U};
+    const uint8_t expressionControllers[] = {11U, 43U};
+    for (uint8_t index = 0; index < 2U; ++index) {
+        const uint8_t bit = static_cast<uint8_t>(1U << index);
+        if ((state.modulationMasks[channel] & bit) != 0U) {
+            state.modulationMasks[channel] =
+                static_cast<uint8_t>(state.modulationMasks[channel] & ~bit);
+            bytes[1] = modulationControllers[index];
+            return true;
+        }
+        if ((state.expressionMasks[channel] & bit) != 0U) {
+            state.expressionMasks[channel] =
+                static_cast<uint8_t>(state.expressionMasks[channel] & ~bit);
+            bytes[1] = expressionControllers[index];
+            bytes[2] = 127U;
+            return true;
+        }
+    }
+    const uint16_t channelBit = static_cast<uint16_t>(1U << channel);
+    if ((state.pitchBendMask & channelBit) != 0U) {
+        state.pitchBendMask =
+            static_cast<uint16_t>(state.pitchBendMask & ~channelBit);
+        bytes[0] = static_cast<uint8_t>(0xe0U | channel);
+        bytes[1] = 0U;
+        bytes[2] = 64U;
+        return true;
+    }
+    if ((state.channelPressureMask & channelBit) != 0U) {
+        state.channelPressureMask =
+            static_cast<uint16_t>(state.channelPressureMask & ~channelBit);
+        bytes[0] = static_cast<uint8_t>(0xd0U | channel);
+        bytes[1] = 0U;
+        size = 2U;
+        return true;
+    }
+    for (uint8_t word = 0; word < 4U; ++word) {
+        uint32_t& mask = state.polyPressureMasks[channel][word];
+        for (uint8_t bit = 0; bit < 32U; ++bit) {
+            const uint32_t value = static_cast<uint32_t>(1U) << bit;
+            if ((mask & value) != 0U) {
+                mask &= ~value;
+                bytes[0] = static_cast<uint8_t>(0xa0U | channel);
+                bytes[1] = static_cast<uint8_t>(word * 32U + bit);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
-    const RecordedEvent ending = captureEndingTemplate(algorithm);
-    const RecordedState& state = algorithm.recordedState;
-    for (uint8_t channel = 0; channel < 16U; ++channel) {
-        for (uint8_t note = 0; note < 128U; ++note) {
-            for (uint32_t occurrence = 0;
-                 occurrence < state.heldNoteCounts[channel][note];
-                 ++occurrence) {
-                appendEnding(algorithm, ending,
-                             static_cast<uint8_t>(0x80U | channel), note, 0);
-            }
-        }
+// Freezes capture at one ending timestamp. Generated endings are appended by
+// bounded progress, never interleaved with newly captured events.
+bool beginFinalization(Algorithm& algorithm) {
+    if (!algorithm.captureEnabled) {
+        return false;
     }
-    for (uint8_t channel = 0; channel < 16U; ++channel) {
-        for (uint8_t controller = 64U; controller <= 69U; ++controller) {
-            if ((state.pedalMasks[channel] &
-                 static_cast<uint8_t>(1U << (controller - 64U))) != 0U) {
-                appendEnding(algorithm, ending,
-                             static_cast<uint8_t>(0xb0U | channel),
-                             controller, 0);
-            }
+    HistoryControl& history = historyControl(algorithm);
+    history.endingTemplate = captureEndingTemplate(algorithm);
+    history.finalizeCursor = 0;
+    history.finalizing = true;
+    algorithm.captureEnabled = false;
+    return true;
+}
+
+const uint32_t kFinalizeNoteSlots = 16U * 128U;
+
+// Appends at most `budget` generated endings in the legacy order by consuming
+// the recorded ownership state behind a resumable cursor.
+bool finalizeCaptureStep(Algorithm& algorithm, uint32_t budget,
+                         uint32_t& appended) {
+    HistoryControl& history = historyControl(algorithm);
+    if (!history.finalizing) {
+        return true;
+    }
+    RecordedState& state = algorithm.recordedState;
+    while (history.finalizeCursor < kFinalizeNoteSlots) {
+        const uint8_t channel =
+            static_cast<uint8_t>(history.finalizeCursor / 128U);
+        const uint8_t note = static_cast<uint8_t>(history.finalizeCursor % 128U);
+        uint32_t& count = state.heldNoteCounts[channel][note];
+        if (count == 0U) {
+            ++history.finalizeCursor;
+            continue;
         }
-        const uint8_t modulationControllers[] = {1U, 33U};
-        const uint8_t expressionControllers[] = {11U, 43U};
-        for (uint8_t index = 0; index < 2U; ++index) {
-            if ((state.modulationMasks[channel] & (1U << index)) != 0U) {
-                appendEnding(algorithm, ending,
-                             static_cast<uint8_t>(0xb0U | channel),
-                             modulationControllers[index], 0);
-            }
-            if ((state.expressionMasks[channel] & (1U << index)) != 0U) {
-                appendEnding(algorithm, ending,
-                             static_cast<uint8_t>(0xb0U | channel),
-                             expressionControllers[index], 127);
-            }
+        if (appended == budget) {
+            return false;
         }
-        if ((state.pitchBendMask & (1U << channel)) != 0U) {
-            appendEnding(algorithm, ending,
-                         static_cast<uint8_t>(0xe0U | channel), 0, 64);
+        appendEnding(algorithm, history.endingTemplate,
+                     static_cast<uint8_t>(0x80U | channel), note, 0);
+        --count;
+        ++appended;
+    }
+    while (history.finalizeCursor < kFinalizeNoteSlots + 16U) {
+        if (appended == budget) {
+            return false;
         }
-        if ((state.channelPressureMask & (1U << channel)) != 0U) {
-            appendEnding(algorithm, ending,
-                         static_cast<uint8_t>(0xd0U | channel), 0, 0, 2);
+        uint8_t bytes[3] = {0, 0, 0};
+        uint8_t size = 3U;
+        if (!takeChannelEnding(
+                state,
+                static_cast<uint8_t>(history.finalizeCursor - kFinalizeNoteSlots),
+                bytes, size)) {
+            ++history.finalizeCursor;
+            continue;
         }
-        for (uint8_t word = 0; word < 4U; ++word) {
-            uint32_t mask = state.polyPressureMasks[channel][word];
-            for (uint8_t bit = 0; bit < 32U; ++bit) {
-                if ((mask & (static_cast<uint32_t>(1U) << bit)) != 0U) {
-                    appendEnding(
-                        algorithm, ending,
-                        static_cast<uint8_t>(0xa0U | channel),
-                        static_cast<uint8_t>(word * 32U + bit), 0);
-                }
-            }
-        }
+        appendEnding(algorithm, history.endingTemplate, bytes[0], bytes[1],
+                     bytes[2], size);
+        ++appended;
     }
 
     algorithm.recordedState = RecordedState();
-    algorithm.captureEnabled = false;
+    history.finalizing = false;
+    return true;
+}
+
+void completeCaptureFinalization(Algorithm& algorithm) {
+    uint32_t appended = 0;
+    while (!finalizeCaptureStep(algorithm, kFinalizeAppendsPerStep, appended)) {
+        appended = 0;
+    }
+}
+
+// Legacy synchronous capture stop: the same bounded steps run to completion.
+void finalizeCapture(Algorithm& algorithm) {
+    beginFinalization(algorithm);
+    completeCaptureFinalization(algorithm);
 }
 
 uint32_t playbackDestinationMask(const Algorithm& algorithm) {
@@ -1207,8 +1718,12 @@ void setNotePending(Algorithm& algorithm, uint8_t channel, uint8_t note,
     }
 }
 
+// Bit zero is the generated-ending tag. Bits 1..31 hold a checked index+1
+// (zero means absent); oversized indices are never encoded.
 uint32_t encodedEndingIndex(uint32_t eventIndex) {
-    return (eventIndex + 1U) << kRecordedEventEndingIndexShift;
+    return eventIndex < 0x7fffffffU
+               ? (eventIndex + 1U) << kRecordedEventEndingIndexShift
+               : 0U;
 }
 
 bool decodedEndingIndex(const RecordedEvent& event, uint32_t& eventIndex) {
@@ -1221,7 +1736,13 @@ bool decodedEndingIndex(const RecordedEvent& event, uint32_t& eventIndex) {
     return true;
 }
 
-void prepareRecordedEndingOwnership(Algorithm& algorithm) {
+void linkRecordedEvent(RecordedEvent& event, uint32_t targetIndex) {
+    event.flags &= kRecordedEventFlagCaptureEnding;
+    event.flags |= encodedEndingIndex(targetIndex);
+}
+
+void beginRecordedEndingPairing(Algorithm& algorithm) {
+    HistoryControl& history = historyControl(algorithm);
     clearPendingPlaybackEndings(algorithm);
     const uint32_t none = algorithm.eventCount;
     for (uint8_t channel = 0; channel < 16U; ++channel) {
@@ -1231,77 +1752,133 @@ void prepareRecordedEndingOwnership(Algorithm& algorithm) {
         }
         algorithm.pendingEndings.sustainEventIndices[channel] = none;
         algorithm.pendingEndings.sustainDueIntervals[channel] = none;
-    }
-
-    // Build FIFO note occurrence pairs in one bounded pass. During this pass a
-    // queued note-on's metadata temporarily links to the next queued attack;
-    // popping it replaces that link with its recorded note-off index.
-    for (uint32_t index = 0; index < algorithm.eventCount; ++index) {
-        RecordedEvent* event = recordedEventByIndex(algorithm, index);
-        event->flags &= kRecordedEventFlagCaptureEnding;
-        const uint8_t type = event->bytes[0] & 0xf0U;
-        const uint8_t channel = event->bytes[0] & 0x0fU;
-        const uint8_t note = event->bytes[1] & 0x7fU;
-        const bool noteOn = type == 0x90U && event->bytes[2] != 0U;
-        const bool noteOff = type == 0x80U ||
-                             (type == 0x90U && event->bytes[2] == 0U);
-        if (noteOn) {
-            const uint32_t tail = static_cast<uint32_t>(
-                algorithm.pendingEndings.noteDueIntervals[channel][note]);
-            if (tail == none) {
-                algorithm.pendingEndings.noteEventIndices[channel][note] =
-                    index;
-            } else {
-                RecordedEvent* tailEvent =
-                    recordedEventByIndex(algorithm, tail);
-                tailEvent->flags |= encodedEndingIndex(index);
-            }
-            algorithm.pendingEndings.noteDueIntervals[channel][note] = index;
-        } else if (noteOff) {
-            const uint32_t head =
-                algorithm.pendingEndings.noteEventIndices[channel][note];
-            if (head != none) {
-                RecordedEvent* attack = recordedEventByIndex(algorithm, head);
-                uint32_t next = none;
-                decodedEndingIndex(*attack, next);
-                attack->flags &= kRecordedEventFlagCaptureEnding;
-                attack->flags |= encodedEndingIndex(index);
-                algorithm.pendingEndings.noteEventIndices[channel][note] = next;
-                if (next == none) {
-                    algorithm.pendingEndings.noteDueIntervals[channel][note] =
-                        none;
-                }
-            }
-        } else if (type == 0xb0U && event->bytes[1] == 64U) {
-            if (event->bytes[2] >= 64U) {
-                const uint32_t tail = static_cast<uint32_t>(
-                    algorithm.pendingEndings.sustainDueIntervals[channel]);
-                if (tail == none) {
-                    algorithm.pendingEndings.sustainEventIndices[channel] =
-                        index;
-                } else {
-                    RecordedEvent* tailEvent =
-                        recordedEventByIndex(algorithm, tail);
-                    tailEvent->flags |= encodedEndingIndex(index);
-                }
-                algorithm.pendingEndings.sustainDueIntervals[channel] = index;
-            } else {
-                uint32_t press =
-                    algorithm.pendingEndings.sustainEventIndices[channel];
-                while (press != none) {
-                    RecordedEvent* pressEvent =
-                        recordedEventByIndex(algorithm, press);
-                    uint32_t next = none;
-                    decodedEndingIndex(*pressEvent, next);
-                    pressEvent->flags &= kRecordedEventFlagCaptureEnding;
-                    pressEvent->flags |= encodedEndingIndex(index);
-                    press = next;
-                }
-                algorithm.pendingEndings.sustainEventIndices[channel] = none;
-                algorithm.pendingEndings.sustainDueIntervals[channel] = none;
-            }
+        for (uint8_t pedal = 0; pedal < 2U; ++pedal) {
+            history.pedalHeads[channel][pedal] = none;
+            history.pedalTails[channel][pedal] = none;
         }
     }
+    history.pairingCursor = 0;
+    history.pairingWalkPress = none;
+    history.pairingWalkRelease = none;
+    history.pairingGeneration = history.generation;
+    history.pairingComplete = false;
+    history.pairing = true;
+}
+
+// A press queues FIFO behind earlier presses; a release starts a resumable
+// walk that links every queued press to it.
+void pairPedalEvent(Algorithm& algorithm, RecordedEvent& event,
+                    uint32_t index, uint32_t& head, uint64_t& tail) {
+    const uint32_t none = algorithm.eventCount;
+    if (event.bytes[2] >= 64U) {
+        if (tail == none) {
+            head = index;
+        } else {
+            recordedEventByIndex(algorithm, static_cast<uint32_t>(tail))
+                ->flags |= encodedEndingIndex(index);
+        }
+        tail = index;
+        return;
+    }
+    HistoryControl& history = historyControl(algorithm);
+    history.pairingWalkPress = head;
+    history.pairingWalkRelease = index;
+    head = none;
+    tail = none;
+}
+
+// One record visit of the existing FIFO occurrence pairing. A queued note-on
+// temporarily links to the next queued attack until its note-off pops it.
+void pairRecordedEvent(Algorithm& algorithm, uint32_t index) {
+    const uint32_t none = algorithm.eventCount;
+    RecordedEvent* event = recordedEventByIndex(algorithm, index);
+    event->flags &= kRecordedEventFlagCaptureEnding;
+    const uint8_t type = event->bytes[0] & 0xf0U;
+    const uint8_t channel = event->bytes[0] & 0x0fU;
+    const uint8_t note = event->bytes[1] & 0x7fU;
+    const bool noteOn = type == 0x90U && event->bytes[2] != 0U;
+    const bool noteOff = type == 0x80U ||
+                         (type == 0x90U && event->bytes[2] == 0U);
+    PendingPlaybackEndings& work = algorithm.pendingEndings;
+    if (noteOn) {
+        const uint32_t tail =
+            static_cast<uint32_t>(work.noteDueIntervals[channel][note]);
+        if (tail == none) {
+            work.noteEventIndices[channel][note] = index;
+        } else {
+            recordedEventByIndex(algorithm, tail)->flags |=
+                encodedEndingIndex(index);
+        }
+        work.noteDueIntervals[channel][note] = index;
+    } else if (noteOff) {
+        const uint32_t head = work.noteEventIndices[channel][note];
+        if (head != none) {
+            RecordedEvent* attack = recordedEventByIndex(algorithm, head);
+            uint32_t next = none;
+            decodedEndingIndex(*attack, next);
+            linkRecordedEvent(*attack, index);
+            work.noteEventIndices[channel][note] = next;
+            if (next == none) {
+                work.noteDueIntervals[channel][note] = none;
+            }
+        }
+    } else if (type == 0xb0U && event->bytes[1] == 64U) {
+        pairPedalEvent(algorithm, *event, index,
+                       work.sustainEventIndices[channel],
+                       work.sustainDueIntervals[channel]);
+    } else if (type == 0xb0U &&
+               (event->bytes[1] == 66U || event->bytes[1] == 69U)) {
+        HistoryControl& history = historyControl(algorithm);
+        const uint8_t pedal = event->bytes[1] == 66U ? 0U : 1U;
+        pairPedalEvent(algorithm, *event, index,
+                       history.pedalHeads[channel][pedal],
+                       history.pedalTails[channel][pedal]);
+    }
+}
+
+// Pairs the frozen history once per generation, charging every record and
+// release-walk visit to `budget`. Returns true once links are complete.
+bool pairRecordedEndingsStep(Algorithm& algorithm, uint32_t& budget) {
+    HistoryControl& history = historyControl(algorithm);
+    if (history.pairingComplete &&
+        history.pairedGeneration == history.generation) {
+        return true;
+    }
+    if (!history.pairing || history.pairingGeneration != history.generation) {
+        beginRecordedEndingPairing(algorithm);
+    }
+    const uint32_t none = algorithm.eventCount;
+    while (budget != 0U) {
+        if (history.pairingWalkPress != none) {
+            RecordedEvent* press =
+                recordedEventByIndex(algorithm, history.pairingWalkPress);
+            uint32_t next = none;
+            decodedEndingIndex(*press, next);
+            linkRecordedEvent(*press, history.pairingWalkRelease);
+            history.pairingWalkPress = next;
+        } else if (history.pairingCursor < algorithm.eventCount) {
+            pairRecordedEvent(algorithm, history.pairingCursor);
+            ++history.pairingCursor;
+        } else {
+            break;
+        }
+        --budget;
+    }
+    if (history.pairingWalkPress != none ||
+        history.pairingCursor < algorithm.eventCount) {
+        return false;
+    }
+    clearPendingPlaybackEndings(algorithm);
+    history.pairing = false;
+    history.pairingComplete = true;
+    history.pairedGeneration = history.generation;
+    return true;
+}
+
+// Legacy synchronous entry: completes (or reuses) this generation's pairing.
+void prepareRecordedEndingOwnership(Algorithm& algorithm) {
+    uint32_t unlimited = kHistoryNoIndex;
+    pairRecordedEndingsStep(algorithm, unlimited);
     clearPendingPlaybackEndings(algorithm);
 }
 
@@ -1793,6 +2370,246 @@ void handleResetEdge(Algorithm& algorithm, uint64_t sample) {
     }
 }
 
+uint32_t historySetupFingerprint(const HistoryState& state,
+                                 const HistoryContextMeta& meta) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&state);
+    uint32_t hash = 2166136261U;
+    for (uint32_t index = kHistorySetupBegin; index < kHistorySetupEnd;
+         ++index) {
+        hash = (hash ^ bytes[index]) * 16777619U;
+    }
+    hash = (hash ^ (meta.coverageComplete ? 1U : 0U)) * 16777619U;
+    return (hash ^ (meta.setupChangesInside ? 1U : 0U)) * 16777619U;
+}
+
+bool sameHistoryRange(const PulseRange& left, const PulseRange& right) {
+    return left.startPulse == right.startPulse &&
+           left.endPulse == right.endPulse;
+}
+
+void requestHistoryCandidate(Algorithm& algorithm, const PulseRange& range) {
+    HistoryControl& history = historyControl(algorithm);
+    if (history.candidateRequested &&
+        sameHistoryRange(history.work.range, range)) {
+        return;
+    }
+    history.candidateRequested = true;
+    history.contexts[kHistoryContextCandidate].ready = false;
+    history.work.range = range;
+    history.workPhase = kPreparationSearch;
+}
+
+void cancelHistoryCandidate(Algorithm& algorithm) {
+    HistoryControl& history = historyControl(algorithm);
+    history.candidateRequested = false;
+    history.contexts[kHistoryContextCandidate].ready = false;
+    history.workPhase = kPreparationIdle;
+}
+
+// Starts reconstruction at the newest checkpoint wholly before the selection
+// (<= 9 probes), else at the eviction seed, and positions the journal cursor
+// at its first entry not already folded into that state (<= 9 probes).
+void beginHistoryReconstruction(Algorithm& algorithm, uint32_t& budget) {
+    HistoryControl& history = historyControl(algorithm);
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    HistoryState& work = arena.contexts[kHistoryContextWork];
+    const uint64_t start = history.work.range.startPulse;
+    const uint64_t total = nextHistoryOrdinal(algorithm);
+    uint64_t low = history.baseOrdinal / kHistoryCheckpointInterval + 1U;
+    uint64_t high = total / kHistoryCheckpointInterval + 1U;
+    uint64_t found = 0;
+    uint32_t comparisons = 0;
+    while (low < high) {
+        const uint64_t middle = low + (high - low) / 2U;
+        const HistoryCheckpoint& checkpoint =
+            historyCheckpoint(algorithm, middle);
+        ++comparisons;
+        if (checkpoint.key.ordinal == middle * kHistoryCheckpointInterval &&
+            checkpoint.key.pulse < start) {
+            found = middle;
+            low = middle + 1U;
+        } else {
+            high = middle;
+        }
+    }
+    noteMaximum(history.maximumCheckpointSearchComparisons, comparisons);
+    if (found != 0U) {
+        copyHistoryState(work, historyCheckpoint(algorithm, found).state);
+        history.workOrdinal = found * kHistoryCheckpointInterval;
+        history.work.coverageComplete =
+            history.workOrdinal >= history.coverageStartOrdinal;
+    } else {
+        copyHistoryState(work, history.seed);
+        history.workOrdinal = history.baseOrdinal;
+        // A seed that already folded the selection's own pulse cannot
+        // represent the state before it.
+        history.work.coverageComplete =
+            history.seedValid &&
+            history.baseOrdinal >= history.coverageStartOrdinal &&
+            !(history.seedFolded && history.seedLastPulse >= start);
+    }
+    history.workJournalCursor =
+        journalBound(algorithm, history.workOrdinal, false, comparisons);
+    budget = budget > comparisons ? budget - comparisons : 0U;
+    history.work.generation = history.generation;
+    history.work.setupChangesInside = false;
+    history.workForwardEvents = 0;
+    history.workJournalVisits = 0;
+    history.workPhase = kPreparationFold;
+}
+
+// Bounded, resumable candidate preparation over immutable history: at most
+// 511 forward events plus the retained journal, never touching event links
+// or the active context. Returns true when the candidate is ready.
+bool prepareHistoryCandidate(Algorithm& algorithm, uint32_t& budget) {
+    HistoryControl& history = historyControl(algorithm);
+    if (!history.candidateRequested) {
+        return false;
+    }
+    HistoryContextMeta& candidate = history.contexts[kHistoryContextCandidate];
+    if (candidate.ready && candidate.generation == history.generation &&
+        sameHistoryRange(candidate.range, history.work.range)) {
+        return true;
+    }
+    if (history.workPhase == kPreparationIdle ||
+        history.work.generation != history.generation) {
+        history.workPhase = kPreparationSearch;
+    }
+    if (history.workPhase == kPreparationSearch) {
+        if (budget < 18U) {
+            return false;
+        }
+        beginHistoryReconstruction(algorithm, budget);
+    }
+
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    HistoryState& work = arena.contexts[kHistoryContextWork];
+    const uint64_t start = history.work.range.startPulse;
+    const uint64_t total = nextHistoryOrdinal(algorithm);
+    while (history.workPhase == kPreparationFold) {
+        if (budget == 0U) {
+            return false;
+        }
+        const RecordedEvent* event =
+            history.workOrdinal < total
+                ? recordedEventByIndex(
+                      algorithm, static_cast<uint32_t>(history.workOrdinal -
+                                                       history.baseOrdinal))
+                : NULL;
+        if (history.workJournalCursor < history.journalCount) {
+            const HistoryJournalEntry& entry =
+                journalEntry(algorithm, history.workJournalCursor);
+            // Entries received before the selection's first own event are
+            // its context, including gap seeds stamped at that event's pulse.
+            if (entry.key.ordinal <= history.workOrdinal) {
+                if (entry.key.pulse >= start &&
+                    (event == NULL ||
+                     event->pulse >= history.work.range.endPulse)) {
+                    history.workPhase = kPreparationInside;
+                    break;
+                }
+                copyHistoryState(work, entry.state);
+                ++history.workJournalCursor;
+                ++history.workJournalVisits;
+                --budget;
+                continue;
+            }
+        }
+        if (event == NULL || event->pulse >= start) {
+            history.workPhase = kPreparationInside;
+            break;
+        }
+        if (history.workForwardEvents == kHistoryMaximumForwardEvents) {
+            history.work.coverageComplete = false;
+            history.workPhase = kPreparationInside;
+            break;
+        }
+        applyHistoryEvent(work, *event);
+        ++history.workOrdinal;
+        ++history.workForwardEvents;
+        --budget;
+    }
+
+    // Setup changes journaled strictly inside the selection are flagged.
+    while (history.workJournalCursor < history.journalCount) {
+        const HistoryJournalEntry& entry =
+            journalEntry(algorithm, history.workJournalCursor);
+        if (entry.key.pulse >= history.work.range.endPulse) {
+            break;
+        }
+        if (budget == 0U) {
+            return false;
+        }
+        if (entry.key.pulse >= start &&
+            !sameHistoryBytes(entry.state, work, kHistorySetupBegin,
+                              kHistorySetupEnd)) {
+            history.work.setupChangesInside = true;
+        }
+        ++history.workJournalCursor;
+        ++history.workJournalVisits;
+        --budget;
+    }
+
+    noteMaximum(history.maximumForwardEventVisits, history.workForwardEvents);
+    noteMaximum(history.maximumJournalVisits, history.workJournalVisits);
+    if (!history.work.coverageComplete) {
+        // Missing coverage is unknown, never certified by a checkpoint alone.
+        zeroHistoryState(work);
+    }
+    history.work.setupFingerprint = historySetupFingerprint(work, history.work);
+    history.work.ready = true;
+    copyHistoryState(arena.contexts[kHistoryContextCandidate], work);
+    candidate = history.work;
+    history.workPhase = kPreparationIdle;
+    return true;
+}
+
+// Playback entry adopts the selected range's prepared context as the active,
+// immutable copy. Preparation is bounded, so completing it here is fixed work.
+void adoptActiveHistoryContext(Algorithm& algorithm, const PulseRange& range) {
+    HistoryControl& history = historyControl(algorithm);
+    requestHistoryCandidate(algorithm, range);
+    uint32_t unlimited = kHistoryNoIndex;
+    prepareHistoryCandidate(algorithm, unlimited);
+    MpeArenaReservation& arena = mpeArena(algorithm);
+    copyHistoryState(arena.contexts[kHistoryContextActive],
+                     arena.contexts[kHistoryContextCandidate]);
+    history.contexts[kHistoryContextActive] =
+        history.contexts[kHistoryContextCandidate];
+}
+
+// Once per host step: finalize at most 128 generated appends, then spend at
+// most 512 record visits on frozen-history pairing and candidate preparation.
+void advanceHistoryWork(Algorithm& algorithm) {
+    HistoryControl& history = historyControl(algorithm);
+    history.lastStepFinalizeAppends = 0;
+    history.lastStepPreparationVisits = 0;
+    if (history.finalizing) {
+        uint32_t appended = 0;
+        finalizeCaptureStep(algorithm, kFinalizeAppendsPerStep, appended);
+        history.lastStepFinalizeAppends = appended;
+        noteMaximum(history.maximumStepFinalizeAppends, appended);
+        if (history.finalizing) {
+            return;
+        }
+    }
+    uint32_t budget = kPreparationVisitsPerStep;
+    // Pairing reuses note/pedal work storage, so it runs only while that
+    // storage is free and the history is frozen.
+    if (!algorithm.captureEnabled && algorithm.selectionValid &&
+        algorithm.transportState == kTransportStopped &&
+        algorithm.pendingEndings.noteCount == 0U &&
+        algorithm.pendingEndings.sustainCount == 0U) {
+        pairRecordedEndingsStep(algorithm, budget);
+    }
+    if (budget != 0U) {
+        prepareHistoryCandidate(algorithm, budget);
+    }
+    history.lastStepPreparationVisits = kPreparationVisitsPerStep - budget;
+    noteMaximum(history.maximumStepPreparationVisits,
+                history.lastStepPreparationVisits);
+}
+
 void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
     if (algorithm == NULL || algorithm->v == NULL || busFrames == NULL ||
@@ -1802,6 +2619,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     const int numFrames = numFramesBy4 * 4;
     algorithm->processingStarted = true;
+    advanceHistoryWork(*algorithm);
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
     const float* clockFrames = clockBus >= 1 && clockBus <= kNT_lastBus
@@ -2066,6 +2884,31 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
 
     observeSetup(*algorithm, byte0, byte1, byte2);
 
+    uint64_t offset = algorithm->sampleCursor - algorithm->lastPulseSample;
+    if (offset > 0xffffffffULL) {
+        offset = 0xffffffffULL;
+    }
+    // The MIDI callback carries no arrival timestamp. A callback at the first
+    // sample boundary after a scanned pulse is the finest observable
+    // pulse-aligned case; normalize that one-sample ambiguity to phase zero.
+    RecordedEvent event = {
+        algorithm->currentPulse,
+        offset <= 1U ? 0U : static_cast<uint32_t>(offset),
+        boundedInterval(algorithm->lastClockIntervalSamples),
+        {byte0, byte1, byte2},
+        static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
+        0,
+    };
+    const int recordingChannel = recordingAdmission(*algorithm);
+    const bool admitted =
+        recordingChannel == 0 || static_cast<int>(byte0 & 0x0fU) + 1 == recordingChannel;
+    const bool recorded = admitted && algorithm->captureEnabled &&
+                          algorithm->clockRunning &&
+                          eligiblePerformanceEvent(event);
+    if (admitted) {
+        observeLiveHistory(*algorithm, event, recorded);
+    }
+
     const bool emergencyController =
         (byte0 & 0xf0U) == 0xb0U && (byte1 == 120U || byte1 == 123U);
     if (emergencyController) {
@@ -2081,43 +2924,9 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1,
         return;
     }
 
-    if (!algorithm->captureEnabled || !algorithm->clockRunning) {
+    if (!recorded) {
         return;
     }
-
-    RecordedEvent event = {
-        algorithm->currentPulse,
-        0,
-        boundedInterval(algorithm->lastClockIntervalSamples),
-        {byte0, byte1, byte2},
-        static_cast<uint8_t>((byte0 & 0xf0U) == 0xd0U ? 2U : 3U),
-        0,
-    };
-    if (!eligiblePerformanceEvent(event)) {
-        return;
-    }
-
-    const uint8_t channel = static_cast<uint8_t>((byte0 & 0x0fU) + 1U);
-    int recordingChannel = 0;
-    if (algorithm->v != NULL) {
-        recordingChannel = algorithm->v[kParameterRecordingChannel];
-    }
-    if (recordingChannel < 0 || recordingChannel > 16) {
-        recordingChannel = 0;
-    }
-    if (recordingChannel != 0 && channel != recordingChannel) {
-        return;
-    }
-
-    uint64_t offset = algorithm->sampleCursor - algorithm->lastPulseSample;
-    if (offset > 0xffffffffULL) {
-        offset = 0xffffffffULL;
-    }
-    // The MIDI callback carries no arrival timestamp. A callback at the first
-    // sample boundary after a scanned pulse is the finest observable
-    // pulse-aligned case; normalize that one-sample ambiguity to phase zero.
-    event.offsetSamples =
-        offset <= 1U ? 0U : static_cast<uint32_t>(offset);
     appendEvent(*algorithm, event);
     trackRecordedState(*algorithm, event);
 }
@@ -3512,11 +4321,8 @@ bool parsePresetState(_NT_jsonParse& parse, Algorithm& algorithm) {
     return true;
 }
 
-bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
+bool deserialiseState(_NT_algorithm* self, _NT_jsonParse& parse) {
     Algorithm* algorithm = static_cast<Algorithm*>(self);
-    if (algorithm == NULL) {
-        return false;
-    }
     int members = 0;
     bool restored = false;
     if (!parse.numberOfObjectMembers(members)) {
@@ -3582,6 +4388,19 @@ bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
            algorithm->transportState == kTransportStopped;
 }
 
+// Restored events carry no retained observation coverage until the MPE
+// extension is loaded, so a non-empty load is honestly unknown history.
+bool deserialise(_NT_algorithm* self, _NT_jsonParse& parse) {
+    Algorithm* algorithm = static_cast<Algorithm*>(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    const uint64_t retiredOrdinal = nextHistoryOrdinal(*algorithm);
+    const bool restored = deserialiseState(self, parse);
+    restartHistory(*algorithm, retiredOrdinal, algorithm->eventCount == 0U);
+    return restored;
+}
+
 static const _NT_factory kFactory = {
     .guid = NT_MULTICHAR('T', 'h', 'M', 'b'),
     .name = "MidiBuffer",
@@ -3619,6 +4438,43 @@ Algorithm* asAlgorithm(_NT_algorithm* self) {
 } // namespace
 
 #if defined(MIDIBUFFER_NATIVE_TEST)
+bool historySnapshot(const _NT_algorithm* self, HistorySnapshot& snapshot) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    const HistoryControl& history = historyControl(*algorithm);
+    snapshot.baseOrdinal = history.baseOrdinal;
+    snapshot.nextOrdinal = nextHistoryOrdinal(*algorithm);
+    snapshot.generation = history.generation;
+    snapshot.pairedGeneration = history.pairedGeneration;
+    snapshot.coverageStartOrdinal = history.coverageStartOrdinal;
+    snapshot.seedLastPulse = history.seedLastPulse;
+    snapshot.checkpointCount = history.checkpointCount;
+    snapshot.journalCount = history.journalCount;
+    snapshot.journalEvictions = history.journalEvictions;
+    snapshot.lastStepFinalizeAppends = history.lastStepFinalizeAppends;
+    snapshot.maximumStepFinalizeAppends = history.maximumStepFinalizeAppends;
+    snapshot.lastStepPreparationVisits = history.lastStepPreparationVisits;
+    snapshot.maximumStepPreparationVisits =
+        history.maximumStepPreparationVisits;
+    snapshot.maximumSeedSearchComparisons =
+        history.maximumSeedSearchComparisons;
+    snapshot.maximumCheckpointSearchComparisons =
+        history.maximumCheckpointSearchComparisons;
+    snapshot.maximumForwardEventVisits = history.maximumForwardEventVisits;
+    snapshot.maximumJournalVisits = history.maximumJournalVisits;
+    snapshot.seedValid = history.seedValid;
+    snapshot.seedFolded = history.seedFolded;
+    snapshot.finalizing = history.finalizing;
+    snapshot.pairingComplete = history.pairingComplete &&
+                               history.pairedGeneration == history.generation;
+    copyHistoryState(snapshot.live, history.live);
+    copyHistoryState(snapshot.recorded, history.recorded);
+    copyHistoryState(snapshot.seed, history.seed);
+    return true;
+}
+
 bool setupObserverSnapshot(const _NT_algorithm* self, SetupObserver& snapshot) {
     if (self == NULL) return false;
     const Algorithm* algorithm = static_cast<const Algorithm*>(self);
@@ -3805,8 +4661,10 @@ bool setRetainedTimelineFixture(_NT_algorithm* self, uint64_t startPulse,
     if (algorithm == NULL || algorithm->eventCapacity == 0U) {
         return false;
     }
+    const uint64_t retiredOrdinal = nextHistoryOrdinal(*algorithm);
     algorithm->eventHead = 0U;
     algorithm->eventCount = endPulse > startPulse ? 1U : 0U;
+    restartHistory(*algorithm, retiredOrdinal, false);
     algorithm->historyEndPulseExclusive =
         endPulse > startPulse ? endPulse : 0U;
     if (algorithm->eventCount != 0U) {
@@ -3851,6 +4709,7 @@ bool addRetainedTimelineNoteFixture(_NT_algorithm* self, uint64_t pulse,
     }
     algorithm->recordingEvents[writeIndex] = event;
     ++algorithm->eventCount;
+    ++historyControl(*algorithm).generation;
     return true;
 }
 
@@ -3871,6 +4730,34 @@ bool setTimelineNavigationFixture(_NT_algorithm* self, bool showAll,
 }
 #endif
 
+bool historyContext(const _NT_algorithm* self, bool candidate,
+                    HistoryContextSnapshot& context) {
+    const Algorithm* algorithm = asAlgorithm(self);
+    if (algorithm == NULL) {
+        return false;
+    }
+    const HistoryContextSlot slot =
+        candidate ? kHistoryContextCandidate : kHistoryContextActive;
+    const HistoryControl& history = historyControl(*algorithm);
+    const HistoryContextMeta& meta = history.contexts[slot];
+    context.range = meta.range;
+    context.generation = meta.generation;
+    context.setupFingerprint = meta.setupFingerprint;
+    // A candidate is stale once history changes; the adopted active context
+    // remains its immutable copy.
+    context.ready = meta.ready && (!candidate ||
+                                   meta.generation == history.generation);
+    context.coverageComplete = meta.coverageComplete;
+    context.setupChangesInside = meta.setupChangesInside;
+    copyHistoryState(context.state, mpeArena(*algorithm).contexts[slot]);
+    return context.ready;
+}
+
+bool beginCaptureFinalization(_NT_algorithm* self) {
+    Algorithm* algorithm = asAlgorithm(self);
+    return algorithm != NULL && beginFinalization(*algorithm);
+}
+
 bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
                        uint64_t endPulse) {
     Algorithm* algorithm = asAlgorithm(self);
@@ -3889,6 +4776,7 @@ bool setPulseSelection(_NT_algorithm* self, uint64_t startPulse,
     algorithm->selection.startPulse = startPulse;
     algorithm->selection.endPulse = endPulse;
     algorithm->selectionValid = true;
+    requestHistoryCandidate(*algorithm, algorithm->selection);
     if (algorithm->transportState != kTransportStopped &&
         algorithm->activeSelectionValid) {
         algorithm->rangeTransitionPending =
@@ -3950,6 +4838,7 @@ bool startPlayback(_NT_algorithm* self) {
     }
 
     prepareRecordedEndingOwnership(*algorithm);
+    adoptActiveHistoryContext(*algorithm, range);
     algorithm->activeSelection = range;
     algorithm->activeSelectionValid = true;
     algorithm->rangeTransitionPending = false;

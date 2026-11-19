@@ -1407,6 +1407,358 @@ void verifySetupObservedBeforeCaptureWithoutChangingOrdinaryBytes() {
            "setup observation leaves ordinary admitted bytes unchanged");
 }
 
+// --- Historical candidate contexts over immutable event pairs ---
+
+midibuffer::HistorySnapshot historyState(midibuffer_test::HostDouble& host) {
+    midibuffer::HistorySnapshot state = {};
+    midibuffer::historySnapshot(host.algorithm(), state);
+    return state;
+}
+
+bool knownHistoryValue(const midibuffer::HistoryState& state, uint8_t channel,
+                       midibuffer::HistoryValue index, uint8_t expected) {
+    return (state.known[channel] & (1U << index)) != 0U &&
+           state.values[channel][index] == expected;
+}
+
+bool knownBend(const midibuffer::HistoryState& state, uint8_t channel,
+               uint8_t lsb, uint8_t msb) {
+    return knownHistoryValue(state, channel, midibuffer::kHistoryBendLsb, lsb) &&
+           knownHistoryValue(state, channel, midibuffer::kHistoryBendMsb, msb);
+}
+
+bool historyUnknown(const midibuffer::HistoryState& state) {
+    for (unsigned channel = 0; channel < 16U; ++channel) {
+        if (state.known[channel] != 0U || state.roles[channel] != 0U) {
+            return false;
+        }
+    }
+    return state.zoneCountState[0] == midibuffer::kSetupUnknown &&
+           state.zoneCountState[1] == midibuffer::kSetupUnknown;
+}
+
+// Selects a range and advances host steps until its candidate is ready.
+bool prepareCandidate(midibuffer_test::HostDouble& host, uint64_t start,
+                      uint64_t end, midibuffer::HistoryContextSnapshot& context,
+                      uint32_t maximumSteps = 8U) {
+    if (!midibuffer::setPulseSelection(host.algorithm(), start, end)) {
+        return false;
+    }
+    for (uint32_t step = 0; step <= maximumSteps; ++step) {
+        if (midibuffer::historyContext(host.algorithm(), true, context) &&
+            context.range.startPulse == start && context.range.endPulse == end) {
+            return true;
+        }
+        noClockBlock(host);
+    }
+    return false;
+}
+
+void verifyHistoricalContextAcrossGapsAndEqualTimeChanges() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "historical context host constructs");
+    sendMidi(host, 0xE1, 0x11, 0x40);  // pre-capture, pre-clock member bend
+    sendMidi(host, 0xB0, 1, 20);       // manager-only modulation context
+    startCapture(host);
+    acquireClock(host);
+    const uint64_t first = snapshot(host).currentPulse;
+    sendMidi(host, 0x91, 60, 100);
+    clockPulse(host);
+    sendMidi(host, 0xE1, 0x22, 0x50);
+    sendMidi(host, 0x81, 60, 0);
+    clockPulse(host);
+    const uint64_t equal = snapshot(host).currentPulse;
+    sendMidi(host, 0xE1, 0x33, 0x60);  // same pulse and offset as the attack
+    sendMidi(host, 0x91, 62, 90);
+    clockPulse(host);
+    noClockBlock(host);
+    noClockBlock(host);
+    noClockBlock(host);
+    expect(!snapshot(host).clockRunning, "clock gap is established");
+    sendMidi(host, 0xE1, 0x44, 0x70);  // music-free changes during the gap
+    sendMidi(host, 0xB1, 74, 55);
+    acquireClock(host);
+    const uint64_t resumed = snapshot(host).currentPulse;
+    sendMidi(host, 0x81, 62, 0);
+    clockPulse(host);
+    sendMidi(host, 0xE1, 0x55, 0x10);  // newest value
+    clockPulse(host);
+    stopCapture(host);
+
+    midibuffer::HistoryContextSnapshot context = {};
+    expect(prepareCandidate(host, first, first + 1U, context) &&
+               context.coverageComplete &&
+               knownBend(context.state, 1, 0x11, 0x40) &&
+               knownHistoryValue(context.state, 0,
+                                 midibuffer::kHistoryModulationMsb, 20) &&
+               (context.state.known[1] &
+                (1U << midibuffer::kHistoryTimbre)) == 0U,
+           "pre-capture member and manager-only context precede the first "
+           "attack while unobserved timbre stays unknown");
+    expect(prepareCandidate(host, equal, equal + 1U, context) &&
+               knownBend(context.state, 1, 0x22, 0x50),
+           "an equal-time change belongs to its selection, not its context");
+    expect(prepareCandidate(host, resumed, resumed + 1U, context) &&
+               knownBend(context.state, 1, 0x44, 0x70) &&
+               knownHistoryValue(context.state, 1, midibuffer::kHistoryTimbre,
+                                 55),
+           "a full resumption seed covers changes made during a clock gap");
+    expect(knownBend(historyState(host).live, 1, 0x55, 0x10) &&
+               !knownBend(context.state, 1, 0x55, 0x10),
+           "contexts are historical rather than the newest observation");
+}
+
+// The legacy capture-stop path finalizes synchronously; the Finalizing-state
+// seam is the only route that exercises per-step finalization bounds.
+void verifyBoundedFinalizationKeepsEndingsTaggedAndUnobserved() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "bounded finalization host constructs");
+    startCapture(host);
+    acquireClock(host);
+    sendMidi(host, 0xE0, 0x01, 0x30);
+    for (uint32_t index = 0; index < 300U; ++index) {
+        sendMidi(host, static_cast<uint8_t>(0x90U | (index / 100U)),
+                 static_cast<uint8_t>(20U + index % 100U), 100);
+    }
+    const uint32_t captured = snapshot(host).eventCount;
+    expect(midibuffer::beginCaptureFinalization(host.algorithm()) &&
+               !snapshot(host).captureEnabled && historyState(host).finalizing &&
+               snapshot(host).eventCount == captured,
+           "finalization freezes capture before appending endings");
+    sendMidi(host, 0x95, 1, 1);
+    expect(snapshot(host).eventCount == captured,
+           "frozen capture admits no new events while finalizing");
+    uint32_t steps = 0;
+    bool bounded = true;
+    while (historyState(host).finalizing && steps < 16U) {
+        noClockBlock(host);
+        bounded = bounded && historyState(host).lastStepFinalizeAppends <= 128U;
+        ++steps;
+    }
+    expect(bounded && steps == 3U &&
+               historyState(host).maximumStepFinalizeAppends == 128U &&
+               snapshot(host).eventCount == captured + 301U,
+           "301 generated endings progress by at most 128 appends per step");
+    bool tagged = true;
+    midibuffer::RecordedEvent event = {};
+    for (uint32_t index = captured; index < captured + 301U; ++index) {
+        tagged = tagged && midibuffer::recordedEventAt(host.algorithm(), index,
+                                                       event) &&
+                 (event.flags & 1U) != 0U;
+    }
+    expect(tagged && eventBytesMatch(event, 0xE0, 0, 64, 3),
+           "every generated ending keeps the synthetic tag");
+    expect(knownBend(historyState(host).recorded, 0, 0x01, 0x30),
+           "a generated centered bend never seeds historical observation");
+
+    startCapture(host);
+    acquireClock(host);
+    const uint64_t later = snapshot(host).currentPulse;
+    sendMidi(host, 0x90, 70, 100);
+    clockPulse(host);
+    stopCapture(host);
+    midibuffer::HistoryContextSnapshot context = {};
+    expect(prepareCandidate(host, later, later + 1U, context) &&
+               knownBend(context.state, 0, 0x01, 0x30),
+           "a context after generated endings keeps the observed bend");
+}
+
+void verifyRollingSeedsAndBoundedPairingAtMaximumCapacity() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(5), "maximum-capacity history host constructs");
+    startCapture(host);
+    acquireClock(host);
+    const uint32_t capacity = snapshot(host).eventCapacity;
+    const uint64_t firstPulse = snapshot(host).currentPulse;
+    uint32_t sent = 0;
+    while (sent < capacity + 5000U) {
+        const uint64_t pulse = snapshot(host).currentPulse;
+        sendMidi(host, 0xE0, static_cast<uint8_t>(pulse & 0x7fU),
+                 static_cast<uint8_t>((pulse >> 7U) & 0x7fU));
+        for (uint32_t index = 0; index < 99U; ++index) {
+            sendMidi(host, 0xB0, 7, static_cast<uint8_t>(index));
+        }
+        sent += 100U;
+        clockPulse(host);
+    }
+    sendMidi(host, 0xE0, 0, 64);  // neutral: finalization appends nothing
+    sendMidi(host, 0x90, 60, 100);
+    sendMidi(host, 0x80, 60, 0);
+    clockPulse(host);
+    stopCapture(host);
+    const midibuffer::HistorySnapshot rolled = historyState(host);
+    expect(snapshot(host).eventCount == capacity && capacity == 208333U &&
+               rolled.baseOrdinal == sent + 3U - capacity &&
+               rolled.seedFolded && rolled.seedValid &&
+               rolled.checkpointCount == 409U &&
+               rolled.maximumSeedSearchComparisons <= 9U,
+           "eviction advances the full seed before every overwrite");
+
+    const uint64_t oldest = snapshot(host).oldestPulse;
+    const uint64_t newest = snapshot(host).newestPulse;
+    const uint64_t starts[] = {oldest + 1U, (oldest + newest) / 2U, newest - 3U};
+    for (uint64_t start : starts) {
+        midibuffer::HistoryContextSnapshot context = {};
+        expect(prepareCandidate(host, start, start + 1U, context, 1000U),
+               "rolling candidate becomes ready");
+        const uint64_t previous = start - 1U;
+        expect(context.coverageComplete &&
+                   knownBend(context.state, 0,
+                             static_cast<uint8_t>(previous & 0x7fU),
+                             static_cast<uint8_t>((previous >> 7U) & 0x7fU)),
+               "seed and checkpoint reconstruction yield the pulse's history");
+    }
+    const midibuffer::HistorySnapshot prepared = historyState(host);
+    expect(prepared.pairingComplete &&
+               prepared.maximumStepPreparationVisits == 512U &&
+               prepared.maximumCheckpointSearchComparisons <= 9U &&
+               prepared.maximumForwardEventVisits <= 511U &&
+               prepared.maximumJournalVisits <= 256U,
+           "pairing and preparation progress within 512 visits per step");
+    expect(firstPulse < oldest, "rolling history overwrote its oldest pulses");
+
+    midibuffer::RecordedEvent attack = {};
+    midibuffer::RecordedEvent release = {};
+    expect(midibuffer::recordedEventAt(host.algorithm(), capacity - 2U, attack) &&
+               midibuffer::recordedEventAt(host.algorithm(), capacity - 1U,
+                                           release) &&
+               eventBytesMatch(attack, 0x90, 60, 100, 3) &&
+               attack.flags == (capacity << 1U) && release.flags == 0U,
+           "the maximum ring index pairs through a checked index+1 link");
+}
+
+void verifyJournalOverflowCannotCertifyOlderContext() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "journal overflow host constructs");
+    startCapture(host);
+    acquireClock(host);
+    const uint64_t take = snapshot(host).currentPulse;
+    sendMidi(host, 0xE0, 0x0A, 0x20);
+    clockPulse(host);
+    for (uint32_t index = 0; index < 300U; ++index) {
+        mcm(host, 0, index % 2U == 0U ? 4U : 3U);  // journaled setup changes
+        sendMidi(host, 0xB0, 7, static_cast<uint8_t>(index & 0x7fU));
+        if (index % 10U == 9U) {
+            clockPulse(host);
+        }
+    }
+    for (uint32_t index = 0; index < 1100U; ++index) {
+        sendMidi(host, 0xB0, 7, static_cast<uint8_t>(index & 0x7fU));
+        if (index % 100U == 99U) {
+            clockPulse(host);
+        }
+    }
+    const uint64_t recent = snapshot(host).currentPulse;
+    sendMidi(host, 0x90, 64, 100);
+    clockPulse(host);
+    stopCapture(host);
+    const midibuffer::HistorySnapshot overflowed = historyState(host);
+    expect(overflowed.journalCount == 256U && overflowed.journalEvictions > 0U &&
+               overflowed.coverageStartOrdinal > 0U && !overflowed.seedValid,
+           "journal overflow advances an explicit coverage watermark");
+
+    midibuffer::HistoryContextSnapshot context = {};
+    expect(prepareCandidate(host, take + 1U, take + 2U, context) &&
+               !context.coverageComplete && historyUnknown(context.state),
+           "context before lost journal coverage is unknown, not certified");
+    expect(prepareCandidate(host, recent, recent + 1U, context) &&
+               context.coverageComplete &&
+               context.state.zoneCountState[0] == midibuffer::kSetupKnown &&
+               context.state.zoneCount[0] == 3U,
+           "a checkpoint inside retained coverage restores its setup");
+}
+
+void verifyCandidatePreparationLeavesActivePassImmutable() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "active/candidate isolation host constructs");
+    startCapture(host);
+    acquireClock(host);
+    const uint64_t firstTake = snapshot(host).currentPulse;
+    sendMidi(host, 0xE1, 0x10, 0x20);
+    sendMidi(host, 0x91, 60, 100);
+    clockPulse(host);
+    sendMidi(host, 0x81, 60, 0);
+    clockPulse(host);
+    mcm(host, 0, 5);  // setup changes between the takes
+    clockPulse(host);
+    const uint64_t secondTake = snapshot(host).currentPulse;
+    sendMidi(host, 0xE1, 0x30, 0x40);
+    sendMidi(host, 0x91, 64, 100);
+    sendMidi(host, 0xB1, 66, 127);
+    clockPulse(host);
+    sendMidi(host, 0x81, 64, 0);
+    sendMidi(host, 0xB1, 66, 0);
+    clockPulse(host);
+    stopCapture(host);
+
+    expect(midibuffer::setPulseSelection(host.algorithm(), firstTake,
+                                         firstTake + 2U),
+           "first take selects");
+    changeParameter(host, kPlaybackParameter, 1);
+    midibuffer::HistoryContextSnapshot active = {};
+    expect(midibuffer::historyContext(host.algorithm(), false, active) &&
+               active.range.startPulse == firstTake &&
+               active.coverageComplete && historyUnknown(active.state),
+           "playback entry adopts an immutable active context");
+    const uint32_t count = snapshot(host).eventCount;
+    uint32_t flags[16] = {};
+    for (uint32_t index = 0; index < count && index < 16U; ++index) {
+        midibuffer::RecordedEvent event = {};
+        midibuffer::recordedEventAt(host.algorithm(), index, event);
+        flags[index] = event.flags;
+    }
+    midibuffer::RecordedEvent press = {};
+    uint32_t pressIndex = count;
+    for (uint32_t index = 0; index < count; ++index) {
+        midibuffer::RecordedEvent event = {};
+        midibuffer::recordedEventAt(host.algorithm(), index, event);
+        if (eventBytesMatch(event, 0xB1, 66, 127, 3)) {
+            press = event;
+            pressIndex = index;
+        }
+    }
+    midibuffer::RecordedEvent pressRelease = {};
+    expect(pressIndex < count &&
+               midibuffer::recordedEventAt(host.algorithm(),
+                                           (press.flags >> 1U) - 1U,
+                                           pressRelease) &&
+               eventBytesMatch(pressRelease, 0xB1, 66, 0, 3),
+           "CC66 presses pair through accounted FIFO heads");
+
+    acquireClock(host);
+    midibuffer::HistoryContextSnapshot candidate = {};
+    expect(midibuffer::setPulseSelection(host.algorithm(), secondTake,
+                                         secondTake + 2U),
+           "second take selects while playing");
+    bool ready = false;
+    for (uint32_t step = 0; step < 4U && !ready; ++step) {
+        clockPulse(host);
+        ready = midibuffer::historyContext(host.algorithm(), true, candidate) &&
+                candidate.range.startPulse == secondTake;
+    }
+    // The MCM made channel 2 a member, so its earlier bend became unknown
+    // rather than being carried into the new role or neutralized.
+    expect(ready && candidate.coverageComplete &&
+               (candidate.state.known[1] & 3U) == 0U &&
+               candidate.state.zoneCountState[0] == midibuffer::kSetupKnown &&
+               candidate.state.zoneCount[0] == 5U &&
+               candidate.setupFingerprint != active.setupFingerprint,
+           "candidate exposes its own context and setup fingerprint");
+    midibuffer::HistoryContextSnapshot after = {};
+    bool unchanged = midibuffer::historyContext(host.algorithm(), false, after) &&
+                     after.range.startPulse == active.range.startPulse &&
+                     after.setupFingerprint == active.setupFingerprint &&
+                     std::memcmp(&after.state, &active.state,
+                                 sizeof(after.state)) == 0;
+    for (uint32_t index = 0; index < count && index < 16U; ++index) {
+        midibuffer::RecordedEvent event = {};
+        midibuffer::recordedEventAt(host.algorithm(), index, event);
+        unchanged = unchanged && event.flags == flags[index];
+    }
+    expect(unchanged,
+           "candidate preparation mutates neither the active context nor links");
+}
+
 void verifyClockedCaptureAndReacquisition() {
     midibuffer_test::HostDouble host;
     expect(host.instantiate(1), "clock/capture trace host constructs");
@@ -6473,6 +6825,11 @@ int main() {
     verifySetupSensitivityEncodings();
     verifySetupMembershipInvalidationIsTargeted();
     verifySetupObservedBeforeCaptureWithoutChangingOrdinaryBytes();
+    verifyHistoricalContextAcrossGapsAndEqualTimeChanges();
+    verifyBoundedFinalizationKeepsEndingsTaggedAndUnobserved();
+    verifyRollingSeedsAndBoundedPairingAtMaximumCapacity();
+    verifyJournalOverflowCannotCertifyOlderContext();
+    verifyCandidatePreparationLeavesActivePassImmutable();
     verifyClockedCaptureAndReacquisition();
     verifyChannelAndEventEligibility();
     verifyTimelineSelectionDisplayAndControls();
