@@ -151,7 +151,9 @@ Automated native and ARM checks cannot exercise firmware plug-in scanning, reloc
 
 Record first: card/backup identity, the release asset name and its ZIP and object SHA-256, the SHA-256 read back from `/programs/plug-ins/MidiBuffer.o` after copying (it must match the object hash), the exact firmware version shown by the module (the supported minimum is 1.18; record only versions actually tested), and the module's View Info API version and free SRAM/DRAM.
 
-For each step record **Pass**, **Fail** or **Not Attempted**, the elapsed time, any error text and the last screen shown. Treat 60 seconds with no result as a timeout for that step (a diagnostic limit, not a claim about normal load time).
+The release object is built by the release workflow's toolchain, so its SHA-256 can differ from a local `make hardware` build of the same source; the installed read-back must match the published asset's object, not a local build. Run the whole matrix below on firmware 1.18 and again on the newest supported firmware available to you, and claim only the versions actually run. If you install through a remote or editor integration rather than the card, also perform its Load step before Add.
+
+For each step record **Pass**, **Fail** or **Not Attempted**, the elapsed time, any error text and the last screen shown. For a failure, note the stage it stopped at: plug-in scan/Load, Add (memory allocation), first display/response, or preset restore. Treat 60 seconds with no result as a timeout for that step (a diagnostic limit, not a claim about normal load time).
 
 1. **Cold explicit Load→Add, 1 MB.** Power on with autoload disabled or set to an empty preset so no old preset masks the test. Load the plug-in, then add MidiBuffer at Buffer MB 1. Pass: it appears empty, stopped and silent, the display responds, and no clock or old preset is needed.
 2. **Warm Add.** Without power-cycling, add a second MidiBuffer (or remove and add again). Same pass condition.
@@ -167,7 +169,7 @@ Keep separate any musical or MPE observations made during this check; they do no
 - No MIDI-file export workaround is provided or required. Reconsidering export depends on suitable future firmware/API file-writing support.
 - Program changes, SysEx, MIDI realtime/transport, Channel Mode CC120–127, and RPN/NRPN-related CC6, CC38, and CC96–101 are not recorded.
 - The plug-in does not reconstruct notes that began before the selected range, serialize external clocks/instruments/routing, guarantee silence for other devices sharing a channel, recover corrupt/incomplete presets, or recover unsaved changes.
-- Licensing, distribution/publication, routing redesign, extra panic gestures, MIDI transport following, and a broad hardware compatibility programme are outside version one. The remaining physical release check is intentionally modest rather than a firmware/hardware matrix.
+- Licensing, distribution/publication, routing redesign, extra panic gestures, MIDI transport following, and a broad hardware compatibility programme are outside version one. The remaining physical release check is the compact loading handoff above (minimum and newest available firmware only), not a broad device compatibility matrix.
 
 ## Detailed behavior reference
 
