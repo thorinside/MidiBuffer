@@ -67,6 +67,19 @@ build/vital_receiver_smoke: tests/vital_receiver_smoke.cpp tests/vital-smoke-sta
 	$(NATIVE_CXX) -std=c++11 $(COMMON_WARNINGS) -Wno-multichar -Wno-deprecated-declarations $< \
 		-framework AudioToolbox -framework CoreMIDI -framework CoreFoundation -o $@
 
+# req-014/ac-015 local qualification: direct versus replayed MPE in Vital 1.5.5
+# (needs installed Vital and numpy; logs/renders/report in build/receiver).
+.PHONY: vital-receiver-compare
+vital-receiver-compare: build/receiver_fixture build/vital_receiver_render
+	$(PYTHON) tests/vital_receiver_compare.py
+
+build/receiver_fixture: $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/host_double.cpp tests/host_double.hpp tests/receiver_fixture.cpp | build
+	$(NATIVE_CXX) $(NATIVE_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/receiver_fixture.cpp -o $@
+
+build/vital_receiver_render: tests/vital_receiver_render.cpp | build
+	$(NATIVE_CXX) -std=c++11 -O2 $(COMMON_WARNINGS) -Wno-multichar -Wno-deprecated-declarations $< \
+		-framework AudioToolbox -framework CoreMIDI -framework CoreFoundation -o $@
+
 HOST_DYLIB_EXT := dylib
 HOST_DYLIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup
 else
