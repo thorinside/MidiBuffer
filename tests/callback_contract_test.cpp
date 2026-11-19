@@ -7344,9 +7344,10 @@ void verifyMpeLiveRouteChangeCleansOldRouteAndStops() {
 
 // Plays the selected range once from a fresh deliberate entry and returns
 // the entry sample (0 when blocked).
-uint64_t mpePlayFirstPulse(midibuffer_test::HostDouble& host, MpeRig& rig) {
+uint64_t mpePlayFirstPulse(midibuffer_test::HostDouble& host, MpeRig& rig,
+                           uint32_t maximumClocks = 64U) {
     midibuffer_test::resetTrace();
-    const uint64_t entry = mpeEnter(host, rig);
+    const uint64_t entry = mpeEnter(host, rig, maximumClocks);
     stepThrough(host, entry + 15U);
     return entry;
 }
@@ -7484,6 +7485,44 @@ void verifyMpeResumptionSeedAndMissingContext() {
                bare.factory()->draw(bare.algorithm()) &&
                drawContainsSubstring("context incomplete"),
            "missing context warns and plays with no invented values or pre-range attack/release");
+}
+
+// ac-005: after a real ring overwrite evicts the bend that preceded the
+// selection, the eviction seed still supplies that historical value.
+void verifyMpeContextSurvivesRingOverwrite() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    mpeBeginTake(host, rig);
+    sendMidi(host, 0xE1, 0x12, 0x34);
+    const uint32_t capacity = snapshot(host).eventCapacity;
+    for (uint32_t index = 0; index < capacity + 16U; ++index) {
+        sendMidi(host, 0xB2, 0x4A, static_cast<uint8_t>(index & 0x7fU));
+    }
+    mpeClock(host, rig);
+    const uint64_t selected = snapshot(host).currentPulse;
+    sendMidi(host, 0x91, 0x3C, 0x64);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 0x3C, 0x00);
+    mpeEndTake(host, rig);
+    midibuffer::RecordedEvent oldest = {};
+    expect(midibuffer::recordedEventAt(host.algorithm(), 0U, oldest) &&
+               oldest.bytes[0] == 0xB2U,
+           "the ring actually overwrote the pre-selection bend");
+    changeParameter(host, kMpeModeParameter, 1);
+    expect(midibuffer::setPulseSelection(host.algorithm(), selected,
+                                         selected + 2U),
+           "selection after the ring overwrite is valid");
+    const uint64_t entry = mpePlayFirstPulse(host, rig, 128U);
+    MidiList expected = {};
+    expected.add(0xE1, 0x12, 0x34);
+    size_t cursor = mpeSnapshot(host).generatedSetup;
+    expect(entry != 0U && midiSequence(cursor, expected) &&
+               midiAt(cursor, 0xB2, 0x4A,
+                      static_cast<uint8_t>((capacity + 15U) & 0x7fU)) &&
+               midiAt(cursor + 1U, 0x91, 0x3C, 0x64),
+           "evicted pre-selection bend and latest CC74 seed the starting context");
 }
 
 void observedLowerSetupWith1200(midibuffer_test::HostDouble& host) {
@@ -8007,6 +8046,7 @@ int main() {
     verifyMpeLiveRouteChangeCleansOldRouteAndStops();
     verifyMpeHistoricalContextPrecedesFirstAttack();
     verifyMpeResumptionSeedAndMissingContext();
+    verifyMpeContextSurvivesRingOverwrite();
     verifyMpeOldTakeRestoresItsOwnSetup();
     verifyMpeSafeSetupFragments();
     verifyMpeSetupChangingSelectionsAndRangeEdits();
