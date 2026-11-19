@@ -1145,6 +1145,9 @@ void runClusterCase(const ClusterCase& spec) {
            "cluster replay has zero byte/length/channel/order/sample disagreement");
     expect(budgetsHold(state.maximumStep), "cluster per-step budgets hold");
     expect(generatedRouted, "cluster setup/context use the selected destination at entry");
+    // Admitting or rejecting a same-sample cluster must inspect every member.
+    expect(state.maximumStep.visits >= spec.count,
+           "visit counter covers every message of the admitted or rejected cluster");
     expect(state.maximumStep.sends + state.maximumStep.cleanupCalls >= observedSends &&
                state.maximumStep.sends <= observedSends &&
                state.maximumStep.fanout + state.maximumStep.cleanupFanout >= observedFanout &&
