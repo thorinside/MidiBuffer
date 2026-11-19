@@ -83,6 +83,18 @@ class PresetImage {
     bool removeNavigation();
     bool makeLegacyWithoutAppendedParameters();
     bool corruptNavigationTarget();
+    // midibufferState member fixtures. Hex members are decoded/re-encoded
+    // in 256-byte chunks; leadingNumber is the optional leading version
+    // element (-1 when absent).
+    bool removeMember(const char* name);
+    bool hexMember(const char* name, uint8_t* bytes, size_t capacity,
+                   size_t& count, int& leadingNumber) const;
+    bool setHexMember(const char* name, const uint8_t* bytes, size_t count,
+                      int leadingNumber);
+    // Exact compact-JSON characters the member adds (separating comma,
+    // quoted name and colon, value) and the hex characters within it.
+    bool memberCharacters(const char* name, uint64_t& total,
+                          uint64_t& hexCharacters) const;
 
   private:
     friend class HostDouble;

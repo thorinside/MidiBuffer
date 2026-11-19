@@ -19,6 +19,10 @@ Build or obtain `MidiBuffer.o`, then place it at:
 
 Load **MidiBuffer** using the disting NT's normal plug-in loading workflow. The repository build product is `plugins/MidiBuffer.o`.
 
+A release ZIP (`MidiBuffer-<tag>.zip`) contains exactly one file, `programs/plug-ins/MidiBuffer.o`. Extract it at the root of the SD card so the object lands at `/programs/plug-ins/MidiBuffer.o`, replacing any older copy (keep a backup of the card first). Do not rename the file or leave a second copy elsewhere under `/programs/plug-ins/`. After copying, compare the installed file's SHA-256 with the published object hash before testing.
+
+**Resources and defaults.** Every instance needs its event buffer (decimal 1–5 MB, default 1 MB) plus a fixed 524,288-byte DRAM block for MPE metadata, even with **MPE Mode** Off: 1,524,288 bytes of DRAM at 1 MB and 5,524,288 bytes at 5 MB, and at most 50,360 bytes of SRAM (42,168 bytes in the current ARM build). This is more than releases before MPE support needed, including for old presets. A fresh instance starts empty, stopped and silent: Capture and Playback Off, MPE Mode Off, MPE Setup Observed, member counts 0, and no clock acquired. If the module cannot provide the memory, the instance is refused rather than given a smaller buffer.
+
 The algorithm GUID is `ThMb` (`Th` is the thorinside namespace). The corrected
 v0.5.0 release replaces the initial `MdBf` GUID; presets saved with that initial
 GUID are not supported.
@@ -95,7 +99,9 @@ Capacity is an event count, not a duration. Dense streams of notes, controllers,
 
 Every instance also reserves a separately accounted 524,288-byte DRAM block for MPE history, setup and playback ownership, even with **MPE Mode** Off, so each size needs that much more DRAM than the event buffer alone (1,524,288 bytes at 1 MB; 5,524,288 bytes at 5 MB). The event capacities above are unchanged.
 
-Larger buffers also make larger presets. In the native host model, a full 5 MB event history serializes to approximately 10.1 MB of custom JSON string payload. API v13 publishes no payload-size or save/load-time guarantee, so this measurement is not a firmware guarantee.
+Larger buffers also make larger presets. In the native host model, a full 5 MB event history serializes to approximately 10.4 MB of custom JSON string payload (including the MPE metadata). API v13 publishes no payload-size or save/load-time guarantee, so this measurement is not a firmware guarantee.
+
+The saved MPE metadata stores only used entries and is bounded at 405,976 bytes of data (811,952 hexadecimal characters plus at most 8,192 characters of JSON structure, 820,144 extra characters in total). The current layout's worst case is 243,361 bytes; a full 5 MB history with every checkpoint and a full journal measures 208,889 bytes (420,236 extra characters) in the native host model. `make inspect` checks the ARM SRAM, sidecar and event layout against these limits.
 
 ## Routing and shared-channel safety
 
@@ -115,7 +121,7 @@ Valid legacy images with only parameters 0–9 retain those inherited values and
 
 Loading is silent. The live clock and reset levels, partial clock acquisition, current button holds, external routing, and connected instruments are not preset data. Restored capture or playback waits for two fresh clock pulses. Saved in-flight playback then continues its unconsumed interval and pending endings before advancing the loop; loading does not synthesize replacement attacks for external notes that were sounding before the load.
 
-Only valid saved state is in MidiBuffer's scope. If a preset is corrupt or incomplete and firmware cannot load it, the algorithm is not loaded; failure handling and error presentation belong to the firmware. MidiBuffer does not promise plug-in-specific recovery, partial restoration, or recovery of edits made after the preset was saved.
+Only valid saved state is in MidiBuffer's scope. If a preset is corrupt or incomplete, MidiBuffer rejects it and leaves itself empty, stopped and silent; failure handling and error presentation belong to the firmware. MidiBuffer does not promise plug-in-specific recovery, partial restoration, or recovery of edits made after the preset was saved.
 
 ## MPE mode (MIDI 1.0 MPE)
 
@@ -135,7 +141,25 @@ MPE mode replays a MIDI 1.0 Polyphonic Expression performance through the same s
 
 **Overload.** Each audio step allows at most 32,768 event/heap visits, 8,192 MIDI send calls (including setup, context, wrap and retrigger endings), 32,768 destination deliveries and 262,144 scheduler operations. All events due at the same sample are checked together before any of them is sent. If they cannot fit, none of them is sent, owned notes and holds are ended, **Playback** is set Off and the display shows `Overload: Off/On to restart`. Expression is never thinned or delayed. These are operation counts, not a guarantee of hardware deadlines or DIN-MIDI throughput.
 
-**Presets.** The four MPE controls are saved as normal parameters. MPE history, ownership and deliberate-start state are not yet saved: loading never sends setup, and loaded playback continues with ordinary semantics until a fresh **Playback** Off/On.
+**Presets.** The four MPE controls are saved as normal parameters. New presets also store an optional `mpe` member (version 1): retained setup/expression history and coverage, the entry phase, scope, and the notes and holds playback owns with their pending recorded endings. It is written field by field in little-endian order, never as memory images, pointers or scheduler layout. Loading is silent in either host restore order and is continuation-only: a preset saved while Finalizing, Preparing, Armed or Playing resumes after two fresh clock pulses with the next unconsumed events and pending endings, without new setup, starting context or replacement attacks. Note pairing is rebuilt in bounded steps unless the saved pairing was complete for the saved history. A request saved while blocked stays blocked; correcting the setting after loading resumes it the same continuation-only way. Only a fresh **Playback** Off→On sends setup again. A saved overload stays latched until a fresh Off/On.
+
+Presets without the `mpe` member (older presets, or a preset re-saved by an older build, which drops it) load with **MPE Mode** Off and unknown MPE history; ordinary playback is unchanged. A preset whose `mpe` member (or event links) is malformed, truncated, oversized, of an unknown version or inconsistent is rejected: MidiBuffer is left empty, stopped, with MPE Mode Off, and sends nothing. What the module does next (an error, or not loading the algorithm) is up to the firmware; recovery is not promised.
+
+## Loading handoff (physical disting NT check)
+
+Automated native and ARM checks cannot exercise firmware plug-in scanning, relocation, Load/Add or the installed card. This reproducible procedure is for the project owner, on an authorized disting NT with a backed-up SD card, using the exact final release asset. The candidate's ZIP and object SHA-256 values, publisher receipt and owner results are recorded when that candidate is handed off; until then they are pending, not passed. Earlier reports in `docs/` remain historical: a problem not reproduced on one firmware/object is "not reproduced", not "fixed".
+
+Record first: card/backup identity, the release asset name and its ZIP and object SHA-256, the SHA-256 read back from `/programs/plug-ins/MidiBuffer.o` after copying (it must match the object hash), the exact firmware version shown by the module (the supported minimum is 1.18; record only versions actually tested), and the module's View Info API version and free SRAM/DRAM.
+
+For each step record **Pass**, **Fail** or **Not Attempted**, the elapsed time, any error text and the last screen shown. Treat 60 seconds with no result as a timeout for that step (a diagnostic limit, not a claim about normal load time).
+
+1. **Cold explicit Load→Add, 1 MB.** Power on with autoload disabled or set to an empty preset so no old preset masks the test. Load the plug-in, then add MidiBuffer at Buffer MB 1. Pass: it appears empty, stopped and silent, the display responds, and no clock or old preset is needed.
+2. **Warm Add.** Without power-cycling, add a second MidiBuffer (or remove and add again). Same pass condition.
+3. **5 MB with sufficient resources.** Add MidiBuffer at Buffer MB 5 when View Info shows enough free DRAM for 5,524,288 bytes. Same pass condition. If memory is insufficient, record that separately; low memory alone is not a plug-in defect.
+4. **Stopped-empty save and reload.** Save a preset containing a stopped, empty MidiBuffer, load another preset, then reload it. Pass: it restores empty, stopped and silent.
+5. **Cold autoload.** Make that preset the autoload preset and power-cycle. Pass: it loads empty, stopped and silent.
+
+Keep separate any musical or MPE observations made during this check; they do not substitute for, and are not implied by, these loading results.
 
 ## Version-one limits
 
@@ -184,7 +208,7 @@ MidiBuffer retains eligible channel MIDI as pulse-relative events in a fixed rol
 - An early pulse first catches up every pending event from the preceding source interval in recorded order, then advances the selected range. Clock prediction uses the running-average method documented below.
 - NT preset save uses the native `serialise` callback to capture a coherent, non-mutating point-in-time image of every retained event (contents, ring order, pulse timing, and ownership flags) plus selected/active/pending ranges, playback cursor and scheduler state, capture/playback intent, clock-history timing, recorded and playback note/controller ownership, explicit Show All/manual policy, exact 64-bit manual span, timeline scroll, Start/End/Range target, and pending note/sustain endings. The host's normal preset parameter handling preserves all 16 parameters, including shared Playback, Clear Recording, filters, routing, and the MPE controls; native tests exercise parameter restoration both before and after custom deserialization.
 - Loading through the native `deserialise` callback reconstructs that image in a fresh same-specification instance. Parameter restoration is reconciled as state rather than repeated Playback or Clear actions: it does not finalize capture, erase history, duplicate transport transitions, or send cleanup MIDI. Capture and playback intent are retained, but live clock/reset gate levels, partial clock acquisition, current encoder-button holds, and external instrument state are not pretended to be preset data. Restored activity emits nothing until two fresh patched-clock pulses establish a live interval. If playback was saved in flight, that interval is rebased—not advanced—so its unconsumed event cursor and same-interval note/sustain endings continue before the next pulse advances the loop. Playback-held output ownership remains available for deterministic continuation and later stop/reset cleanup; loading itself sends no MIDI.
-- Valid preset payloads are supported for every **Buffer MB** value from 1 through 5. The canonical event payload is chunked hexadecimal because API v13 JSON exposes no 64-bit or binary primitive; 64-bit timing uses lossless 16-bit components. A full 5 MB history is therefore approximately 10.1 MB of custom JSON string payload in the native host model. The SDK publishes no payload-size or save/load-time budget, so the native measurement is evidence rather than a firmware guarantee. Corrupt/incomplete preset recovery and recovery of changes made after the save are not promised.
+- Valid preset payloads are supported for every **Buffer MB** value from 1 through 5. The canonical event payload is chunked hexadecimal because API v13 JSON exposes no 64-bit or binary primitive; 64-bit timing uses lossless 16-bit components. A full 5 MB history is therefore approximately 10.4 MB of custom JSON string payload (including the MPE metadata) in the native host model. The SDK publishes no payload-size or save/load-time budget, so the native measurement is evidence rather than a firmware guarantee. Corrupt/incomplete preset recovery and recovery of changes made after the save are not promised.
 
 The **Buffer MB** specification is chosen before the algorithm instance is created. It supports 1–5 MB using decimal megabytes, has a hard maximum of 5,000,000 recording bytes, and cannot resize at runtime. Rolling-history metadata is requested separately in SRAM. Each current event record occupies 24 bytes, so the event capacities are 41,666 through 208,333; the display reports the actual capacity. Retained time is not fixed: denser MIDI consumes the same event capacity sooner and therefore retains fewer clock pulses.
 

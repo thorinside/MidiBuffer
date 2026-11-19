@@ -845,6 +845,128 @@ bool PresetImage::corruptNavigationTarget() {
     return true;
 }
 
+bool PresetImage::removeMember(const char* name) {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    if (state == NULL) {
+        return false;
+    }
+    for (std::vector<JsonNode>::iterator child = state->children.begin();
+         child != state->children.end(); ++child) {
+        if (child->name == name) {
+            state->children.erase(child);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PresetImage::hexMember(const char* name, uint8_t* bytes, size_t capacity,
+                            size_t& count, int& leadingNumber) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    const JsonNode* state = namedChild(document->root, "midibufferState");
+    const JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL || member->type != kJsonArray) {
+        return false;
+    }
+    count = 0U;
+    leadingNumber = -1;
+    for (size_t index = 0; index < member->children.size(); ++index) {
+        const JsonNode& child = member->children[index];
+        if (index == 0U && child.type == kJsonInt) {
+            leadingNumber = child.intValue;
+            continue;
+        }
+        if (child.type != kJsonString || child.stringValue.size() % 2U != 0U) {
+            return false;
+        }
+        for (size_t at = 0; at < child.stringValue.size(); at += 2U) {
+            unsigned value = 0U;
+            if (count >= capacity ||
+                std::sscanf(child.stringValue.c_str() + at, "%2x", &value) != 1) {
+                return false;
+            }
+            bytes[count++] = static_cast<uint8_t>(value);
+        }
+    }
+    return true;
+}
+
+bool PresetImage::setHexMember(const char* name, const uint8_t* bytes,
+                               size_t count, int leadingNumber) {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL) {
+        return false;
+    }
+    member->type = kJsonArray;
+    member->children.clear();
+    if (leadingNumber >= 0) {
+        JsonNode number(kJsonInt);
+        number.intValue = leadingNumber;
+        member->children.push_back(number);
+    }
+    static const char kDigits[] = "0123456789abcdef";
+    for (size_t offset = 0; offset < count; offset += 256U) {
+        JsonNode chunk(kJsonString);
+        for (size_t index = offset; index < count && index < offset + 256U;
+             ++index) {
+            chunk.stringValue.push_back(kDigits[bytes[index] >> 4U]);
+            chunk.stringValue.push_back(kDigits[bytes[index] & 0x0fU]);
+        }
+        member->children.push_back(chunk);
+    }
+    return true;
+}
+
+namespace {
+
+uint64_t compactJsonCharacters(const JsonNode& node, uint64_t& hex) {
+    char text[32];
+    switch (node.type) {
+    case kJsonObject:
+    case kJsonArray: {
+        uint64_t total = 2U;
+        for (size_t index = 0; index < node.children.size(); ++index) {
+            const JsonNode& child = node.children[index];
+            total += (index == 0U ? 0U : 1U) +
+                     (node.type == kJsonObject ? child.name.size() + 3U : 0U) +
+                     compactJsonCharacters(child, hex);
+        }
+        return total;
+    }
+    case kJsonInt:
+        return static_cast<uint64_t>(
+            std::snprintf(text, sizeof(text), "%d", node.intValue));
+    case kJsonString:
+        hex += node.stringValue.size();
+        return node.stringValue.size() + 2U;
+    case kJsonBoolean:
+        return node.boolValue ? 4U : 5U;
+    default:
+        return 4U;
+    }
+}
+
+}  // namespace
+
+bool PresetImage::memberCharacters(const char* name, uint64_t& total,
+                                   uint64_t& hexCharacters) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    const JsonNode* state = namedChild(document->root, "midibufferState");
+    const JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL) {
+        return false;
+    }
+    hexCharacters = 0U;
+    total = 1U + std::strlen(name) + 3U +
+            compactJsonCharacters(*member, hexCharacters);
+    return true;
+}
+
 HostDouble::HostDouble()
     : factory_(NULL),
       requirements_(),

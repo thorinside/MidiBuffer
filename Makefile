@@ -6,6 +6,7 @@ SANITIZER_TEST := build/callback_contract_asan_ubsan
 RANGE_MOTION_TEST := build/range_motion_test
 ARM_OBJECT := plugins/$(PLUGIN_NAME).o
 ARM_RANGE_MOTION_OBJECT := build/range_motion_arm.o
+ARM_LAYOUT_OBJECT := build/resource_layout_arm.o
 TRACEABILITY_MANIFEST := docs/MIDIBUFFER_THREE_TRACEABILITY.json
 TRACEABILITY_CHECK := tests/verify_traceability.py
 
@@ -77,9 +78,9 @@ $(HOST_DYLIB): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motio
 	$(NATIVE_CXX) $(COMMON_FLAGS) -O2 -fPIC $(HOST_DYLIB_LDFLAGS) -o $@ $(SOURCE)
 	@echo "Built host plugin: $@"
 
-hardware: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
+hardware: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT) $(ARM_LAYOUT_OBJECT)
 
-inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
+inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT) $(ARM_LAYOUT_OBJECT)
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Class:[[:space:]]+ELF32'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Data:[[:space:]]+2.s complement, little endian'
 	@$(ARM_READELF) -h $(ARM_OBJECT) | grep -Eq 'Type:[[:space:]]+REL \(Relocatable file\)'
@@ -92,6 +93,17 @@ inspect: $(ARM_OBJECT) $(ARM_RANGE_MOTION_OBJECT)
 		test -z "$$unexpected" || { echo "Unexpected undefined symbols:"; echo "$$unexpected"; exit 1; }
 	@$(ARM_SIZE) $(ARM_OBJECT)
 	@echo "PASS: ARM ELF/pluginEntry inspection and reviewed API v13 undefined-symbol allowlist"
+	@# ARM-ABI resource layout: SRAM <= 50,360 B; sidecar exactly 524,288 B
+	@# (489,528 B used); 24-byte events; DRAM = decimal buffer + sidecar at
+	@# every size, including ordinary mode; canonical MPE preset data bound.
+	@$(ARM_NM) -S -t d $(ARM_LAYOUT_OBJECT) | awk '/midibufferLayout/ { size[$$4] = $$2 + 0 } \
+		END { sram = size["midibufferLayoutSram"]; side = size["midibufferLayoutSidecar"]; \
+		used = size["midibufferLayoutSidecarUsed"]; event = size["midibufferLayoutEvent"]; \
+		preset = size["midibufferLayoutPresetMaximum"]; \
+		if (sram == 0 || sram > 50360 || side != 524288 || used != 489528 || event != 24 || preset > 405976) { \
+			printf "FAIL: ARM layout SRAM=%d sidecar=%d used=%d event=%d preset=%d\n", sram, side, used, event, preset; exit 1 } \
+		printf "RESOURCE: ARM SRAM=%d B (<= 50,360); sidecar=%d B (used %d B); event=%d B; MPE preset max=%d B binary, %d hex chars\n", sram, side, used, event, preset, 2 * preset; \
+		for (mb = 1; mb <= 5; ++mb) printf "RESOURCE: %d MB: %d events, DRAM %d B (events %d + sidecar %d)\n", mb, int(mb * 1000000 / event), mb * 1000000 + side, mb * 1000000, side }'
 
 verify: test sanitize static-check traceability hardware inspect
 	@echo "PASS: integrated native/emulator, sanitizer/static, traceability, and ARM regression gate"
@@ -108,6 +120,9 @@ $(RANGE_MOTION_TEST): src/range_motion.hpp tests/range_motion_test.cpp | build
 
 $(ARM_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp | plugins
 	$(ARM_CXX) $(ARM_FLAGS) -c $(SOURCE) -o $@
+
+$(ARM_LAYOUT_OBJECT): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/resource_layout_arm.cpp | build
+	$(ARM_CXX) $(ARM_FLAGS) -c tests/resource_layout_arm.cpp -o $@
 
 $(ARM_RANGE_MOTION_OBJECT): src/range_motion.hpp tests/range_motion_arm_compile.cpp | build
 	$(ARM_CXX) $(ARM_FLAGS) -c tests/range_motion_arm_compile.cpp -o $@
