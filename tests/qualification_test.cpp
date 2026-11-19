@@ -65,6 +65,16 @@ bool isAttack(const uint8_t* bytes) {
     return (bytes[0] & 0xf0U) == 0x90U && bytes[2] != 0U;
 }
 
+// Playback Destination enum "Breakout, USB, Select Bus, Internal, All".
+uint32_t destinationMask(int16_t value) {
+    static const uint32_t kMasks[] = {
+        kNT_destinationBreakout, kNT_destinationUSB, kNT_destinationSelectBus,
+        kNT_destinationInternal,
+        kNT_destinationBreakout | kNT_destinationUSB | kNT_destinationSelectBus |
+            kNT_destinationInternal};
+    return kMasks[value < 0 ? 0 : value];
+}
+
 unsigned bitCount(uint32_t value) {
     unsigned count = 0U;
     for (; value != 0U; value &= value - 1U) {
@@ -89,7 +99,20 @@ Call* gCalls = NULL;
 size_t gCallCount = 0U;
 bool gCallOverflow = false;
 
+// Trace-derived per-step NT send calls and destination bits, kept separately
+// from the plug-in's own MpeWorkCounters so the two can be cross-checked.
+uint64_t gDrainedFanout = 0U;
+size_t gTraceSummed = 0U;
+uint64_t gTraceFanout = 0U;
+uint64_t gStepMaximumSends = 0U;
+uint64_t gStepMaximumFanout = 0U;
+
 void appendCalls(const midibuffer_test::MidiCall* calls, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        gDrainedFanout += bitCount(calls[index].destination);
+    }
+    gTraceSummed = 0U;
+    gTraceFanout = 0U;
     for (size_t index = 0; index < count; ++index) {
         if (gCallCount >= kCallCapacity) {
             gCallOverflow = true;
@@ -108,6 +131,23 @@ void beginCollection() {
     midibuffer_test::setMidiTraceDrain(appendCalls);
     gCallCount = 0U;
     gCallOverflow = false;
+    gDrainedFanout = 0U;
+    gTraceSummed = 0U;
+    gTraceFanout = 0U;
+    gStepMaximumSends = 0U;
+    gStepMaximumFanout = 0U;
+}
+
+uint64_t sentCalls() {
+    return gCallCount + midibuffer_test::trace().midiCallCount;
+}
+
+uint64_t sentFanout() {
+    const midibuffer_test::Trace& current = midibuffer_test::trace();
+    for (; gTraceSummed < current.midiCallCount; ++gTraceSummed) {
+        gTraceFanout += bitCount(current.midiCalls[gTraceSummed].destination);
+    }
+    return gDrainedFanout + gTraceFanout;
 }
 
 void finishCollection() {
@@ -162,7 +202,15 @@ void advanceTo(Rig& rig, uint64_t target) {
             host.bus(1)[rig.nextPulse - base] = 2.0f;
             rig.nextPulse += rig.interval;
         }
+        const uint64_t calls = sentCalls();
+        const uint64_t fanout = sentFanout();
         host.step(static_cast<int>(count / 4U));
+        if (sentCalls() - calls > gStepMaximumSends) {
+            gStepMaximumSends = sentCalls() - calls;
+        }
+        if (sentFanout() - fanout > gStepMaximumFanout) {
+            gStepMaximumFanout = sentFanout() - fanout;
+        }
     }
 }
 
@@ -272,6 +320,10 @@ Comparison compareFrom(size_t first, uint64_t limit, uint32_t destination,
         ++end;
     }
     const size_t actual = end - first;
+    if (gExpectedCount > kExpectedCapacity) {
+        ++result.disagreements;
+        return result;
+    }
     const size_t count = gExpectedCount < actual ? gExpectedCount : actual;
     for (size_t index = 0; index < count; ++index) {
         const Call& call = gCalls[first + index];
@@ -351,26 +403,35 @@ void forget(Receiver& receiver) {
     }
 }
 
-void apply(Receiver& receiver, const uint8_t* bytes) {
+// Returns the tracked slot a message sets, or -1 when it sets none.
+int apply(Receiver& receiver, const uint8_t* bytes) {
     const uint8_t channel = bytes[0] & 0x0fU;
+    int slot = -1;
+    int value = bytes[1];
     switch (bytes[0] & 0xf0U) {
     case 0xe0U:
-        receiver.value[channel][0] = bytes[1] | (bytes[2] << 7);
+        slot = 0;
+        value = bytes[1] | (bytes[2] << 7);
         break;
     case 0xd0U:
-        receiver.value[channel][1] = bytes[1];
+        slot = 1;
         break;
     case 0xb0U:
         for (unsigned index = 0; index < ARRAY_SIZE(kTrackedControllers);
              ++index) {
             if (bytes[1] == kTrackedControllers[index]) {
-                receiver.value[channel][2U + index] = bytes[2];
+                slot = static_cast<int>(2U + index);
+                value = bytes[2];
             }
         }
         break;
     default:
         break;
     }
+    if (slot >= 0) {
+        receiver.value[channel][slot] = value;
+    }
+    return slot;
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +746,8 @@ void runTemplateCase(const TemplateCase& spec) {
     const uint64_t passEnd = starts[spec.selectedPulses];
     advanceTo(rig, passEnd & ~static_cast<uint64_t>(3U));
     const midibuffer::MpePlaybackSnapshot state = mpeState(rig);
+    const uint64_t observedSends = gStepMaximumSends;
+    const uint64_t observedFanout = gStepMaximumFanout;
     advanceTo(rig, alignUp4(passEnd + 1U) + 64U);
     finishCollection();
     const uint64_t callbackAllocations =
@@ -696,31 +759,42 @@ void runTemplateCase(const TemplateCase& spec) {
     const size_t setupCount = expectedSetup(setup);
     bool setupMatches = state.generatedSetup == setupCount &&
                         gCallCount >= setupCount;
+    const uint32_t destination = destinationMask(spec.destination);
     for (size_t index = 0; setupMatches && index < setupCount; ++index) {
         setupMatches = gCalls[index].sample == entry &&
+                       gCalls[index].destination == destination &&
                        std::memcmp(gCalls[index].bytes, setup + index * 3U, 3U) == 0;
     }
+    // Each known pre-selection value is restored exactly once, nothing else.
     Receiver receiver;
     forget(receiver);
     const size_t contextEnd = setupCount + state.generatedContext;
-    bool contextAtEntry = gCallCount >= contextEnd;
-    for (size_t index = setupCount; contextAtEntry && index < contextEnd; ++index) {
-        contextAtEntry = gCalls[index].sample == entry;
-        apply(receiver, gCalls[index].bytes);
+    bool contextMatches = gCallCount >= contextEnd;
+    bool restored[16][kChannelValues];
+    std::memset(restored, 0, sizeof(restored));
+    for (size_t index = setupCount; contextMatches && index < contextEnd; ++index) {
+        const uint8_t channel = gCalls[index].bytes[0] & 0x0fU;
+        const int slot = apply(receiver, gCalls[index].bytes);
+        contextMatches = gCalls[index].sample == entry &&
+                         gCalls[index].destination == destination && slot >= 0 &&
+                         !restored[channel][slot];
+        if (slot >= 0) {
+            restored[channel][slot] = true;
+        }
     }
-    bool contextMatches = contextAtEntry;
-    for (unsigned channel = 0; channel <= 8U; ++channel) {
+    uint32_t knownValues = 0U;
+    for (unsigned channel = 0; channel < 16U; ++channel) {
         for (unsigned index = 0; index < kChannelValues; ++index) {
+            knownValues += truth.value[channel][index] >= 0 ? 1U : 0U;
             contextMatches = contextMatches &&
                              receiver.value[channel][index] ==
                                  truth.value[channel][index];
         }
     }
+    contextMatches = contextMatches && state.generatedContext == knownValues;
     midibuffer::HistoryContextSnapshot context = {};
     const bool contextRead =
         midibuffer::historyContext(rig.host.algorithm(), false, context);
-    const uint32_t destination =
-        gCallCount > contextEnd ? gCalls[contextEnd].destination : 0U;
     const Comparison comparison =
         compareFrom(contextEnd, passEnd, destination, label);
 
@@ -737,6 +811,9 @@ void runTemplateCase(const TemplateCase& spec) {
     expect(state.generatedCleanup == 0U && state.rejectedClusters == 0U,
            "reference pass needs no collision cleanup and rejects no cluster");
     expect(budgetsHold(state.maximumStep), "every per-step budget holds");
+    expect(state.maximumStep.sends == observedSends &&
+               state.maximumStep.fanout == observedFanout,
+           "plug-in send/fanout counters equal the trace-derived per-step maxima");
     expect(spec.destination != 4 ||
                (bitCount(destination) == 4U &&
                 state.maximumStep.fanout == 4U * state.maximumStep.sends),
@@ -893,8 +970,8 @@ void runTimingCase(const TimingCase& spec) {
 
     const midibuffer::MpePlaybackSnapshot state = mpeState(rig);
     const size_t first = spec.mpe ? state.generatedSetup + state.generatedContext : 0U;
-    const uint32_t destination = gCallCount > first ? gCalls[first].destination : 0U;
-    const Comparison comparison = compareFrom(first, end, destination, spec.label);
+    const Comparison comparison =
+        compareFrom(first, end, destinationMask(-1), spec.label);
     bool excluded = true;
     for (size_t index = 0; index < gCallCount; ++index) {
         const uint8_t status = gCalls[index].bytes[0];
@@ -947,14 +1024,17 @@ struct ClusterCase {
     bool collisions; // count attacks retriggering count/2 keys
     int16_t destination;
     uint32_t frames;
+    uint32_t playInterval;
+    bool fullRing;   // overwrite the 1 MB ring before the cluster take
 };
 
 void runClusterCase(const ClusterCase& spec) {
     Rig rig;
     char label[96];
-    std::snprintf(label, sizeof(label), "cluster %u %s dest=%d frames=%u",
+    std::snprintf(label, sizeof(label), "cluster %u %s dest=%d frames=%u play=%u%s",
                   spec.count, spec.collisions ? "attacks" : "expressions",
-                  spec.destination, spec.frames);
+                  spec.destination, spec.frames, spec.playInterval,
+                  spec.fullRing ? " full-ring" : "");
     expect(construct(rig, 1, 0U, spec.frames), "cluster host constructs");
     for (unsigned index = 0; index < 9U; ++index) {
         pulse(rig);
@@ -963,6 +1043,14 @@ void runClusterCase(const ClusterCase& spec) {
     send3(rig, 0xb0U, 100U, 6U);
     send3(rig, 0xb0U, 6U, 15U);
     setParameter(rig, kCaptureParameter, 1);
+    if (spec.fullRing) {
+        // 45,000 untracked manager CC7 messages, one per host boundary.
+        const uint64_t base = alignUp4(rig.nextPulse + 1U);
+        for (uint32_t index = 0; index < 45000U; ++index) {
+            advanceTo(rig, base + 4U * index);
+            send3(rig, 0xb0U, 7U, static_cast<uint8_t>(index & 0x7fU));
+        }
+    }
     const uint64_t take = pulse(rig);
     const uint64_t startPulse = capture(rig).currentPulse;
     const uint8_t attack[3] = {0x9fU, 0x3cU, 0x64U};
@@ -987,9 +1075,15 @@ void runClusterCase(const ClusterCase& spec) {
     pulse(rig);
     pulse(rig);
     setParameter(rig, kCaptureParameter, 0);
+    const midibuffer::HistorySnapshot stored = historyState(rig);
+    expect(!spec.fullRing || stored.baseOrdinal > 0U,
+           "full-ring cluster take follows actual overwrite");
     expect(midibuffer::setPulseSelection(rig.host.algorithm(), startPulse,
                                          startPulse + 2U),
            "cluster selection is accepted");
+    if (spec.playInterval != kSourceInterval) {
+        retime(rig, spec.playInterval);
+    }
     if (spec.destination >= 0) {
         setParameter(rig, kPlaybackDestinationParameter, spec.destination);
     }
@@ -998,13 +1092,19 @@ void runClusterCase(const ClusterCase& spec) {
     const uint64_t allocations = midibuffer_test::heapAllocationCount();
     const uint64_t entry = enterPlayback(rig, true);
     expect(entry != 0U, "cluster selection enters MPE playback");
-    advanceTo(rig, alignUp4(entry + kSourceInterval + 1U) + 16U);
-    finishCollection();
+    const uint32_t played = spec.playInterval;
+    const uint64_t attackAt = entry + halfUpScale(8U, played, kSourceInterval);
+    const uint64_t clusterAt = entry + halfUpScale(16U, played, kSourceInterval);
+    const uint64_t endingAt = entry + played + halfUpScale(8U, played, kSourceInterval);
+    advanceTo(rig, alignUp4(endingAt + 1U) + 16U);
     const midibuffer::MpePlaybackSnapshot state = mpeState(rig);
+    const uint64_t observedSends = gStepMaximumSends;
+    const uint64_t observedFanout = gStepMaximumFanout;
+    finishCollection();
     const bool reject = spec.count > 8192U;
 
     gExpectedCount = 0U;
-    expectMessage(entry + 8U, attack);
+    expectMessage(attackAt, attack);
     if (!reject) {
         for (uint32_t index = 0; index < spec.count; ++index) {
             if (spec.collisions) {
@@ -1015,31 +1115,43 @@ void runClusterCase(const ClusterCase& spec) {
                 if (index >= spec.count / 2U) {
                     const uint8_t cut[3] = {static_cast<uint8_t>(message[0] & 0x8fU),
                                             message[1], 0U};
-                    expectMessage(entry + 16U, cut); // generated collision ending
+                    expectMessage(clusterAt, cut); // generated collision ending
                 }
             } else {
                 clusterMessage(index, message);
             }
-            expectMessage(entry + 16U, message);
+            expectMessage(clusterAt, message);
         }
-        expectMessage(entry + kSourceInterval + 8U, ending);
+        expectMessage(endingAt, ending);
     } else {
         const uint8_t cleanup[3] = {0x8fU, 0x3cU, 0x00U};
-        expectMessage(entry + 16U, cleanup); // reserve cleanup of prior ownership
+        expectMessage(clusterAt, cleanup); // reserve cleanup of prior ownership
     }
     const size_t first = state.generatedSetup + state.generatedContext;
-    const uint64_t limit = spec.collisions && !reject ? entry + 17U
-                                                       : entry + kSourceInterval + 9U;
+    const uint64_t limit = spec.collisions && !reject ? clusterAt + 1U : endingAt + 1U;
     if (spec.collisions && !reject) {
         --gExpectedCount; // the recorded ending is outside this window
     }
-    const uint32_t destination = gCallCount > first ? gCalls[first].destination : 0U;
+    const uint32_t destination = destinationMask(spec.destination);
+    bool generatedRouted = gCallCount >= first;
+    for (size_t index = 0; generatedRouted && index < first; ++index) {
+        generatedRouted = gCalls[index].destination == destination &&
+                          gCalls[index].sample == entry;
+    }
     const Comparison comparison = compareFrom(first, limit, destination, label);
     expect(!rig.clockFault && !gCallOverflow, "cluster simulation and trace are complete");
     expect(comparison.disagreements == 0U && comparison.extra == 0U &&
                comparison.missing == 0U,
            "cluster replay has zero byte/length/channel/order/sample disagreement");
     expect(budgetsHold(state.maximumStep), "cluster per-step budgets hold");
+    expect(generatedRouted, "cluster setup/context use the selected destination at entry");
+    expect(state.maximumStep.sends + state.maximumStep.cleanupCalls >= observedSends &&
+               state.maximumStep.sends <= observedSends &&
+               state.maximumStep.fanout + state.maximumStep.cleanupFanout >= observedFanout &&
+               state.maximumStep.fanout <= observedFanout &&
+               (reject || (state.maximumStep.sends == observedSends &&
+                           state.maximumStep.fanout == observedFanout)),
+           "plug-in send/fanout counters agree with the trace-derived per-step maxima");
     expect(spec.destination != 4 || bitCount(destination) == 4U,
            "cluster fanout uses all four destinations");
     expect(reject == (state.rejectedClusters == 1U) &&
@@ -1072,6 +1184,12 @@ int main() {
                 "(1 ending 3 B + 8x(bend 3 + pressure 2 + CC74 3) + attack 3 "
                 "+ 4 manager CC x 3): 3,000 ev/s = 8,200 B/s, 4,500 = 12,300 B/s, "
                 "10,000 = 27,333.33 B/s (native/virtual, not DIN 3,125 B/s)\n");
+    std::printf("QUALIFY: assumptions: simulated 48 kHz, 24,000-sample source clock; "
+                "MIDI callbacks occur between host steps, so receipt is the 4-sample "
+                "host boundary at or before floor(k x 48000 / R) after an origin 6 "
+                "samples past the take's first edge (exact at 3,000 ev/s, <= 3 "
+                "samples early at 4,500/10,000); template edges sit at sample 2 mod 4; "
+                "operation counts are algorithmic, not hardware deadlines\n");
 
     // ac-014 timing oracle cases in both playback modes.
     for (unsigned mode = 0; mode < 2U; ++mode) {
@@ -1117,14 +1235,21 @@ int main() {
 
     const uint32_t clusterSizes[] = {0U, 1U, 32U, 256U, 2250U, 5000U, 8193U};
     for (size_t index = 0; index < ARRAY_SIZE(clusterSizes); ++index) {
-        const ClusterCase single = {clusterSizes[index], false, -1, 64U};
-        const ClusterCase fanout = {clusterSizes[index], false, 4, 4U};
+        const ClusterCase single = {clusterSizes[index], false, -1, 64U, 24000U, false};
+        const ClusterCase fanout = {clusterSizes[index], false, 4, 4U, 24000U, false};
         runClusterCase(single);
         runClusterCase(fanout);
     }
-    const ClusterCase collisions[] = {{32U, true, -1, 64U}, {256U, true, 4, 4U}};
-    for (size_t index = 0; index < ARRAY_SIZE(collisions); ++index) {
-        runClusterCase(collisions[index]);
+    const ClusterCase combined[] = {
+        {32U, true, -1, 64U, 24000U, false},
+        {256U, true, 4, 4U, 24000U, false},
+        // Bursts after real overwrite, at double tempo, with four-way fanout.
+        {5000U, false, 4, 16U, 12000U, true},
+        {8193U, false, 4, 16U, 12000U, true},
+        {256U, true, 4, 64U, 48000U, true},
+    };
+    for (size_t index = 0; index < ARRAY_SIZE(combined); ++index) {
+        runClusterCase(combined[index]);
     }
 
     std::free(gInputs);
