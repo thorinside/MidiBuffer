@@ -51,11 +51,12 @@ int main() {
 
     // Restore the checked-in class state before recording the receiver's readback.
     FILE* fixture = std::fopen("tests/vital-smoke-state.plist", "rb");
-    if (!fixture || std::fseek(fixture, 0, SEEK_END)) { std::fprintf(stderr, "open state fixture failed\n"); return 1; }
-    long length = std::ftell(fixture);
-    if (length <= 0 || std::fseek(fixture, 0, SEEK_SET)) return 1;
-    UInt8* bytes = static_cast<UInt8*>(std::malloc(static_cast<size_t>(length)));
-    if (!bytes || std::fread(bytes, 1, static_cast<size_t>(length), fixture) != static_cast<size_t>(length) || std::fclose(fixture)) return 1;
+    if (!fixture) { std::fprintf(stderr, "open state fixture failed\n"); return 1; }
+    long length = std::fseek(fixture, 0, SEEK_END) ? -1 : std::ftell(fixture);
+    UInt8* bytes = length > 0 && !std::fseek(fixture, 0, SEEK_SET)
+                       ? static_cast<UInt8*>(std::malloc(static_cast<size_t>(length))) : nullptr;
+    const bool read = bytes && std::fread(bytes, 1, static_cast<size_t>(length), fixture) == static_cast<size_t>(length);
+    if (std::fclose(fixture) || !read) { std::free(bytes); std::fprintf(stderr, "read state fixture failed\n"); return 1; }
     CFDataRef fixtureData = CFDataCreate(nullptr, bytes, length); std::free(bytes);
     CFErrorRef error = nullptr;
     CFPropertyListRef fixtureState = CFPropertyListCreateWithData(nullptr, fixtureData, kCFPropertyListImmutable, nullptr, &error);

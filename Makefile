@@ -3,6 +3,8 @@ API_INCLUDE := distingNT_API/include
 SOURCE := src/midibuffer.cpp
 NATIVE_TEST := build/callback_contract_test
 SANITIZER_TEST := build/callback_contract_asan_ubsan
+QUALIFICATION_TEST := build/qualification_test
+QUALIFICATION_SANITIZER_TEST := build/qualification_asan_ubsan
 RANGE_MOTION_TEST := build/range_motion_test
 ARM_OBJECT := plugins/$(PLUGIN_NAME).o
 ARM_RANGE_MOTION_OBJECT := build/range_motion_arm.o
@@ -30,12 +32,14 @@ ARM_FLAGS := $(COMMON_FLAGS) -Os -fPIC -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-ab
 
 all: verify
 
-test: $(NATIVE_TEST) $(RANGE_MOTION_TEST)
+test: $(NATIVE_TEST) $(RANGE_MOTION_TEST) $(QUALIFICATION_TEST)
 	./$(NATIVE_TEST)
 	./$(RANGE_MOTION_TEST)
+	./$(QUALIFICATION_TEST)
 
-sanitize: $(SANITIZER_TEST)
+sanitize: $(SANITIZER_TEST) $(QUALIFICATION_SANITIZER_TEST)
 	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./$(SANITIZER_TEST)
+	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./$(QUALIFICATION_SANITIZER_TEST)
 	@echo "PASS: native production callbacks pass ASan/UBSan"
 
 static-check:
@@ -114,6 +118,12 @@ $(NATIVE_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_moti
 
 $(SANITIZER_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/host_double.cpp tests/host_double.hpp tests/callback_contract_test.cpp | build
 	$(NATIVE_CXX) $(SANITIZER_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/callback_contract_test.cpp -o $@
+
+$(QUALIFICATION_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/host_double.cpp tests/host_double.hpp tests/qualification_test.cpp | build
+	$(NATIVE_CXX) $(NATIVE_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/qualification_test.cpp -o $@
+
+$(QUALIFICATION_SANITIZER_TEST): $(SOURCE) src/midibuffer_core.hpp src/nt_host.hpp src/range_motion.hpp tests/host_double.cpp tests/host_double.hpp tests/qualification_test.cpp | build
+	$(NATIVE_CXX) $(SANITIZER_FLAGS) -Itests $(SOURCE) tests/host_double.cpp tests/qualification_test.cpp -o $@
 
 $(RANGE_MOTION_TEST): src/range_motion.hpp tests/range_motion_test.cpp | build
 	$(NATIVE_CXX) $(COMMON_FLAGS) tests/range_motion_test.cpp -o $@
