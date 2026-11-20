@@ -8650,6 +8650,9 @@ void verifySetupInsideSilentLeadInKeepsSelectionStartEpoch() {
                context.coverageComplete && context.setupChangesInside &&
                context.state.zoneCount[0] == 15U,
            "setup inside silent lead-in keeps old epoch and flags unsupported");
+    expect(prepareCandidate(host, start + 1U, start + 4U, context) &&
+               !context.setupChangesInside && context.state.zoneCount[0] == 7U,
+           "setup at the selection start remains known starting context");
 }
 
 void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
@@ -8673,6 +8676,14 @@ void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
     expect(zone(setupState(host), 0, midibuffer::kSetupKnown, 3) &&
                value(setupState(host).zones[0].manager, midibuffer::kSetupKnown, 250),
            "fresh admitted transactions restore exact setup knowledge after gap");
+    // Even the channel admitted under both settings can have its range reset
+    // by an MCM on an unobserved manager; Manual must not recover that range.
+    bend(host, 1, 24, 0);
+    changeParameter(host, kRecordingChannelParameter, 2);
+    mcm(host, 0, 3);
+    changeParameter(host, kRecordingChannelParameter, 0);
+    expect(setupState(host).channelSensitivity[1].state != midibuffer::kSetupKnown,
+           "unseen manager gap invalidates per-channel ranges even on continuously admitted members");
     startCapture(host);
     acquireClock(host);
     sendMidi(host, 0x91, 60, 100);
@@ -8688,6 +8699,12 @@ void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
                context.state.zoneCountState[0] != midibuffer::kSetupKnown &&
                context.state.managerState[0] != midibuffer::kSetupKnown,
            "the first post-gap resumption seed cannot certify pre-gap setup");
+    setManualScope(host, 2, 0);
+    changeParameter(host, kMpeModeParameter, 1);
+    MpeRig rig = {host.elapsedSamples()};
+    mpePlayFirstPulse(host, rig);
+    expect(mpeSnapshot(host).generatedSetup == 0U && noSetupOrPanicFrom(0U),
+           "Manual scope cannot emit stale ranges from before an unobserved manager gap");
 }
 
 // Capture Off must use the same staged work as entry. Existing bounded tests
@@ -8695,9 +8712,10 @@ void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
 void verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture() {
     midibuffer_test::HostDouble source;
     MpeRig rig = {};
-    mpeInstantiate(source, rig);
+    mpeInstantiate(source, rig, 5);
     changeParameter(source, kMpeModeParameter, 1);
     mpeBeginTake(source, rig);
+    for (unsigned i = 0; i < 5000U; ++i) sendMidi(source, 0xB1, 74, i % 128U);
     for (unsigned i = 0; i < 300U; ++i) {
         sendMidi(source, static_cast<uint8_t>(0x90U | (i / 100U)),
                  static_cast<uint8_t>(i % 100U), 100);
@@ -8717,7 +8735,9 @@ void verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture() {
     expect(source.savePreset(image), "staged Capture Off snapshot saves");
     for (int order = 0; order < 2; ++order) {
         midibuffer_test::HostDouble loaded;
-        expect(loadSilently(loaded, image, order != 0),
+        midibuffer_test::resetTrace();
+        expect(loaded.instantiate(5) && loaded.loadPreset(image, order != 0) &&
+                   midibuffer_test::trace().midiCallCount == 0U,
                "staged Capture Off loads silently in both host orders");
         bool bounded = true;
         for (unsigned step = 0; step < 4U; ++step) {
@@ -8745,12 +8765,64 @@ void verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture() {
                snapshot(source).eventCount == count &&
                !snapshot(source).playbackArmed,
            "ordinary entry after a mode switch waits for staged MPE endings");
-    for (unsigned step = 0; step < 4U; ++step) noClockBlock(source);
+    midibuffer_test::resetTrace();
+    for (unsigned step = 0; step < 64U; ++step) {
+        const bool finalizing = historyState(source).finalizing;
+        noClockBlock(source);
+        if (finalizing && !historyState(source).finalizing) {
+            expect(!snapshot(source).playbackArmed &&
+                       !historyState(source).pairingComplete,
+                   "finishing MPE endings cannot run a full-ring ordinary preparation in one step");
+        }
+    }
     expect(!historyState(source).finalizing &&
                snapshot(source).eventCount == count + 300U &&
+               historyState(source).maximumStepPreparationVisits <= 512U &&
+               midibuffer_test::trace().midiCallCount == 0U &&
                historyState(source).maximumStepFinalizeAppends <= 128U &&
                (snapshot(source).playbackArmed || snapshot(source).playbackClockLossPaused),
            "waiting ordinary entry starts only after every staged ending is retained");
+}
+
+void verifyModeOffDuringPreparingCompletesOrdinaryEntryWithinBudget() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig, 5);
+    mcm(host, 0, 15);
+    const uint64_t start = mpeBeginTake(host, rig);
+    for (unsigned i = 0; i < 5000U; ++i) sendMidi(host, 0xB1, 74, i % 128U);
+    mpeClock(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 1U),
+           "large Preparing-state history is selectable");
+    changeParameter(host, kMpeModeParameter, 1);
+    changeParameter(host, kPlaybackParameter, 1);
+    noClockBlock(host);
+    expect(mpeSnapshot(host).phase == midibuffer::kMpePhasePreparing,
+           "entry reaches Preparing after finalization but before pairing completes");
+    changeParameter(host, kCaptureParameter, 1);
+    expect(!snapshot(host).captureEnabled && host.parameter(kCaptureParameter) == 0,
+           "Capture On cannot overlap Preparing without pending finalization");
+    changeParameter(host, kMpeModeParameter, 0);
+    midibuffer_test::PresetImage pending;
+    expect(host.savePreset(pending), "deferred ordinary entry saves while Preparing");
+    for (int order = 0; order < 2; ++order) {
+        midibuffer_test::HostDouble loaded;
+        midibuffer_test::resetTrace();
+        expect(loaded.instantiate(5) && loaded.loadPreset(pending, order != 0),
+               "deferred ordinary Preparing state loads in both host orders");
+        for (unsigned i = 0; i < 64U; ++i) noClockBlock(loaded);
+        expect((snapshot(loaded).playbackArmed || snapshot(loaded).playbackClockLossPaused) &&
+                   !snapshot(loaded).captureEnabled &&
+                   historyState(loaded).maximumStepPreparationVisits <= 512U &&
+                   midibuffer_test::trace().midiCallCount == 0U,
+               "loaded deferred ordinary entry completes silently within preparation budget");
+    }
+    midibuffer_test::resetTrace();
+    for (unsigned i = 0; i < 64U; ++i) noClockBlock(host);
+    expect((snapshot(host).playbackArmed || snapshot(host).playbackClockLossPaused) &&
+               historyState(host).maximumStepPreparationVisits <= 512U &&
+               midibuffer_test::trace().midiCallCount == 0U,
+           "Mode Off during Preparing completes ordinary entry without setup or unbounded step work");
 }
 
 void verifyClearRetainsKnownContextBeforeNewRecordedMusic() {
@@ -8793,6 +8865,7 @@ int main() {
     verifySetupInsideSilentLeadInKeepsSelectionStartEpoch();
     verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge();
     verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture();
+    verifyModeOffDuringPreparingCompletesOrdinaryEntryWithinBudget();
     verifyClearRetainsKnownContextBeforeNewRecordedMusic();
     verifySetupObserverTransactionsAndZones();
     verifySetupSensitivityEncodings();

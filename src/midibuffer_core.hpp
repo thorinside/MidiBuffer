@@ -206,7 +206,8 @@ bool historyContext(const _NT_algorithm* self, bool candidate,
                     HistoryContextSnapshot& context);
 // Finalizing-state entry: freezes capture and leaves its generated endings to
 // bounded per-step progress (at most 128 appends per step). Legacy capture
-// stop, playback start, clear and save complete any pending work themselves.
+// stop stays synchronous in ordinary mode. MPE stop/entry remain staged;
+// clear discards pending work and save snapshots it for silent continuation.
 bool beginCaptureFinalization(_NT_algorithm* self);
 
 // MPE playback lifecycle, visible status and bounded-work instrumentation.

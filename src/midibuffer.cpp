@@ -1291,6 +1291,7 @@ int recordingAdmission(const Algorithm& algorithm) {
 // A recording-channel change is an admission boundary: channels that were
 // not observed under both settings become unknown rather than stale.
 void refreshSetupRoles(SetupObserver& setup);
+void forgetChannelSensitivities(SetupObserver& setup);
 
 void updateHistoryAdmission(Algorithm& algorithm) {
     HistoryControl& history = historyControl(algorithm);
@@ -1326,6 +1327,11 @@ void updateHistoryAdmission(Algorithm& algorithm) {
             if (managerGap || memberGap[zone]) {
                 setup.zones[zone].member.state = kSetupUnknown;
             }
+        }
+        if (managerGap) {
+            // A missed MCM may reset even continuously admitted members.
+            // Manual scope must not revive their old per-channel receipts.
+            forgetChannelSensitivities(setup);
         }
         refreshSetupRoles(setup);
         for (uint8_t channel = 0; channel < 16U; ++channel) {
@@ -3357,6 +3363,12 @@ void mpeAdvanceEntry(Algorithm& algorithm) {
     uint8_t lower = 0U;
     uint8_t upper = 0U;
     mpe.entryPending = false;
+    if (!mpeModeOn(algorithm)) {
+        // Deferred ordinary entry shares the same 512-visit preparation pump.
+        // Both synchronous helpers below will reuse these exact ready caches.
+        startPlayback(&algorithm);
+        return;
+    }
     mpe.status = mpeResolveScope(algorithm,
                                  arena.contexts[kHistoryContextCandidate],
                                  lower, upper);
@@ -3473,6 +3485,11 @@ void mpeControlChanged(_NT_algorithm* self, Algorithm& algorithm,
         return;
     }
     if (mpe.entryPending) {
+        if (!mpeModeOn(algorithm)) {
+            // Mode Off during either Finalizing or Preparing stays deferred,
+            // rather than stranding Playback On or scanning in the callback.
+            return;
+        }
         mpe.status = mpeControlStatus(algorithm);
         if (mpe.status != kMpeStatusReady || !mpeModeOn(algorithm)) {
             mpe.entryPending = false;
@@ -4014,15 +4031,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     mpe.step = MpeWorkCounters();
     mpe.admittedValid = false;
     mpe.restoreWindow = false;
-    const bool wasFinalizing = historyControl(*algorithm).finalizing;
     advanceHistoryWork(*algorithm);
-    // If mode was switched Off during staged work, an ordinary request waits
-    // for all endings rather than synchronously draining MPE finalization.
-    if (wasFinalizing && !historyControl(*algorithm).finalizing &&
-        !mpeModeOn(*algorithm) && algorithm->v[kParameterPlayback] != 0 &&
-        algorithm->transportState == kTransportStopped) {
-        startPlayback(self);
-    }
     mpeAdvanceEntry(*algorithm);
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
@@ -7056,6 +7065,8 @@ bool startPlayback(_NT_algorithm* self) {
     // remains On but leaves capture untouched until a valid range exists.
     finalizeCapture(*algorithm);
     if (historyControl(*algorithm).finalizing) {
+        mpeState(*algorithm).entryPending = true;
+        requestHistoryCandidate(*algorithm, range);
         return false;
     }
     if (algorithm->transportState != kTransportStopped) {
