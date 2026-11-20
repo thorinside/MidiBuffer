@@ -8673,6 +8673,21 @@ void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
     expect(zone(setupState(host), 0, midibuffer::kSetupKnown, 3) &&
                value(setupState(host).zones[0].manager, midibuffer::kSetupKnown, 250),
            "fresh admitted transactions restore exact setup knowledge after gap");
+    startCapture(host);
+    acquireClock(host);
+    sendMidi(host, 0x91, 60, 100);
+    clockPulse(host);
+    changeParameter(host, kRecordingChannelParameter, 2);
+    changeParameter(host, kRecordingChannelParameter, 0);
+    const uint64_t afterGap = snapshot(host).currentPulse;
+    sendMidi(host, 0x81, 60, 0);
+    clockPulse(host);
+    stopCapture(host);
+    midibuffer::HistoryContextSnapshot context = {};
+    expect(prepareCandidate(host, afterGap, afterGap + 1U, context) &&
+               context.state.zoneCountState[0] != midibuffer::kSetupKnown &&
+               context.state.managerState[0] != midibuffer::kSetupKnown,
+           "the first post-gap resumption seed cannot certify pre-gap setup");
 }
 
 // Capture Off must use the same staged work as entry. Existing bounded tests
@@ -8718,6 +8733,24 @@ void verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture() {
         expect(snapshot(loaded).captureEnabled,
                "explicit Capture On works after finalization finishes");
     }
+    // Switching modes must not turn an in-flight MPE stop into an ordinary
+    // synchronous drain. Playback waits, then arms only after the final chunk.
+    changeParameter(source, kMpeModeParameter, 0);
+    expect(midibuffer::setPulseSelection(source.algorithm(),
+                                        snapshot(source).oldestPulse,
+                                        snapshot(source).newestPulse + 1U),
+           "staged finalization history remains selectable");
+    changeParameter(source, kPlaybackParameter, 1);
+    expect(historyState(source).finalizing &&
+               snapshot(source).eventCount == count &&
+               !snapshot(source).playbackArmed,
+           "ordinary entry after a mode switch waits for staged MPE endings");
+    for (unsigned step = 0; step < 4U; ++step) noClockBlock(source);
+    expect(!historyState(source).finalizing &&
+               snapshot(source).eventCount == count + 300U &&
+               historyState(source).maximumStepFinalizeAppends <= 128U &&
+               (snapshot(source).playbackArmed || snapshot(source).playbackClockLossPaused),
+           "waiting ordinary entry starts only after every staged ending is retained");
 }
 
 void verifyClearRetainsKnownContextBeforeNewRecordedMusic() {

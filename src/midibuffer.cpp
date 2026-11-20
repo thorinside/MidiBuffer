@@ -853,6 +853,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& memory,
     return algorithm;
 }
 
+bool beginFinalization(Algorithm& algorithm);
 void finalizeCapture(Algorithm& algorithm);
 void completeCaptureFinalization(Algorithm& algorithm);
 uint64_t nextHistoryOrdinal(const Algorithm& algorithm);
@@ -944,6 +945,12 @@ void parameterChanged(_NT_algorithm* self, int parameter) {
             finalizeCapture(*algorithm);
         } else if (!algorithm->captureEnabled &&
                    algorithm->transportState == kTransportStopped) {
+            // A new capture cannot overwrite ownership still being finalized,
+            // or overlap the staged preparation of a requested playback entry.
+            if (historyControl(*algorithm).finalizing || restoring.entryPending) {
+                nt_host::setParameterFromAudio(self, kParameterCapture, 0);
+                return;
+            }
             completeCaptureFinalization(*algorithm);
             algorithm->recordedState = RecordedState();
             algorithm->captureEnabled = true;
@@ -1283,18 +1290,54 @@ int recordingAdmission(const Algorithm& algorithm) {
 
 // A recording-channel change is an admission boundary: channels that were
 // not observed under both settings become unknown rather than stale.
+void refreshSetupRoles(SetupObserver& setup);
+
 void updateHistoryAdmission(Algorithm& algorithm) {
     HistoryControl& history = historyControl(algorithm);
     const int admission = recordingAdmission(algorithm);
     if (history.admission >= 0 && history.admission != admission) {
+        SetupObserver& setup = mpeArena(algorithm).setup;
+        bool managerGap = false;
+        bool memberGap[2] = {false, false};
         for (uint8_t channel = 0; channel < 16U; ++channel) {
             const bool before =
                 history.admission == 0 || history.admission == channel + 1;
             const bool after = admission == 0 || admission == channel + 1;
             if (!before || !after) {
                 forgetHistoryChannel(history.live, channel);
+                const uint32_t generation = setup.selectors[channel].generation;
+                setup.selectors[channel] = SetupSelector();
+                setup.selectors[channel].generation = generation + 1U;
+                setup.channelSensitivity[channel] = {0U, kSetupUnknown};
+                managerGap = managerGap || channel == 0U || channel == 15U;
+                memberGap[0] = memberGap[0] ||
+                    setup.roles[channel] == kSetupRoleLowerMember;
+                memberGap[1] = memberGap[1] ||
+                    setup.roles[channel] == kSetupRoleUpperMember;
             }
         }
+        // An unseen manager MCM can resize either zone. Do not certify old
+        // topology/ranges on re-entry; independently received new MCMs recover it.
+        for (unsigned zone = 0; zone < 2U; ++zone) {
+            if (managerGap) {
+                setup.zones[zone].countState = kSetupUnknown;
+                setup.zones[zone].manager.state = kSetupUnknown;
+            }
+            if (managerGap || memberGap[zone]) {
+                setup.zones[zone].member.state = kSetupUnknown;
+            }
+        }
+        refreshSetupRoles(setup);
+        for (uint8_t channel = 0; channel < 16U; ++channel) {
+            if (history.membershipGeneration[channel] !=
+                setup.membershipGeneration[channel]) {
+                history.membershipGeneration[channel] =
+                    setup.membershipGeneration[channel];
+                forgetHistoryChannel(history.live, channel);
+            }
+        }
+        // This must precede the next recorded event's resumption seed.
+        copyHistorySetup(history.live, setup);
     }
     history.admission = admission;
 }
@@ -1607,10 +1650,14 @@ void completeCaptureFinalization(Algorithm& algorithm) {
     }
 }
 
-// Legacy synchronous capture stop: the same bounded steps run to completion.
+// Ordinary capture stop remains synchronous; MPE uses per-step finalization.
 void finalizeCapture(Algorithm& algorithm) {
+    const bool staged = historyControl(algorithm).finalizing ||
+        (algorithm.v != NULL && algorithm.v[kParameterMpeMode] != 0);
     beginFinalization(algorithm);
-    completeCaptureFinalization(algorithm);
+    if (!staged) {
+        completeCaptureFinalization(algorithm);
+    }
 }
 
 uint32_t playbackDestinationMask(const Algorithm& algorithm) {
@@ -3368,7 +3415,8 @@ uint8_t mpePhase(const Algorithm& algorithm) {
     if (mpe.fault) {
         return kMpePhaseFault;
     }
-    if (mpe.entryPending) {
+    if (mpe.entryPending ||
+        (mpeModeOn(algorithm) && historyControl(algorithm).finalizing)) {
         return historyControl(algorithm).finalizing ? kMpePhaseFinalizing
                                                     : kMpePhasePreparing;
     }
@@ -3839,9 +3887,14 @@ bool prepareHistoryCandidate(Algorithm& algorithm, uint32_t& budget) {
             // Entries received before the selection's first own event are
             // its context, including gap seeds stamped at that event's pulse.
             if (entry.key.ordinal <= history.workOrdinal) {
+                // Setup receipts are precisely timed. Do not hoist one
+                // strictly inside a silent lead-in into the start epoch.
+                // Resumption seeds still describe known pre-event gap state.
                 if (entry.key.pulse >= start &&
                     (event == NULL ||
-                     event->pulse >= history.work.range.endPulse)) {
+                     event->pulse >= history.work.range.endPulse ||
+                     (entry.kind == kHistoryJournalSetup &&
+                      entry.key.pulse > start))) {
                     history.workPhase = kPreparationInside;
                     break;
                 }
@@ -3961,7 +4014,15 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     mpe.step = MpeWorkCounters();
     mpe.admittedValid = false;
     mpe.restoreWindow = false;
+    const bool wasFinalizing = historyControl(*algorithm).finalizing;
     advanceHistoryWork(*algorithm);
+    // If mode was switched Off during staged work, an ordinary request waits
+    // for all endings rather than synchronously draining MPE finalization.
+    if (wasFinalizing && !historyControl(*algorithm).finalizing &&
+        !mpeModeOn(*algorithm) && algorithm->v[kParameterPlayback] != 0 &&
+        algorithm->transportState == kTransportStopped) {
+        startPlayback(self);
+    }
     mpeAdvanceEntry(*algorithm);
     const int clockBus = algorithm->v[kParameterClock];
     const int resetBus = algorithm->v[kParameterReset];
@@ -6994,6 +7055,9 @@ bool startPlayback(_NT_algorithm* self) {
     // performance without transmitting live cleanup. An unavailable request
     // remains On but leaves capture untouched until a valid range exists.
     finalizeCapture(*algorithm);
+    if (historyControl(*algorithm).finalizing) {
+        return false;
+    }
     if (algorithm->transportState != kTransportStopped) {
         return true;
     }

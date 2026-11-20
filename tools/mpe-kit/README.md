@@ -2,21 +2,23 @@
 
 Actual-device result: **NOT ATTEMPTED**. No controller or Vital is required. USB Mac↔NT is the only later physical MIDI connection. This kit changes no device or system routing. Preparation exercises production callbacks on the Mac and private virtual CoreMIDI endpoints; it cannot establish firmware or hardware behavior.
 
-Delivered location: `/Users/nealsanche/nosuch/midibuffer-fbd7e8dd-worktrees/mpe-kit-20261119-4fa6eb36`, branch `tools/mpe-kit-20261119-4fa6eb36`, registered mirror checkout `801c559c-0ce6-4ff3-a46d-a6c8d9afdf84`. The implementation GENERAL report records the exact commit. Baseline: `e3456fa00d3b1bc2fd63028d39dae34225061dbe`; product source matches qualified `51abe692564b83d63b927ba1c051c527420f9c6b`, SDK `5a4910d1d4233180114d6aee5ddaa4b8aec577e8`.
+The kit originated on branch `tools/mpe-kit-20261119-4fa6eb36` at `bab34a8` and is now included with the reviewed MidiBuffer implementation. Run the copy from the same source checkout you intend to verify, not a stale preparation checkout. The pinned SDK is `5a4910d1d4233180114d6aee5ddaa4b8aec577e8`; the self-test validates it. Record the tested source HEAD and dirty state with each trial.
 
 ## Safe first commands
 
 Run in a foreground terminal. The existing environment is used read-only. No install is needed: Python 3.12, mido 1.3.3 and python-rtmidi 1.5.8 were observed at preparation. `clang++` and the existing pinned SDK are needed only for self-test.
 
 ```sh
-cd /Users/nealsanche/nosuch/midibuffer-fbd7e8dd-worktrees/mpe-kit-20261119-4fa6eb36
+cd /path/to/MidiBuffer
 PY=/Users/nealsanche/.venvs/ntpush/bin/python
 "$PY" -c 'import mido, rtmidi; print(mido.__file__, rtmidi.__file__)'
 "$PY" tools/mpe-kit/kit.py list-ports
 mkdir -p build/my-first-mpe-test
 "$PY" tools/mpe-kit/kit.py dry-run --log build/my-first-mpe-test/expected.json
-"$PY" tools/mpe-kit/selftest.py --sdk /Users/nealsanche/nosuch/midibuffer-fbd7e8dd-worktrees/38aabdfa-dae3-41c6-9bde-432484c31897/distingNT_API
+"$PY" tools/mpe-kit/selftest.py --sdk "$PWD/distingNT_API"
 ```
+
+An aborted take and its cleanup invalidate the strict fresh-instance assumption. Clear Recording does **not** reset the implementation's observed input context; retries on that instance can correctly emit known context before music. Keep the original strict FAIL. A context-aware trial needs a separately declared exact context envelope and adequate capture window, not prefix stripping or a widened tolerance. Any physical remove/add, preset operation or new trial still requires explicit owner authorization.
 
 Use a fresh evidence directory for each trial; existing logs/reports are never overwritten. The self-test uses random self-created virtual endpoints, opens only those identities through an allowlist, then disposes them. It compiles a small fixture against the existing production host-double seam, with read-only SDK access. It runs foreground for about ten seconds. It prints its unique `build/mpe-kit-...` evidence path. No DAW, IAC or audio setup is needed.
 

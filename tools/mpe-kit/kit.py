@@ -265,8 +265,11 @@ def send(backend, name, uid, confirmation, path, rows=None, sleep=time.sleep, cl
             start = clock()
             for e in rows:
                 deadline = start + e['t']
-                while clock() < deadline:
-                    sleep(min(.001, deadline - clock()))
+                while True:
+                    remaining = deadline - clock()
+                    if remaining <= 0:
+                        break
+                    sleep(min(.001, remaining))
                 if clock() - deadline > .025:
                     raise RuntimeError('sender missed event deadline by more than 25ms; take incomplete')
                 if last_music_send is not None and clock() - last_music_send < .005:
