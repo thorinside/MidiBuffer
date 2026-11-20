@@ -8826,10 +8826,15 @@ void verifyModeOffDuringPreparingCompletesOrdinaryEntryWithinBudget() {
     }
     midibuffer_test::resetTrace();
     for (unsigned i = 0; i < 64U; ++i) noClockBlock(host);
+    // Clockless preparation may enter the ordinary clock-loss-paused state.
+    // Either way the edited range and its first retained event must be exact.
     expect((snapshot(host).playbackArmed || snapshot(host).playbackClockLossPaused) &&
+               snapshot(host).activeSelection.startPulse == start + 1U &&
+               snapshot(host).activeSelection.endPulse == start + 2U &&
+               snapshot(host).playbackEventIndex == 5000U &&
                historyState(host).maximumStepPreparationVisits <= 512U &&
                midibuffer_test::trace().midiCallCount == 0U,
-           "Mode Off during Preparing completes ordinary entry without setup or unbounded step work");
+           "Mode Off during Preparing completes ordinary entry at the exact edited event within budget");
 }
 
 void verifyClearRetainsKnownContextBeforeNewRecordedMusic() {
