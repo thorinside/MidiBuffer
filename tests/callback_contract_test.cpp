@@ -8626,6 +8626,129 @@ void verifyFactorySizesDeclareSidecarAndRefuseInsufficientMemory() {
     }
 }
 
+// Existing mid-take setup coverage has selected notes before the change. A
+// silent lead-in shares the next event ordinal and must not hoist that change.
+void verifySetupInsideSilentLeadInKeepsSelectionStartEpoch() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    mcm(host, 0, 15);
+    const uint64_t first = mpeBeginTake(host, rig);
+    sendMidi(host, 0x91, 60, 100);
+    sendMidi(host, 0x81, 60, 0);
+    mpeClock(host, rig);
+    const uint64_t start = first + 1U;
+    mpeClock(host, rig);
+    mcm(host, 0, 7); // exactly timed Setup journal entry, not a gap seed
+    mpeClock(host, rig);
+    sendMidi(host, 0x91, 62, 100);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 62, 0);
+    mpeEndTake(host, rig);
+    midibuffer::HistoryContextSnapshot context = {};
+    expect(prepareCandidate(host, start, start + 4U, context) &&
+               context.coverageComplete && context.setupChangesInside &&
+               context.state.zoneCount[0] == 15U,
+           "setup inside silent lead-in keeps old epoch and flags unsupported");
+}
+
+void verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge() {
+    midibuffer_test::HostDouble host;
+    expect(host.instantiate(1), "setup admission-gap host constructs");
+    mcm(host, 0, 3);
+    bend(host, 0, 12, 50);
+    changeParameter(host, kRecordingChannelParameter, 2);
+    mcm(host, 0, 7); // receiver changes while manager input is unobserved
+    changeParameter(host, kRecordingChannelParameter, 0);
+    sendMidi(host, 0xB0, 6, 15);
+    sendMidi(host, 0xB0, 38, 25);
+    const Setup lost = setupState(host);
+    expect(lost.selectors[0].validMask == 0U &&
+               !lost.selectors[0].dataValid &&
+               lost.zones[0].countState != midibuffer::kSetupKnown &&
+               lost.zones[0].manager.state != midibuffer::kSetupKnown,
+           "admission gap invalidates stale RPN selector, Data Entry and MCM knowledge");
+    mcm(host, 0, 3);
+    bend(host, 0, 2, 50);
+    expect(zone(setupState(host), 0, midibuffer::kSetupKnown, 3) &&
+               value(setupState(host).zones[0].manager, midibuffer::kSetupKnown, 250),
+           "fresh admitted transactions restore exact setup knowledge after gap");
+}
+
+// Capture Off must use the same staged work as entry. Existing bounded tests
+// exercise only the explicit Finalizing seam, not this parameter callback.
+void verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture() {
+    midibuffer_test::HostDouble source;
+    MpeRig rig = {};
+    mpeInstantiate(source, rig);
+    changeParameter(source, kMpeModeParameter, 1);
+    mpeBeginTake(source, rig);
+    for (unsigned i = 0; i < 300U; ++i) {
+        sendMidi(source, static_cast<uint8_t>(0x90U | (i / 100U)),
+                 static_cast<uint8_t>(i % 100U), 100);
+    }
+    const uint32_t count = snapshot(source).eventCount;
+    midibuffer_test::resetTrace();
+    stopCapture(source);
+    expect(!snapshot(source).captureEnabled && historyState(source).finalizing &&
+               snapshot(source).eventCount == count,
+           "MPE Capture Off freezes without synchronously draining endings");
+    changeParameter(source, kCaptureParameter, 1);
+    expect(!snapshot(source).captureEnabled &&
+               source.parameter(kCaptureParameter) == 0 &&
+               historyState(source).finalizing && snapshot(source).eventCount == count,
+           "Capture On during staged finalization is rejected without draining or data loss");
+    midibuffer_test::PresetImage image;
+    expect(source.savePreset(image), "staged Capture Off snapshot saves");
+    for (int order = 0; order < 2; ++order) {
+        midibuffer_test::HostDouble loaded;
+        expect(loadSilently(loaded, image, order != 0),
+               "staged Capture Off loads silently in both host orders");
+        bool bounded = true;
+        for (unsigned step = 0; step < 4U; ++step) {
+            noClockBlock(loaded);
+            bounded = bounded && historyState(loaded).lastStepFinalizeAppends <= 128U;
+        }
+        expect(bounded && !historyState(loaded).finalizing &&
+                   snapshot(loaded).eventCount == count + 300U &&
+                   !snapshot(loaded).captureEnabled &&
+                   midibuffer_test::trace().midiCallCount == 0U,
+               "saved staged Capture Off finishes all endings silently in bounded steps");
+        changeParameter(loaded, kCaptureParameter, 1);
+        expect(snapshot(loaded).captureEnabled,
+               "explicit Capture On works after finalization finishes");
+    }
+}
+
+void verifyClearRetainsKnownContextBeforeNewRecordedMusic() {
+    midibuffer_test::HostDouble host;
+    MpeRig rig = {};
+    mpeInstantiate(host, rig);
+    for (uint8_t ch = 1; ch <= 2; ++ch) {
+        sendMidi(host, static_cast<uint8_t>(0xE0U | ch), 0, 64);
+        sendMidi(host, static_cast<uint8_t>(0xD0U | ch), 0, 0);
+        sendMidi(host, static_cast<uint8_t>(0xB0U | ch), 74, 64);
+    }
+    changeParameter(host, kClearRecordingParameter, 1);
+    changeParameter(host, kClearRecordingParameter, 0);
+    const uint64_t start = mpeBeginTake(host, rig);
+    sendMidi(host, 0xE1, 0, 72);
+    sendMidi(host, 0x91, 57, 100);
+    mpeClock(host, rig);
+    sendMidi(host, 0x81, 57, 64);
+    mpeEndTake(host, rig);
+    setManualScope(host, 2, 0);
+    changeParameter(host, kMpeModeParameter, 1);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
+           "post-Clear take selection is valid");
+    mpePlayFirstPulse(host, rig);
+    expect(midiAt(0, 0xE1, 0, 64) && midiAt(1, 0xD1, 0, 0) &&
+               midiAt(2, 0xB1, 74, 64) && midiAt(3, 0xE2, 0, 64) &&
+               midiAt(4, 0xD2, 0, 0) && midiAt(5, 0xB2, 74, 64) &&
+               midiAt(6, 0xE1, 0, 72),
+           "Clear retains six known neutral context messages ahead of new music");
+}
+
 int main() {
     midibuffer_test::resetTrace();
     midibuffer_test::HostDouble host;
@@ -8634,6 +8757,10 @@ int main() {
     if (host.algorithm() != NULL) {
         verifyBoundaryCallbacks(host);
     }
+    verifySetupInsideSilentLeadInKeepsSelectionStartEpoch();
+    verifyAdmissionGapsCannotReuseSetupTransactionsOrKnowledge();
+    verifyMpeCaptureOffStagesEndingsAndRejectsOverlappingCapture();
+    verifyClearRetainsKnownContextBeforeNewRecordedMusic();
     verifySetupObserverTransactionsAndZones();
     verifySetupSensitivityEncodings();
     verifySetupMembershipInvalidationIsTargeted();
