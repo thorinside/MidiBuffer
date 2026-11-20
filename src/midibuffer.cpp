@@ -3366,6 +3366,15 @@ void mpeAdvanceEntry(Algorithm& algorithm) {
     if (!mpeModeOn(algorithm)) {
         // Deferred ordinary entry shares the same 512-visit preparation pump.
         // Both synchronous helpers below will reuse these exact ready caches.
+        // Position by bounded binary search, not the legacy linear entry scan.
+        if (!algorithm.playbackPositionValid ||
+            algorithm.playbackPulse < algorithm.selection.startPulse ||
+            algorithm.playbackPulse >= algorithm.selection.endPulse) {
+            algorithm.playbackPulse = algorithm.selection.startPulse;
+            algorithm.playbackEventIndex =
+                mpeLowerBound(algorithm, algorithm.playbackPulse);
+            algorithm.playbackPositionValid = true;
+        }
         startPlayback(&algorithm);
         return;
     }
@@ -7064,7 +7073,8 @@ bool startPlayback(_NT_algorithm* self) {
     // performance without transmitting live cleanup. An unavailable request
     // remains On but leaves capture untouched until a valid range exists.
     finalizeCapture(*algorithm);
-    if (historyControl(*algorithm).finalizing) {
+    if (historyControl(*algorithm).finalizing || mpeState(*algorithm).entryPending) {
+        // Range edits and repeated requests must stay in the bounded pump too.
         mpeState(*algorithm).entryPending = true;
         requestHistoryCandidate(*algorithm, range);
         return false;

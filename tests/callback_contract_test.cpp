@@ -8792,7 +8792,9 @@ void verifyModeOffDuringPreparingCompletesOrdinaryEntryWithinBudget() {
     const uint64_t start = mpeBeginTake(host, rig);
     for (unsigned i = 0; i < 5000U; ++i) sendMidi(host, 0xB1, 74, i % 128U);
     mpeClock(host, rig);
-    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 1U),
+    sendMidi(host, 0xB1, 74, 64);
+    mpeClock(host, rig);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start, start + 2U),
            "large Preparing-state history is selectable");
     changeParameter(host, kMpeModeParameter, 1);
     changeParameter(host, kPlaybackParameter, 1);
@@ -8802,7 +8804,12 @@ void verifyModeOffDuringPreparingCompletesOrdinaryEntryWithinBudget() {
     changeParameter(host, kCaptureParameter, 1);
     expect(!snapshot(host).captureEnabled && host.parameter(kCaptureParameter) == 0,
            "Capture On cannot overlap Preparing without pending finalization");
+    expect(!historyState(host).pairingComplete,
+           "Preparing mode-switch regression has genuinely unfinished pairing");
     changeParameter(host, kMpeModeParameter, 0);
+    expect(midibuffer::setPulseSelection(host.algorithm(), start + 1U, start + 2U) &&
+               !snapshot(host).playbackArmed && !snapshot(host).playbackActive,
+           "a range edit while ordinary entry is deferred cannot bypass bounded preparation");
     midibuffer_test::PresetImage pending;
     expect(host.savePreset(pending), "deferred ordinary entry saves while Preparing");
     for (int order = 0; order < 2; ++order) {
