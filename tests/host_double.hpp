@@ -49,9 +49,8 @@ struct Trace {
     size_t drawCallCount;
     ShapeCall shapeCalls[512];
     size_t shapeCallCount;
-    // Large enough to observe the complete fixed playback-ownership cleanup:
-    // 16 channels * 128 notes, followed by sustain-off on all 16 channels.
-    MidiCall midiCalls[4096];
+    // Normal output plus the approved worst-case cleanup in one step.
+    MidiCall midiCalls[10496];
     size_t midiCallCount;
     ParameterSetCall parameterSetCalls[64];
     size_t parameterSetCallCount;
@@ -59,6 +58,9 @@ struct Trace {
     uint32_t presetRestoreClearTransitions;
 };
 
+// A drain receives each complete full batch before recording resumes.
+typedef void (*MidiTraceDrain)(const MidiCall*, size_t);
+void setMidiTraceDrain(MidiTraceDrain drain);
 void resetTrace();
 const Trace& trace();
 uint8_t framebufferPixel(int x, int y);
@@ -81,6 +83,18 @@ class PresetImage {
     bool removeNavigation();
     bool makeLegacyWithoutAppendedParameters();
     bool corruptNavigationTarget();
+    // midibufferState member fixtures. Hex members are decoded/re-encoded
+    // in 256-byte chunks; leadingNumber is the optional leading version
+    // element (-1 when absent).
+    bool removeMember(const char* name);
+    bool hexMember(const char* name, uint8_t* bytes, size_t capacity,
+                   size_t& count, int& leadingNumber) const;
+    bool setHexMember(const char* name, const uint8_t* bytes, size_t count,
+                      int leadingNumber);
+    // Exact compact-JSON characters the member adds (separating comma,
+    // quoted name and colon, value) and the hex characters within it.
+    bool memberCharacters(const char* name, uint64_t& total,
+                          uint64_t& hexCharacters) const;
 
   private:
     friend class HostDouble;
@@ -117,7 +131,8 @@ class HostDouble {
     uint8_t* sram_;
     uint8_t* dram_;
     int16_t values_[16];
-    float frames_[kNT_lastBus * 8];
+    float* frames_;
+    float* packedFrames_;
     uint64_t hostAllocatedBytes_;
     uint64_t elapsedSamples_;
 };

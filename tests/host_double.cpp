@@ -16,6 +16,7 @@ uint64_t gHeapAllocationCount = 0;
 uint64_t gPendingDispatchSample = 0;
 uint32_t gParameterCallbackDepth = 0;
 midibuffer_test::Trace gTrace;
+midibuffer_test::MidiTraceDrain gMidiTraceDrain = NULL;
 
 const uint32_t kHostParameterOffset = 3U;
 
@@ -224,7 +225,12 @@ void drawFramebufferLine(int x0, int y0, int x1, int y1, int colour) {
 void recordMidi(uint32_t destination, uint8_t size, uint8_t byte0,
                 uint8_t byte1, uint8_t byte2) {
     if (gTrace.midiCallCount >= ARRAY_SIZE(gTrace.midiCalls)) {
-        return;
+        if (gMidiTraceDrain == NULL) {
+            std::fprintf(stderr, "MIDI trace capacity exceeded; drain before continuing\n");
+            std::abort();
+        }
+        gMidiTraceDrain(gTrace.midiCalls, gTrace.midiCallCount);
+        gTrace.midiCallCount = 0;
     }
     midibuffer_test::MidiCall& call =
         gTrace.midiCalls[gTrace.midiCallCount++];
@@ -587,7 +593,7 @@ void midibufferTestSetDispatchSample(uint64_t sample) {
 
 const _NT_globals NT_globals = {
     48000,
-    8,
+    64,
     NULL,
     0,
     0,
@@ -680,6 +686,10 @@ void NT_setParameterFromUi(uint32_t algorithmIndex, uint32_t parameter,
 }  // extern "C"
 
 namespace midibuffer_test {
+
+void setMidiTraceDrain(MidiTraceDrain drain) {
+    gMidiTraceDrain = drain;
+}
 
 void resetTrace() {
     std::memset(&gTrace, 0, sizeof(gTrace));
@@ -835,6 +845,128 @@ bool PresetImage::corruptNavigationTarget() {
     return true;
 }
 
+bool PresetImage::removeMember(const char* name) {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    if (state == NULL) {
+        return false;
+    }
+    for (std::vector<JsonNode>::iterator child = state->children.begin();
+         child != state->children.end(); ++child) {
+        if (child->name == name) {
+            state->children.erase(child);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PresetImage::hexMember(const char* name, uint8_t* bytes, size_t capacity,
+                            size_t& count, int& leadingNumber) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    const JsonNode* state = namedChild(document->root, "midibufferState");
+    const JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL || member->type != kJsonArray) {
+        return false;
+    }
+    count = 0U;
+    leadingNumber = -1;
+    for (size_t index = 0; index < member->children.size(); ++index) {
+        const JsonNode& child = member->children[index];
+        if (index == 0U && child.type == kJsonInt) {
+            leadingNumber = child.intValue;
+            continue;
+        }
+        if (child.type != kJsonString || child.stringValue.size() % 2U != 0U) {
+            return false;
+        }
+        for (size_t at = 0; at < child.stringValue.size(); at += 2U) {
+            unsigned value = 0U;
+            if (count >= capacity ||
+                std::sscanf(child.stringValue.c_str() + at, "%2x", &value) != 1) {
+                return false;
+            }
+            bytes[count++] = static_cast<uint8_t>(value);
+        }
+    }
+    return true;
+}
+
+bool PresetImage::setHexMember(const char* name, const uint8_t* bytes,
+                               size_t count, int leadingNumber) {
+    JsonDocument* document = static_cast<JsonDocument*>(document_);
+    JsonNode* state = namedChild(document->root, "midibufferState");
+    JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL) {
+        return false;
+    }
+    member->type = kJsonArray;
+    member->children.clear();
+    if (leadingNumber >= 0) {
+        JsonNode number(kJsonInt);
+        number.intValue = leadingNumber;
+        member->children.push_back(number);
+    }
+    static const char kDigits[] = "0123456789abcdef";
+    for (size_t offset = 0; offset < count; offset += 256U) {
+        JsonNode chunk(kJsonString);
+        for (size_t index = offset; index < count && index < offset + 256U;
+             ++index) {
+            chunk.stringValue.push_back(kDigits[bytes[index] >> 4U]);
+            chunk.stringValue.push_back(kDigits[bytes[index] & 0x0fU]);
+        }
+        member->children.push_back(chunk);
+    }
+    return true;
+}
+
+namespace {
+
+uint64_t compactJsonCharacters(const JsonNode& node, uint64_t& hex) {
+    char text[32];
+    switch (node.type) {
+    case kJsonObject:
+    case kJsonArray: {
+        uint64_t total = 2U;
+        for (size_t index = 0; index < node.children.size(); ++index) {
+            const JsonNode& child = node.children[index];
+            total += (index == 0U ? 0U : 1U) +
+                     (node.type == kJsonObject ? child.name.size() + 3U : 0U) +
+                     compactJsonCharacters(child, hex);
+        }
+        return total;
+    }
+    case kJsonInt:
+        return static_cast<uint64_t>(
+            std::snprintf(text, sizeof(text), "%d", node.intValue));
+    case kJsonString:
+        hex += node.stringValue.size();
+        return node.stringValue.size() + 2U;
+    case kJsonBoolean:
+        return node.boolValue ? 4U : 5U;
+    default:
+        return 4U;
+    }
+}
+
+}  // namespace
+
+bool PresetImage::memberCharacters(const char* name, uint64_t& total,
+                                   uint64_t& hexCharacters) const {
+    const JsonDocument* document =
+        static_cast<const JsonDocument*>(document_);
+    const JsonNode* state = namedChild(document->root, "midibufferState");
+    const JsonNode* member = state == NULL ? NULL : namedChild(*state, name);
+    if (member == NULL) {
+        return false;
+    }
+    hexCharacters = 0U;
+    total = 1U + std::strlen(name) + 3U +
+            compactJsonCharacters(*member, hexCharacters);
+    return true;
+}
+
 HostDouble::HostDouble()
     : factory_(NULL),
       requirements_(),
@@ -842,7 +974,8 @@ HostDouble::HostDouble()
       sram_(NULL),
       dram_(NULL),
       values_(),
-      frames_(),
+      frames_(static_cast<float*>(std::calloc(kNT_lastBus * NT_globals.maxFramesPerStep, sizeof(float)))),
+      packedFrames_(static_cast<float*>(std::calloc(kNT_lastBus * NT_globals.maxFramesPerStep, sizeof(float)))),
       hostAllocatedBytes_(0),
       elapsedSamples_(0) {}
 
@@ -850,10 +983,12 @@ HostDouble::~HostDouble() {
     unregisterBinding(algorithm_);
     std::free(sram_);
     std::free(dram_);
+    std::free(frames_);
+    std::free(packedFrames_);
 }
 
 bool HostDouble::instantiate(int32_t bufferMegabytes) {
-    if (algorithm_ != NULL) {
+    if (algorithm_ != NULL || frames_ == NULL || packedFrames_ == NULL) {
         return false;
     }
     if (pluginEntry(kNT_selector_version, 0) != kNT_apiVersion13 ||
@@ -988,21 +1123,33 @@ bool HostDouble::loadPreset(const PresetImage& image,
 }
 
 void HostDouble::clearFrames() {
-    std::memset(frames_, 0, sizeof(frames_));
+    std::memset(frames_, 0, kNT_lastBus * NT_globals.maxFramesPerStep * sizeof(float));
 }
 
 float* HostDouble::bus(size_t oneBasedBus) {
     if (oneBasedBus == 0 || oneBasedBus > kNT_lastBus) {
         return NULL;
     }
-    return frames_ + (oneBasedBus - 1) * 8;
+    return frames_ + (oneBasedBus - 1) * NT_globals.maxFramesPerStep;
 }
 
 void HostDouble::step(int numFramesBy4) {
-    factory_->step(algorithm_, frames_, numFramesBy4);
-    if (numFramesBy4 > 0) {
-        elapsedSamples_ += static_cast<uint64_t>(numFramesBy4) * 4U;
+    if (numFramesBy4 <= 0 || static_cast<uint32_t>(numFramesBy4) > NT_globals.maxFramesPerStep / 4U) {
+        std::fprintf(stderr, "invalid host frame count\n");
+        std::abort();
     }
+    const size_t count = static_cast<size_t>(numFramesBy4) * 4U;
+    for (size_t busIndex = 0; busIndex < kNT_lastBus; ++busIndex) {
+        std::memcpy(packedFrames_ + busIndex * count,
+                    frames_ + busIndex * NT_globals.maxFramesPerStep,
+                    count * sizeof(float));
+    }
+    factory_->step(algorithm_, packedFrames_, numFramesBy4);
+    for (size_t busIndex = 0; busIndex < kNT_lastBus; ++busIndex) {
+        std::memcpy(frames_ + busIndex * NT_globals.maxFramesPerStep,
+                    packedFrames_ + busIndex * count, count * sizeof(float));
+    }
+    elapsedSamples_ += count;
 }
 
 }  // namespace midibuffer_test
